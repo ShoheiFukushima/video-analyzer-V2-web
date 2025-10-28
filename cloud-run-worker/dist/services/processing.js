@@ -31,27 +31,32 @@ export async function handleProcessing(request) {
         console.log(`[${request.uploadId}] Step 2: Extracting metadata...`);
         const metadata = await extractMetadata(videoPath);
         console.log(`[${request.uploadId}] ✓ Metadata: ${metadata.duration.toFixed(1)}s, ${metadata.resolution}`);
-        // Extract audio
-        console.log(`[${request.uploadId}] Step 3: Extracting audio...`);
-        await extractAudio(videoPath, audioPath);
-        console.log(`[${request.uploadId}] ✓ Audio extracted`);
-        // Voice Activity Detection (VAD)
-        console.log(`[${request.uploadId}] Step 3.5: Running Voice Activity Detection (VAD)...`);
+        // Voice Activity Detection (VAD) - Check BEFORE audio extraction
+        console.log(`[${request.uploadId}] Step 3: Running Voice Activity Detection (VAD)...`);
         const hasAudio = await detectAudioActivity(videoPath);
         console.log(`[${request.uploadId}] ${hasAudio ? '✓ Audio detected' : '⚠️ No audio detected'}`);
+        // Extract audio (only if audio is detected)
+        if (hasAudio) {
+            console.log(`[${request.uploadId}] Step 4: Extracting audio...`);
+            await extractAudio(videoPath, audioPath);
+            console.log(`[${request.uploadId}] ✓ Audio extracted`);
+        }
+        else {
+            console.log(`[${request.uploadId}] Step 4: Skipping audio extraction (no audio detected)`);
+        }
         // Extract frames for Gemini Vision OCR
-        console.log(`[${request.uploadId}] Step 4: Extracting frames (scene detection)...`);
+        console.log(`[${request.uploadId}] Step 5: Extracting frames (scene detection)...`);
         frames = await extractFrames(videoPath);
         console.log(`[${request.uploadId}] ✓ Extracted ${frames.length} frames`);
         // Process with Whisper API (only if audio is detected)
         let transcription;
         if (hasAudio) {
-            console.log(`[${request.uploadId}] Step 5: Processing with Whisper API...`);
+            console.log(`[${request.uploadId}] Step 6: Processing with Whisper API...`);
             transcription = await processWithWhisper(audioPath);
             console.log(`[${request.uploadId}] ✓ Transcription complete (${transcription.segments?.length || 0} segments)`);
         }
         else {
-            console.log(`[${request.uploadId}] Step 5: Skipping Whisper API (no audio detected)`);
+            console.log(`[${request.uploadId}] Step 6: Skipping Whisper API (no audio detected)`);
             transcription = {
                 text: '',
                 language: 'ja',
@@ -62,22 +67,22 @@ export async function handleProcessing(request) {
             console.log(`[${request.uploadId}] ✓ Generated empty transcription`);
         }
         // Process with Gemini Vision OCR
-        console.log(`[${request.uploadId}] Step 6: Processing with Gemini Vision OCR...`);
+        console.log(`[${request.uploadId}] Step 7: Processing with Gemini Vision OCR...`);
         const ocrResults = await processWithGeminiVision(frames, request.uploadId);
         console.log(`[${request.uploadId}] ✓ OCR complete (${ocrResults.length} frames processed)`);
         // Generate Excel with both Whisper and Gemini Vision results
-        console.log(`[${request.uploadId}] Step 7: Generating hybrid Excel (Whisper + Gemini Vision)...`);
+        console.log(`[${request.uploadId}] Step 8: Generating hybrid Excel (Whisper + Gemini Vision)...`);
         excelPath = path.join(TMP_DIR, `${request.uploadId}_output.xlsx`);
         await generateExcel(transcription, metadata, excelPath, request.fileName, { frames, ocrResults });
         console.log(`[${request.uploadId}] ✓ Excel generated`);
         // Upload result to Vercel Blob
-        console.log(`[${request.uploadId}] Step 8: Uploading result...`);
+        console.log(`[${request.uploadId}] Step 9: Uploading result...`);
         const excelBuffer = await readFile(excelPath);
         const resultUrl = await uploadToBlob(excelBuffer, request.uploadId);
         console.log(`[${request.uploadId}] ✓ Result uploaded to Blob`);
         // Save analytics to Supabase (if consent & available)
         if (request.dataConsent && process.env.SUPABASE_URL) {
-            console.log(`[${request.uploadId}] Step 9: Saving analytics...`);
+            console.log(`[${request.uploadId}] Step 10: Saving analytics...`);
             await saveAnalytics({
                 uploadId: request.uploadId,
                 fileName: request.fileName,
