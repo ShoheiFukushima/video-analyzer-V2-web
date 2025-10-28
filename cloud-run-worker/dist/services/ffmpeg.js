@@ -16,17 +16,30 @@ export async function extractMetadata(videoPath) {
         const format = probeData.format;
         const width = videoStream?.width || 1920;
         const height = videoStream?.height || 1080;
-        const aspectRatio = width / height;
+
+        // Extract rotation metadata (common in smartphone videos)
+        const rotationTag = videoStream?.tags?.rotate ||
+                           videoStream?.side_data_list?.find(d => d.rotation)?.rotation ||
+                           '0';
+        const rotation = Math.abs(parseInt(rotationTag));
+
+        // Swap width/height if video is rotated 90 or 270 degrees (portrait mode)
+        const isPortrait = rotation === 90 || rotation === 270;
+        const displayWidth = isPortrait ? height : width;
+        const displayHeight = isPortrait ? width : height;
+        const aspectRatio = displayWidth / displayHeight;
+
         return {
             duration: parseFloat(format.duration) || 0,
-            width,
-            height,
-            resolution: `${width}x${height}`,
+            width: displayWidth,
+            height: displayHeight,
+            resolution: `${displayWidth}x${displayHeight}`,
             codec: videoStream?.codec_name || 'h264',
             bitrate: parseInt(format.bit_rate) || 0,
             fps: videoStream?.r_frame_rate ? evaluateFraction(videoStream.r_frame_rate) : 30,
             fileSize: parseInt(format.size) || 0,
             aspectRatio,
+            rotation, // Add rotation info for frame extraction
         };
     }
     catch (error) {
@@ -41,6 +54,7 @@ export async function extractMetadata(videoPath) {
             fps: 30,
             fileSize: 0,
             aspectRatio: 16 / 9,
+            rotation: 0,
         };
     }
 }
@@ -65,7 +79,8 @@ async function runSceneDetection(videoPath, threshold) {
     try {
         // Use ffmpeg scene detection filter and capture stderr output
         const command = `ffmpeg -i "${videoPath}" -vf "select='gt(scene,${threshold})',showinfo" -f null - 2>&1`;
-        const { stdout } = await execAsync(command, { maxBuffer: 10 * 1024 * 1024 });
+        // Increased maxBuffer to 50MB for high-resolution videos
+        const { stdout } = await execAsync(command, { maxBuffer: 50 * 1024 * 1024, timeout: 600000 });
         // Parse FFmpeg output for scene timestamps
         const lines = stdout.split('\n');
         for (const line of lines) {
@@ -147,10 +162,29 @@ async function generateSceneRanges(cuts, videoDuration, config = DEFAULT_CONFIG)
     return scenes;
 }
 /**
- * Extract frame at specific timestamp
+ * Extract frame at specific timestamp with aspect ratio preservation and rotation
  */
-async function extractFrameAtTime(videoPath, timestamp, outputPath) {
-    const command = `ffmpeg -ss ${timestamp} -i "${videoPath}" -frames:v 1 -s 1280x720 "${outputPath}" -y`;
+async function extractFrameAtTime(videoPath, timestamp, outputPath, metadata) {
+    // Build video filter for scaling and rotation
+    const maxWidth = 1280;
+    const maxHeight = 720;
+
+    // Scale filter that maintains aspect ratio
+    const scaleFilter = `scale='min(${maxWidth}\\,iw)':'min(${maxHeight}\\,ih)':force_original_aspect_ratio=decrease`;
+
+    // Rotation filter for smartphone videos
+    let rotationFilter = '';
+    if (metadata.rotation === 90) {
+        rotationFilter = ',transpose=1'; // 90 degrees clockwise
+    } else if (metadata.rotation === 270) {
+        rotationFilter = ',transpose=2'; // 90 degrees counter-clockwise
+    } else if (metadata.rotation === 180) {
+        rotationFilter = ',hflip,vflip'; // 180 degrees
+    }
+
+    const videoFilter = `${scaleFilter}${rotationFilter}`;
+    const command = `ffmpeg -ss ${timestamp} -i "${videoPath}" -vf "${videoFilter}" -frames:v 1 "${outputPath}" -y`;
+
     try {
         await execAsync(command);
     }
@@ -172,7 +206,7 @@ export async function extractFrames(videoPath) {
         console.log(`📁 Created output directory: ${outputDir}`);
         const metadata = await extractMetadata(videoPath);
         const duration = metadata.duration;
-        console.log(`🎬 Video duration: ${duration}s`);
+        console.log(`🎬 Video duration: ${duration}s, rotation: ${metadata.rotation}°`);
         const cuts = await detectSceneCuts(videoPath);
         if (cuts.length === 0) {
             console.warn('⚠️ No scene cuts detected, falling back to single scene');
@@ -183,7 +217,7 @@ export async function extractFrames(videoPath) {
         const frames = [];
         for (const scene of scenes) {
             const filename = path.join(outputDir, `scene-${scene.sceneNumber.toString().padStart(4, '0')}.jpg`);
-            await extractFrameAtTime(videoPath, scene.midTime, filename);
+            await extractFrameAtTime(videoPath, scene.midTime, filename, metadata);
             frames.push({
                 filename,
                 timecode: scene.timecode,
@@ -214,7 +248,8 @@ export async function detectAudioActivity(videoPath) {
         console.log('🎤 Running Voice Activity Detection (VAD)...');
         // Use FFmpeg volumedetect filter to analyze audio levels
         const command = `ffmpeg -i "${videoPath}" -af volumedetect -f null - 2>&1`;
-        const { stdout } = await execAsync(command, { maxBuffer: 10 * 1024 * 1024 });
+        // Increased maxBuffer to 50MB for high-resolution videos
+        const { stdout } = await execAsync(command, { maxBuffer: 50 * 1024 * 1024, timeout: 300000 });
         // Parse volumedetect output
         // Example output:
         // [Parsed_volumedetect_0 @ 0x...] mean_volume: -25.3 dB
@@ -227,11 +262,12 @@ export async function detectAudioActivity(videoPath) {
         }
         const meanVolume = parseFloat(meanVolumeMatch[1]);
         const maxVolume = parseFloat(maxVolumeMatch[1]);
-        // Thresholds for audio detection:
-        // - mean_volume > -60 dB: Normal audio levels
-        // - max_volume > -50 dB: At least some audible peaks
-        const MEAN_VOLUME_THRESHOLD = -60;
-        const MAX_VOLUME_THRESHOLD = -50;
+        // Thresholds for audio detection (adjusted for smartphone videos):
+        // - mean_volume > -70 dB: Lower threshold for phone-recorded audio with AGC
+        // - max_volume > -60 dB: Lower threshold for quiet recordings
+        // Smartphone microphones apply automatic gain control (AGC) which can result in lower volume levels
+        const MEAN_VOLUME_THRESHOLD = -70;
+        const MAX_VOLUME_THRESHOLD = -60;
         const hasAudio = meanVolume > MEAN_VOLUME_THRESHOLD && maxVolume > MAX_VOLUME_THRESHOLD;
         console.log(`  📊 Audio levels: mean=${meanVolume.toFixed(1)}dB, max=${maxVolume.toFixed(1)}dB`);
         console.log(`  ${hasAudio ? '✅ Audio detected' : '❌ No audio detected (silent video)'}`);
@@ -245,8 +281,9 @@ export async function detectAudioActivity(videoPath) {
             if (meanVolumeMatch && maxVolumeMatch) {
                 const meanVolume = parseFloat(meanVolumeMatch[1]);
                 const maxVolume = parseFloat(maxVolumeMatch[1]);
-                const MEAN_VOLUME_THRESHOLD = -60;
-                const MAX_VOLUME_THRESHOLD = -50;
+                // Same thresholds as above for smartphone audio
+                const MEAN_VOLUME_THRESHOLD = -70;
+                const MAX_VOLUME_THRESHOLD = -60;
                 const hasAudio = meanVolume > MEAN_VOLUME_THRESHOLD && maxVolume > MAX_VOLUME_THRESHOLD;
                 console.log(`  📊 Audio levels: mean=${meanVolume.toFixed(1)}dB, max=${maxVolume.toFixed(1)}dB`);
                 console.log(`  ${hasAudio ? '✅ Audio detected' : '❌ No audio detected (silent video)'}`);

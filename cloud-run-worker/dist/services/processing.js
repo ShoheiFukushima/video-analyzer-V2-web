@@ -128,7 +128,7 @@ export async function handleProcessing(request) {
 }
 async function downloadFromBlob(url) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120000); // 120秒タイムアウト
+    const timeout = setTimeout(() => controller.abort(), 300000); // 300秒(5分)タイムアウト - スマホの4K動画対応
     try {
         const response = await fetch(url, { signal: controller.signal });
         clearTimeout(timeout);
@@ -140,14 +140,15 @@ async function downloadFromBlob(url) {
     catch (error) {
         clearTimeout(timeout);
         if (error instanceof Error && error.name === 'AbortError') {
-            throw new Error('Download timeout (120s)');
+            throw new Error('Download timeout (300s) - file may be too large');
         }
         throw error;
     }
 }
 async function extractAudio(videoPath, audioPath) {
     // エラーログを保持するため 2>/dev/null を削除
-    const command = `ffmpeg -i "${videoPath}" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${audioPath}" -y`;
+    // -ac 1 を削除してステレオ音声を維持（Whisper APIはステレオ対応）
+    const command = `ffmpeg -i "${videoPath}" -vn -acodec pcm_s16le -ar 16000 "${audioPath}" -y`;
     try {
         const { stdout, stderr } = await execAsync(command);
         // FFmpegの出力をログ
