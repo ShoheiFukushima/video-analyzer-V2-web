@@ -129,18 +129,10 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
       // Uses token from server for security, uploads directly to Vercel Blob
       let blobUrl: string;
       try {
+        setProgress(25); // Show upload starting
         const newBlob = await upload(file.name, file, {
           access: 'public',
           handleUploadUrl: '/api/blob-upload',
-          onUploadProgress: (progressEvent) => {
-            // Update progress bar during upload
-            if (progressEvent.loaded && progressEvent.total) {
-              const uploadProgress = Math.round(
-                (progressEvent.loaded / progressEvent.total) * 40
-              );
-              setProgress(uploadProgress);
-            }
-          },
         });
 
         blobUrl = newBlob.url;
