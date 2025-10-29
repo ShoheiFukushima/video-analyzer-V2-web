@@ -14,7 +14,7 @@ export async function POST(request: NextRequest): Promise<Response> {
   const body = (await request.json()) as HandleUploadBody;
 
   try {
-    const jsonResponse = await handleUpload({
+    const response = await handleUpload({
       body,
       request,
       onBeforeGenerateToken: async (pathname: string) => {
@@ -54,7 +54,7 @@ export async function POST(request: NextRequest): Promise<Response> {
       },
     });
 
-    return jsonResponse;
+    return response;
   } catch (error) {
     console.error('Blob upload error:', error);
     return new Response(
