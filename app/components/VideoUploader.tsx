@@ -47,6 +47,74 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
     }
   };
 
+  /**
+   * Classify error and provide user-friendly message with retry guidance
+   */
+  const getErrorMessage = (error: unknown): { message: string; retryable: boolean } => {
+    if (error instanceof Error) {
+      const msg = error.message.toLowerCase();
+
+      // Network errors
+      if (msg.includes('network') || msg.includes('fetch') || msg.includes('connection')) {
+        return {
+          message: 'Network connection lost. Please check your internet and try again.',
+          retryable: true,
+        };
+      }
+
+      // Timeout errors
+      if (msg.includes('timeout') || msg.includes('timed out')) {
+        return {
+          message: 'Upload took too long. Your internet may be slow. Try again with a smaller file.',
+          retryable: true,
+        };
+      }
+
+      // Authentication errors
+      if (msg.includes('unauthorized') || msg.includes('401')) {
+        return {
+          message: 'Authentication failed. Please sign in again.',
+          retryable: false,
+        };
+      }
+
+      // File size errors
+      if (msg.includes('size') || msg.includes('too large') || msg.includes('413')) {
+        return {
+          message: `File is too large. Maximum: 500MB. Your file: ${(file?.size ?? 0 / 1024 / 1024).toFixed(0)}MB`,
+          retryable: false,
+        };
+      }
+
+      // Processing errors
+      if (msg.includes('processing') || msg.includes('process')) {
+        return {
+          message: 'Failed to start video processing. The server may be busy. Try again in a moment.',
+          retryable: true,
+        };
+      }
+
+      // Blob upload errors
+      if (msg.includes('blob') || msg.includes('upload')) {
+        return {
+          message: 'Failed to upload video to storage. Please check your connection and try again.',
+          retryable: true,
+        };
+      }
+
+      // Generic error with original message
+      return {
+        message: `Upload failed: ${error.message}`,
+        retryable: true,
+      };
+    }
+
+    return {
+      message: 'An unexpected error occurred. Please try again.',
+      retryable: true,
+    };
+  };
+
   const handleUpload = async () => {
     if (!file) return;
 
@@ -59,14 +127,26 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
 
       // Step 1: Upload directly to Vercel Blob from client
       // This bypasses the 413 error by avoiding the API layer
+      let blobUrl: string;
       try {
         const blob = await put(`uploads/${uploadId}/${file.name}`, file, {
           access: 'public',
           multipart: true, // Enable multipart upload for large files
         });
+        blobUrl = blob.url;
         setProgress(50);
+      } catch (uploadErr) {
+        const errorInfo = uploadErr instanceof Error
+          ? uploadErr
+          : new Error('Video upload to storage failed');
+        const { message } = getErrorMessage(errorInfo);
+        setError(message);
+        setUploading(false);
+        return;
+      }
 
-        // Step 2: Trigger processing on Cloud Run Worker
+      // Step 2: Trigger processing on Cloud Run Worker
+      try {
         const processResponse = await fetch("/api/process", {
           method: "POST",
           headers: {
@@ -74,15 +154,23 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
           },
           body: JSON.stringify({
             uploadId,
-            blobUrl: blob.url,
+            blobUrl,
             fileName: file.name,
             dataConsent,
           }),
+          signal: AbortSignal.timeout(15000), // 15 second timeout
         });
 
         if (!processResponse.ok) {
-          const errorData = await processResponse.json();
-          throw new Error(errorData.error || "Processing failed to start");
+          let errorMessage = "Processing failed to start";
+          try {
+            const errorData = await processResponse.json();
+            errorMessage = errorData.error || errorData.message || errorMessage;
+          } catch {
+            // Response wasn't JSON, use status code
+            errorMessage = `Server error (${processResponse.status}). Try again in a moment.`;
+          }
+          throw new Error(errorMessage);
         }
 
         setProgress(100);
@@ -93,11 +181,18 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
         if (fileInputRef.current) {
           fileInputRef.current.value = "";
         }
-      } catch (uploadErr) {
-        throw uploadErr instanceof Error ? uploadErr : new Error('Upload failed');
+      } catch (processErr) {
+        const errorInfo = processErr instanceof Error
+          ? processErr
+          : new Error('Processing initialization failed');
+        const { message } = getErrorMessage(errorInfo);
+        setError(message);
+        setUploading(false);
+        return;
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Upload failed");
+      const { message } = getErrorMessage(err);
+      setError(message);
     } finally {
       setUploading(false);
     }
@@ -186,8 +281,26 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
 
       {/* Error Message */}
       {error && (
-        <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4">
-          <p className="text-red-800 dark:text-red-400 text-sm">{error}</p>
+        <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4 space-y-3">
+          <div className="flex gap-3">
+            <div className="flex-shrink-0">
+              <svg className="h-5 w-5 text-red-600 dark:text-red-400" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+              </svg>
+            </div>
+            <div className="flex-1">
+              <p className="text-red-800 dark:text-red-400 text-sm font-medium">{error}</p>
+            </div>
+          </div>
+          {file && (
+            <button
+              onClick={handleUpload}
+              disabled={uploading}
+              className="text-sm font-medium text-red-700 dark:text-red-300 hover:text-red-800 dark:hover:text-red-200 underline"
+            >
+              Retry Upload
+            </button>
+          )}
         </div>
       )}
 
