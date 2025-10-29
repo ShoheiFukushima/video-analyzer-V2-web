@@ -60,30 +60,40 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
         const response = await fetch(`/api/status/${uploadId}`);
         const data = await response.json();
 
+        // Update progress from API
+        if (data.progress !== undefined) {
+          setProgress(data.progress);
+        }
+
         if (data.status === "completed" && data.resultUrl) {
           setStatus("completed");
           setResultUrl(data.resultUrl);
           setMetadata(data.metadata);
           setProgress(100);
           clearInterval(pollInterval);
+          clearInterval(progressInterval);
           onComplete?.();
         } else if (data.status === "error") {
           setStatus("error");
           setError(data.message || "Processing failed");
           clearInterval(pollInterval);
+          clearInterval(progressInterval);
           onComplete?.();
+        } else if (data.status === "processing") {
+          // Map "processing" to a stage
+          setStatus("frames");
         }
       } catch (err) {
         console.error("Error polling status:", err);
       }
     };
 
-    // Start progress simulation
-    const progressInterval = setInterval(simulateProgress, 3000);
+    // Start progress simulation (slower, as backup)
+    const progressInterval = setInterval(simulateProgress, 5000);
 
-    // Start polling every 5 seconds
-    pollInterval = setInterval(pollStatus, 5000);
-    pollStatus(); // Initial poll
+    // Start polling every 3 seconds
+    pollInterval = setInterval(pollStatus, 3000);
+    pollStatus(); // Initial poll immediately
 
     return () => {
       clearInterval(pollInterval);
