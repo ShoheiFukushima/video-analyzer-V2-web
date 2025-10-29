@@ -7,6 +7,21 @@ export const maxDuration = 300; // 5 minutes
 
 export async function POST(request: NextRequest) {
   try {
+    // Check Content-Length header early to catch too-large requests
+    const contentLength = request.headers.get('content-length');
+    const maxSizeBytes = 100 * 1024 * 1024; // 100MB for Vercel free tier safety
+
+    if (contentLength && parseInt(contentLength) > maxSizeBytes) {
+      return NextResponse.json(
+        {
+          error: "File size exceeds limit",
+          message: `Maximum file size is ${maxSizeBytes / 1024 / 1024}MB. Received: ${Math.round(parseInt(contentLength) / 1024 / 1024)}MB`,
+          code: "FILE_TOO_LARGE"
+        },
+        { status: 413 }
+      );
+    }
+
     // Check authentication
     const { userId } = await auth();
     if (!userId) {
@@ -30,12 +45,16 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "File must be a video" }, { status: 400 });
     }
 
-    // Validate file size (max 500MB)
-    const maxSize = 500 * 1024 * 1024;
+    // Validate file size (max 100MB for safety on Vercel free tier)
+    const maxSize = 100 * 1024 * 1024;
     if (file.size > maxSize) {
       return NextResponse.json(
-        { error: "File size exceeds 500MB limit" },
-        { status: 400 }
+        {
+          error: "File size exceeds limit",
+          message: `Maximum file size is ${maxSize / 1024 / 1024}MB. Your file: ${Math.round(file.size / 1024 / 1024)}MB`,
+          code: "FILE_TOO_LARGE"
+        },
+        { status: 413 }
       );
     }
 
