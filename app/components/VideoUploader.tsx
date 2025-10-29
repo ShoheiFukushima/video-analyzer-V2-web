@@ -2,7 +2,7 @@
 
 import { useState, useRef } from "react";
 import { Upload, X, Film } from "lucide-react";
-import { uploadToBlob } from "@/app/actions/uploadToBlob";
+import { upload } from "@vercel/blob/client";
 
 interface VideoUploaderProps {
   onUploadSuccess: (uploadId: string) => void;
@@ -125,20 +125,25 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
     try {
       const uploadId = `upload_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-      // Step 1: Upload to Vercel Blob via Server Action
-      // This is secure and avoids request size limits
+      // Step 1: Upload to Vercel Blob via client-side upload
+      // Uses token from server for security, uploads directly to Vercel Blob
       let blobUrl: string;
       try {
-        const result = await uploadToBlob(file, file.name, uploadId);
+        const newBlob = await upload(file.name, file, {
+          access: 'public',
+          handleUploadUrl: '/api/blob-upload',
+          onUploadProgress: (progressEvent) => {
+            // Update progress bar during upload
+            if (progressEvent.loaded && progressEvent.total) {
+              const uploadProgress = Math.round(
+                (progressEvent.loaded / progressEvent.total) * 40
+              );
+              setProgress(uploadProgress);
+            }
+          },
+        });
 
-        if (!result.success || !result.url) {
-          const errorMsg = result.message || "Failed to upload video to storage";
-          setError(errorMsg);
-          setUploading(false);
-          return;
-        }
-
-        blobUrl = result.url;
+        blobUrl = newBlob.url;
         setProgress(50);
       } catch (uploadErr) {
         const errorInfo = uploadErr instanceof Error
