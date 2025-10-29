@@ -2,6 +2,7 @@
 
 import { useState, useRef } from "react";
 import { Upload, X, Film } from "lucide-react";
+import { put } from "@vercel/blob";
 
 interface VideoUploaderProps {
   onUploadSuccess: (uploadId: string) => void;
@@ -54,53 +55,46 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
     setError(null);
 
     try {
-      // Step 1: Upload to Vercel Blob
       const uploadId = `upload_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("uploadId", uploadId);
+      // Step 1: Upload directly to Vercel Blob from client
+      // This bypasses the 413 error by avoiding the API layer
+      try {
+        const blob = await put(`uploads/${uploadId}/${file.name}`, file, {
+          access: 'public',
+          multipart: true, // Enable multipart upload for large files
+        });
+        setProgress(50);
 
-      // Upload to Vercel Blob via API route
-      const uploadResponse = await fetch("/api/upload", {
-        method: "POST",
-        body: formData,
-      });
+        // Step 2: Trigger processing on Cloud Run Worker
+        const processResponse = await fetch("/api/process", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            uploadId,
+            blobUrl: blob.url,
+            fileName: file.name,
+            dataConsent,
+          }),
+        });
 
-      if (!uploadResponse.ok) {
-        const errorData = await uploadResponse.json();
-        throw new Error(errorData.error || "Upload failed");
-      }
+        if (!processResponse.ok) {
+          const errorData = await processResponse.json();
+          throw new Error(errorData.error || "Processing failed to start");
+        }
 
-      const { blobUrl } = await uploadResponse.json();
-      setProgress(50);
+        setProgress(100);
+        onUploadSuccess(uploadId);
 
-      // Step 2: Trigger processing on Cloud Run Worker
-      const processResponse = await fetch("/api/process", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          uploadId,
-          blobUrl,
-          fileName: file.name,
-          dataConsent,
-        }),
-      });
-
-      if (!processResponse.ok) {
-        const errorData = await processResponse.json();
-        throw new Error(errorData.error || "Processing failed to start");
-      }
-
-      setProgress(100);
-      onUploadSuccess(uploadId);
-
-      // Reset form
-      setFile(null);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
+        // Reset form
+        setFile(null);
+        if (fileInputRef.current) {
+          fileInputRef.current.value = "";
+        }
+      } catch (uploadErr) {
+        throw uploadErr instanceof Error ? uploadErr : new Error('Upload failed');
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed");

@@ -1,78 +1,52 @@
-import { put } from "@vercel/blob";
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
 
 export const runtime = "nodejs";
-export const maxDuration = 300; // 5 minutes
+export const maxDuration = 60; // 1 minute (just for metadata logging)
 
+/**
+ * This endpoint now just receives confirmation that client-side upload succeeded.
+ * The actual file upload happens directly from the client to Vercel Blob,
+ * bypassing the 413 (Content Too Large) error that occurred with large files.
+ */
 export async function POST(request: NextRequest) {
   try {
-    // Check Content-Length header early to catch too-large requests
-    const contentLength = request.headers.get('content-length');
-    const maxSizeBytes = 100 * 1024 * 1024; // 100MB for Vercel free tier safety
-
-    if (contentLength && parseInt(contentLength) > maxSizeBytes) {
-      return NextResponse.json(
-        {
-          error: "File size exceeds limit",
-          message: `Maximum file size is ${maxSizeBytes / 1024 / 1024}MB. Received: ${Math.round(parseInt(contentLength) / 1024 / 1024)}MB`,
-          code: "FILE_TOO_LARGE"
-        },
-        { status: 413 }
-      );
-    }
-
     // Check authentication
     const { userId } = await auth();
     if (!userId) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const formData = await request.formData();
-    const file = formData.get("file") as File;
-    const uploadId = formData.get("uploadId") as string;
+    const body = await request.json();
+    const { uploadId, blobUrl } = body;
 
-    if (!file) {
-      return NextResponse.json({ error: "No file provided" }, { status: 400 });
-    }
-
-    if (!uploadId) {
-      return NextResponse.json({ error: "No upload ID provided" }, { status: 400 });
-    }
-
-    // Validate file type
-    if (!file.type.startsWith("video/")) {
-      return NextResponse.json({ error: "File must be a video" }, { status: 400 });
-    }
-
-    // Validate file size (max 100MB for safety on Vercel free tier)
-    const maxSize = 100 * 1024 * 1024;
-    if (file.size > maxSize) {
+    if (!uploadId || !blobUrl) {
       return NextResponse.json(
-        {
-          error: "File size exceeds limit",
-          message: `Maximum file size is ${maxSize / 1024 / 1024}MB. Your file: ${Math.round(file.size / 1024 / 1024)}MB`,
-          code: "FILE_TOO_LARGE"
-        },
-        { status: 413 }
+        { error: "Missing uploadId or blobUrl" },
+        { status: 400 }
       );
     }
 
-    // Upload to Vercel Blob
-    const blob = await put(`uploads/${uploadId}/${file.name}`, file, {
-      access: "public",
-      token: process.env.BLOB_READ_WRITE_TOKEN,
-    });
+    // Validate that blobUrl is actually from Vercel Blob
+    if (!blobUrl.includes('blob.vercelusercontent.com')) {
+      return NextResponse.json(
+        { error: "Invalid blob URL" },
+        { status: 400 }
+      );
+    }
+
+    // TODO: Log upload metadata if needed
+    console.log(`Upload confirmed: ${uploadId} -> ${blobUrl}`);
 
     return NextResponse.json({
       success: true,
-      blobUrl: blob.url,
+      blobUrl,
       uploadId,
     });
   } catch (error) {
-    console.error("Upload error:", error);
+    console.error("Upload confirmation error:", error);
     return NextResponse.json(
-      { error: "Upload failed", message: error instanceof Error ? error.message : "Unknown error" },
+      { error: "Upload confirmation failed", message: error instanceof Error ? error.message : "Unknown error" },
       { status: 500 }
     );
   }
