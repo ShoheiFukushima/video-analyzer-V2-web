@@ -4,7 +4,7 @@ import { auth } from '@clerk/nextjs/server';
 
 export const runtime = 'nodejs';
 
-export async function POST(request: Request): Promise<NextResponse> {
+export async function POST(request: Request) {
   try {
     // Verify authentication
     const { userId } = await auth();
@@ -17,27 +17,35 @@ export async function POST(request: Request): Promise<NextResponse> {
 
     const body = (await request.json()) as HandleUploadBody;
 
-    const jsonResponse = await handleUpload({
+    // Call handleUpload with proper parameters
+    const response = await handleUpload({
       body,
       request,
       onBeforeGenerateToken: async (pathname: string) => {
         // Validate file type (must be video)
-        const videoExtensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv'];
+        const videoExtensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.mpg', '.mpeg'];
         const fileExtension = pathname.toLowerCase().split('.').pop();
         const isVideo = fileExtension && videoExtensions.includes(`.${fileExtension}`);
 
         if (!isVideo) {
+          console.warn('Invalid file extension:', pathname);
           throw new Error('Only video files are allowed');
         }
 
+        console.log('Generating token for:', pathname);
+
+        // Return complete token configuration
         return {
           allowedContentTypes: [
             'video/mp4',
             'video/quicktime',
+            'video/mov',
             'video/x-msvideo',
             'video/x-matroska',
             'video/webm',
             'video/x-flv',
+            'video/mpeg',
+            'application/octet-stream',
           ],
           addRandomSuffix: true,
           tokenPayload: JSON.stringify({
@@ -55,9 +63,14 @@ export async function POST(request: Request): Promise<NextResponse> {
       },
     });
 
-    return NextResponse.json(jsonResponse);
+    // Return the response directly - do NOT wrap it again
+    // handleUpload already returns a properly formatted NextResponse
+    return response as unknown as Response;
   } catch (error) {
-    console.error('Blob upload error:', error);
+    console.error('Blob upload error:', {
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
     return NextResponse.json(
       {
         error: 'Upload failed',
