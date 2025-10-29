@@ -14,7 +14,7 @@ export async function POST(request: NextRequest): Promise<Response> {
   const body = (await request.json()) as HandleUploadBody;
 
   try {
-    const response = await handleUpload({
+    const response: any = await handleUpload({
       body,
       request,
       onBeforeGenerateToken: async (pathname: string) => {
