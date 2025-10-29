@@ -51,11 +51,6 @@ export async function POST(request: NextRequest): Promise<Response> {
 
         // Here you could save metadata to database if needed
         // await db.uploads.create({ userId, blobUrl: blob.url, ... })
-
-        return {
-          success: true,
-          blobUrl: blob.url,
-        };
       },
     });
 
