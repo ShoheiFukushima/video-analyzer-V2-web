@@ -2,7 +2,7 @@
 
 import { useState, useRef } from "react";
 import { Upload, X, Film } from "lucide-react";
-import { put } from "@vercel/blob";
+import { uploadToBlob } from "@/app/actions/uploadToBlob";
 
 interface VideoUploaderProps {
   onUploadSuccess: (uploadId: string) => void;
@@ -125,15 +125,20 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
     try {
       const uploadId = `upload_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-      // Step 1: Upload directly to Vercel Blob from client
-      // This bypasses the 413 error by avoiding the API layer
+      // Step 1: Upload to Vercel Blob via Server Action
+      // This is secure and avoids request size limits
       let blobUrl: string;
       try {
-        const blob = await put(`uploads/${uploadId}/${file.name}`, file, {
-          access: 'public',
-          multipart: true, // Enable multipart upload for large files
-        });
-        blobUrl = blob.url;
+        const result = await uploadToBlob(file, file.name, uploadId);
+
+        if (!result.success || !result.url) {
+          const errorMsg = result.message || "Failed to upload video to storage";
+          setError(errorMsg);
+          setUploading(false);
+          return;
+        }
+
+        blobUrl = result.url;
         setProgress(50);
       } catch (uploadErr) {
         const errorInfo = uploadErr instanceof Error
