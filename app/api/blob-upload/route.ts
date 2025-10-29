@@ -1,33 +1,30 @@
 import { handleUpload, type HandleUploadBody } from '@vercel/blob/client';
-import { NextRequest } from 'next/server';
+import { NextResponse } from 'next/server';
 import { auth } from '@clerk/nextjs/server';
 
 export const runtime = 'nodejs';
 
-export async function POST(request: NextRequest): Promise<Response> {
-  // Verify authentication
-  const { userId } = await auth();
-  if (!userId) {
-    return new Response('Unauthorized', { status: 401 });
-  }
-
-  const body = (await request.json()) as HandleUploadBody;
-
+export async function POST(request: Request): Promise<NextResponse> {
   try {
-    const response: any = await handleUpload({
+    // Verify authentication
+    const { userId } = await auth();
+    if (!userId) {
+      return NextResponse.json(
+        { error: 'Unauthorized', message: 'You must be logged in to upload' },
+        { status: 401 }
+      );
+    }
+
+    const body = (await request.json()) as HandleUploadBody;
+
+    const jsonResponse = await handleUpload({
       body,
       request,
       onBeforeGenerateToken: async (pathname: string) => {
         // Validate file type (must be video)
-        if (!pathname.includes('uploads/')) {
-          throw new Error('Invalid upload path');
-        }
-
-        // Only allow video files
         const videoExtensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv'];
-        const isVideo = videoExtensions.some((ext) =>
-          pathname.toLowerCase().endsWith(ext)
-        );
+        const fileExtension = pathname.toLowerCase().split('.').pop();
+        const isVideo = fileExtension && videoExtensions.includes(`.${fileExtension}`);
 
         if (!isVideo) {
           throw new Error('Only video files are allowed');
@@ -42,27 +39,31 @@ export async function POST(request: NextRequest): Promise<Response> {
             'video/webm',
             'video/x-flv',
           ],
-          tokenPayload: JSON.stringify({ userId, uploadPath: pathname }),
+          addRandomSuffix: true,
+          tokenPayload: JSON.stringify({
+            userId,
+            uploadedAt: new Date().toISOString(),
+            fileName: pathname,
+          }),
         };
       },
       onUploadCompleted: async ({ blob, tokenPayload }) => {
         console.log('Upload completed:', blob.url);
-        console.log('Token payload:', tokenPayload);
-
+        console.log('Payload:', tokenPayload);
         // Here you could save metadata to database if needed
-        // await db.uploads.create({ userId, blobUrl: blob.url, ... })
+        // await db.uploads.create({ userId, blobUrl: blob.url, metadata: tokenPayload })
       },
     });
 
-    return response;
+    return NextResponse.json(jsonResponse);
   } catch (error) {
     console.error('Blob upload error:', error);
-    return new Response(
-      JSON.stringify({
+    return NextResponse.json(
+      {
         error: 'Upload failed',
         message: error instanceof Error ? error.message : 'Unknown error',
-      }),
-      { status: 400, headers: { 'content-type': 'application/json' } }
+      },
+      { status: 400 }
     );
   }
 }
