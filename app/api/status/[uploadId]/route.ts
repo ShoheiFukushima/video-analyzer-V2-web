@@ -16,36 +16,6 @@ export async function GET(
 
     const { uploadId } = params;
 
-    // Development mode: return demo data with simulated progress
-    if (process.env.NODE_ENV === "development") {
-      const uploadTime = parseInt(uploadId.split("_")[1] || "0");
-      const elapsedSeconds = (Date.now() - uploadTime) / 1000;
-
-      // Simulate processing progression: 40-60 seconds for full processing
-      if (elapsedSeconds < 40) {
-        return NextResponse.json({
-          uploadId,
-          status: "processing",
-          progress: Math.min(80, Math.floor((elapsedSeconds / 40) * 80)),
-          message: `Processing: ${Math.floor((elapsedSeconds / 40) * 100)}% complete`,
-        });
-      } else {
-        // After 40 seconds, return completed status with demo result
-        return NextResponse.json({
-          uploadId,
-          status: "completed",
-          progress: 100,
-          message: "Processing completed!",
-          resultUrl: `https://example.com/results/${uploadId}.xlsx`,
-          metadata: {
-            duration: 145.5,
-            segmentCount: 12,
-            ocrResultCount: 48,
-          },
-        });
-      }
-    }
-
     const cloudRunUrl = process.env.CLOUD_RUN_URL;
     const workerSecret = process.env.WORKER_SECRET;
 

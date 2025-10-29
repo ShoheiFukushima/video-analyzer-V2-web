@@ -1,7 +1,7 @@
 import { renderHook, waitFor } from '@testing-library/react';
 import { useVideoProcess, useProcessingStatus } from '@/app/hooks/useVideoProcessing';
 import { TestWrapper } from '@/app/test-utils/test-utils';
-import axios, { AxiosError } from 'axios';
+import axios from 'axios';
 
 jest.mock('axios');
 
@@ -36,19 +36,6 @@ describe('useVideoProcess', () => {
 
     expect(result.current.data).toEqual(mockResponse);
   });
-
-  // TODO: Fix error handling mock - currently React Query retries are interfering
-  // it('should handle processing error', async () => {
-  //   mockedAxios.post.mockRejectedValueOnce(new Error('Server error'));
-  //   const { result } = renderHook(() => useVideoProcess(), { wrapper: TestWrapper });
-  //   result.current.mutate({
-  //     uploadId: 'upload_123',
-  //     blobUrl: 'https://example.com/video.mp4',
-  //     fileName: 'test.mp4',
-  //     dataConsent: false,
-  //   });
-  //   await waitFor(() => expect(result.current.isError).toBe(true));
-  // });
 });
 
 describe('useProcessingStatus', () => {
@@ -86,11 +73,4 @@ describe('useProcessingStatus', () => {
     expect(result.current.isFetching).toBe(false);
     expect(mockedAxios.get).not.toHaveBeenCalled();
   });
-
-  // TODO: Fix error handling mock - currently React Query retries are interfering
-  // it('should handle status fetch error', async () => {
-  //   mockedAxios.get.mockRejectedValueOnce(new Error('Not found'));
-  //   const { result } = renderHook(() => useProcessingStatus('invalid_id'), { wrapper: TestWrapper });
-  //   await waitFor(() => expect(result.current.isError).toBe(true));
-  // });
 });

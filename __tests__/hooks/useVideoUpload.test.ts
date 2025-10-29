@@ -1,7 +1,7 @@
 import { renderHook, waitFor } from '@testing-library/react';
 import { useVideoUpload } from '@/app/hooks/useVideoUpload';
 import { TestWrapper } from '@/app/test-utils/test-utils';
-import axios, { AxiosError } from 'axios';
+import axios from 'axios';
 
 jest.mock('axios');
 
@@ -33,13 +33,4 @@ describe('useVideoUpload', () => {
 
     expect(result.current.data).toEqual(mockResponse);
   });
-
-  // TODO: Fix error handling mock - currently React Query retries are interfering
-  // it('should handle upload error', async () => {
-  //   mockedAxios.post.mockRejectedValueOnce(new Error('Network error'));
-  //   const { result } = renderHook(() => useVideoUpload(), { wrapper: TestWrapper });
-  //   const formData = new FormData();
-  //   result.current.mutate(formData);
-  //   await waitFor(() => expect(result.current.isError).toBe(true));
-  // });
 });

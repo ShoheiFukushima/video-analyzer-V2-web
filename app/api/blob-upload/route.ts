@@ -50,8 +50,8 @@ export async function POST(request: Request): Promise<NextResponse> {
       onUploadCompleted: async ({ blob, tokenPayload }) => {
         console.log('Upload completed:', blob.url);
         console.log('Payload:', tokenPayload);
-        // Here you could save metadata to database if needed
-        // await db.uploads.create({ userId, blobUrl: blob.url, metadata: tokenPayload })
+        // TODO: Implement database persistence for upload metadata (Phase 2)
+        // Example: await db.uploads.create({ userId, blobUrl: blob.url, metadata: tokenPayload })
       },
     });
 
