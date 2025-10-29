@@ -5,6 +5,12 @@ const nextConfig = {
       bodySizeLimit: '500mb',
     },
   },
+  api: {
+    bodyParser: {
+      sizeLimit: '500mb',
+    },
+    responseLimit: '500mb',
+  },
   images: {
     domains: [],
   },
