@@ -1,4 +1,4 @@
-import { handleUpload, type HandleUploadBody } from '@vercel/blob/next/api';
+import { handleUpload, type HandleUploadBody } from '@vercel/blob/client';
 import { NextRequest } from 'next/server';
 import { auth } from '@clerk/nextjs/server';
 
