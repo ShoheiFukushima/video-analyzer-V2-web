@@ -4,42 +4,84 @@ import { auth } from '@clerk/nextjs/server';
 
 export const runtime = 'nodejs';
 
+interface BlobUploadResponse {
+  url: string;
+  pathname: string;
+  contentType: string;
+  contentDisposition: string;
+}
+
 export async function POST(request: Request) {
+  const requestId = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  console.log(`[blob-upload][${requestId}] Request started`);
+
   try {
-    // Verify authentication
-    const { userId } = await auth();
-    if (!userId) {
+    // Verify authentication - Required for all environments
+    let userId: string | null = null;
+
+    try {
+      const authResult = await auth();
+      userId = authResult.userId || null;
+      console.log(`[blob-upload][${requestId}] Auth verified:`, { userId });
+    } catch (authError) {
+      console.error(`[blob-upload][${requestId}] Auth error:`, authError);
       return NextResponse.json(
-        { error: 'Unauthorized', message: 'You must be logged in to upload' },
+        { error: 'Unauthorized', message: 'You must be logged in' },
         { status: 401 }
       );
     }
 
-    const body = (await request.json()) as HandleUploadBody;
+    if (!userId) {
+      return NextResponse.json(
+        { error: 'Unauthorized', message: 'User not authenticated' },
+        { status: 401 }
+      );
+    }
 
-    // Call handleUpload with proper parameters
+    // Parse request body
+    let body: HandleUploadBody;
+    try {
+      body = (await request.json()) as HandleUploadBody;
+      console.log(`[blob-upload][${requestId}] Body parsed`);
+    } catch (parseError) {
+      console.error(`[blob-upload][${requestId}] JSON parse failed:`, parseError);
+      return NextResponse.json(
+        { error: 'Invalid request body' },
+        { status: 400 }
+      );
+    }
+
+    // Check token
+    const blobToken = process.env.BLOB_READ_WRITE_TOKEN;
+    if (!blobToken) {
+      console.error(`[blob-upload][${requestId}] Missing BLOB_READ_WRITE_TOKEN`);
+      return NextResponse.json(
+        { error: 'Server misconfigured' },
+        { status: 500 }
+      );
+    }
+
+    // Call handleUpload
+    console.log(`[blob-upload][${requestId}] Calling handleUpload`);
+
     const response = await handleUpload({
       body,
       request,
       onBeforeGenerateToken: async (pathname: string) => {
-        // Validate file type (must be video)
-        const videoExtensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.mpg', '.mpeg'];
-        const fileExtension = pathname.toLowerCase().split('.').pop();
-        const isVideo = fileExtension && videoExtensions.includes(`.${fileExtension}`);
+        console.log(`[blob-upload][${requestId}] Generating token for:`, pathname);
 
-        if (!isVideo) {
-          console.warn('Invalid file extension:', pathname);
-          throw new Error('Only video files are allowed');
+        // Validate video file
+        const ext = pathname.split('.').pop()?.toLowerCase();
+        const videoExts = ['mp4', 'mov', 'avi', 'mkv', 'webm', 'flv', 'mpg', 'mpeg'];
+
+        if (!ext || !videoExts.includes(ext)) {
+          throw new Error(`Invalid file type: ${ext}`);
         }
 
-        console.log('Generating token for:', pathname);
-
-        // Return complete token configuration
         return {
           allowedContentTypes: [
             'video/mp4',
             'video/quicktime',
-            'video/mov',
             'video/x-msvideo',
             'video/x-matroska',
             'video/webm',
@@ -48,6 +90,7 @@ export async function POST(request: Request) {
             'application/octet-stream',
           ],
           addRandomSuffix: true,
+          maximumSizeInBytes: 500 * 1024 * 1024,
           tokenPayload: JSON.stringify({
             userId,
             uploadedAt: new Date().toISOString(),
@@ -55,28 +98,23 @@ export async function POST(request: Request) {
           }),
         };
       },
-      onUploadCompleted: async ({ blob, tokenPayload }) => {
-        console.log('Upload completed:', blob.url);
-        console.log('Payload:', tokenPayload);
-        // TODO: Implement database persistence for upload metadata (Phase 2)
-        // Example: await db.uploads.create({ userId, blobUrl: blob.url, metadata: tokenPayload })
+      onUploadCompleted: async ({ blob }) => {
+        console.log(`[blob-upload][${requestId}] Upload completed:`, blob.url);
       },
     });
 
-    // Return the response directly - do NOT wrap it again
-    // handleUpload already returns a properly formatted NextResponse
-    return response as unknown as Response;
+    console.log(`[blob-upload][${requestId}] Success`);
+    return NextResponse.json(response);
   } catch (error) {
-    console.error('Blob upload error:', {
-      message: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
-    });
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    console.error(`[blob-upload][${requestId}] ERROR:`, errorMsg);
+
     return NextResponse.json(
       {
         error: 'Upload failed',
-        message: error instanceof Error ? error.message : 'Unknown error',
+        message: errorMsg,
       },
-      { status: 400 }
+      { status: 500 }
     );
   }
 }

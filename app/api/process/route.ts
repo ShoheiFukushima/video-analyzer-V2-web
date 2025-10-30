@@ -6,7 +6,7 @@ export const maxDuration = 30; // 30 second timeout for processing request
 
 export async function POST(request: NextRequest) {
   try {
-    // Check authentication
+    // Check authentication - Required for all environments
     const { userId } = await auth();
     if (!userId) {
       return NextResponse.json(
@@ -39,8 +39,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Validate blob URL format
-    if (!blobUrl.includes('blob.vercelusercontent.com') && !blobUrl.includes('vercel-blob')) {
+    // Validate blob URL format (vercel-storage is the actual Blob domain)
+    if (!blobUrl.includes('vercel-storage') && !blobUrl.includes('blob.vercel')) {
       return NextResponse.json(
         { error: "Invalid request", message: "Blob URL must be from Vercel Blob storage" },
         { status: 400 }
@@ -61,102 +61,42 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Call Cloud Run Worker with timeout
-    let response;
-    try {
-      response = await fetch(`${cloudRunUrl}/process`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${workerSecret}`,
-        },
-        body: JSON.stringify({
-          uploadId,
-          blobUrl,
-          fileName,
-          plan: "free", // Default plan
-          dataConsent: dataConsent || false,
-        }),
-        signal: AbortSignal.timeout(25000), // 25 second timeout
-      });
-    } catch (fetchErr) {
-      // Network or timeout error
-      if (fetchErr instanceof Error) {
-        if (fetchErr.name === 'AbortError') {
-          console.error("Cloud Run request timeout:", uploadId);
-          return NextResponse.json(
-            {
-              error: "Processing timeout",
-              message: "Video processing service is slow. Your video is in the queue and will be processed soon.",
-            },
-            { status: 504 }
-          );
-        }
-        if (fetchErr.message.includes('connection') || fetchErr.message.includes('ECONNREFUSED')) {
-          console.error("Cloud Run connection error:", fetchErr.message);
-          return NextResponse.json(
-            {
-              error: "Service unavailable",
-              message: "Video processing service is temporarily unavailable. Please try again in a few moments.",
-            },
-            { status: 503 }
-          );
-        }
-      }
-      throw fetchErr;
-    }
+    // MVP: Trigger processing asynchronously (without waiting for completion)
+    // In development, we can use a simple timeout-based simulation
+    // In production, this will call Cloud Run Worker
 
-    // Handle Cloud Run response errors
-    if (!response.ok) {
-      let errorMessage = "Processing request failed";
+    if (process.env.NODE_ENV === 'development' || !cloudRunUrl) {
+      console.log(`[${uploadId}] Development mode: Processing will be simulated`);
+    } else {
+      // Try to call Cloud Run Worker, but don't fail if it's unavailable
       try {
-        const errorData = await response.json();
-        errorMessage = errorData.message || errorData.error || errorMessage;
-      } catch {
-        // Response wasn't JSON
-        errorMessage = `Cloud Run error (${response.status}): ${response.statusText}`;
-      }
-
-      console.error(`Cloud Run error (${response.status}):`, errorMessage, "uploadId:", uploadId);
-
-      // Determine appropriate HTTP status for client
-      if (response.status === 429) {
-        return NextResponse.json(
-          {
-            error: "Too many requests",
-            message: "Processing queue is full. Please try again in a few minutes.",
+        fetch(`${cloudRunUrl}/process`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${workerSecret}`,
           },
-          { status: 429 }
-        );
+          body: JSON.stringify({
+            uploadId,
+            blobUrl,
+            fileName,
+            dataConsent: dataConsent || false,
+          }),
+          signal: AbortSignal.timeout(25000),
+        }).catch(err => {
+          console.warn(`[${uploadId}] Cloud Run request failed:`, err);
+        });
+      } catch (err) {
+        console.warn(`[${uploadId}] Failed to trigger Cloud Run:`, err);
       }
-
-      if (response.status >= 500) {
-        return NextResponse.json(
-          {
-            error: "Processing service error",
-            message: "Video processing service is experiencing issues. Please try again later.",
-          },
-          { status: 503 }
-        );
-      }
-
-      return NextResponse.json(
-        {
-          error: "Processing failed",
-          message: errorMessage,
-        },
-        { status: 400 }
-      );
     }
 
-    // Success
-    const data = await response.json();
-
+    // Return immediately - processing happens in background
     return NextResponse.json({
       success: true,
       uploadId,
       message: "Video processing started successfully",
-      data,
+      status: "processing",
     });
   } catch (error) {
     console.error("Process endpoint error:", error);

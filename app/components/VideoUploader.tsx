@@ -130,14 +130,28 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
       let blobUrl: string;
       try {
         setProgress(25); // Show upload starting
+
+        console.log('[VideoUploader] Starting blob upload...', {
+          fileName: file.name,
+          fileSize: file.size,
+          fileType: file.type
+        });
+
         const newBlob = await upload(file.name, file, {
           access: 'public',
           handleUploadUrl: '/api/blob-upload',
         });
 
+        console.log('[VideoUploader] Blob upload successful:', { url: newBlob.url });
         blobUrl = newBlob.url;
         setProgress(50);
       } catch (uploadErr) {
+        console.error('[VideoUploader] Upload error:', {
+          message: uploadErr instanceof Error ? uploadErr.message : String(uploadErr),
+          name: uploadErr instanceof Error ? uploadErr.name : undefined,
+          stack: uploadErr instanceof Error ? uploadErr.stack : undefined,
+        });
+
         const errorInfo = uploadErr instanceof Error
           ? uploadErr
           : new Error('Video upload to storage failed');

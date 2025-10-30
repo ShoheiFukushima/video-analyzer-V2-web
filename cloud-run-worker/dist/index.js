@@ -1,112 +1,96 @@
 import express from 'express';
-import { config } from 'dotenv';
-import { handleProcessing } from './services/processing.js';
-import { createClient } from '@supabase/supabase-js';
-// Load environment variables
-config();
+import dotenv from 'dotenv';
+import { processVideo } from './services/videoProcessor.js';
+import { getStatus } from './services/statusManager.js';
+dotenv.config();
 const app = express();
-const PORT = process.env.PORT || 3000;
+const port = process.env.PORT || 8080;
+const workerSecret = process.env.WORKER_SECRET;
 // Middleware
-app.use(express.json());
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
-// Security: Verify WORKER_SECRET
-const authMiddleware = (req, res, next) => {
+app.use(express.json({ limit: '10mb' }));
+// Authentication middleware
+const validateAuth = (req, res, next) => {
     const authHeader = req.headers.authorization;
-    const expectedAuth = `Bearer ${process.env.WORKER_SECRET}`;
-    if (authHeader !== expectedAuth) {
-        return res.status(401).json({ error: 'Unauthorized' });
+    const token = authHeader?.replace('Bearer ', '');
+    if (!token || token !== workerSecret) {
+        res.status(401).json({ error: 'Unauthorized' });
+        return;
     }
     next();
 };
 // Health check endpoint
 app.get('/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        timestamp: new Date().toISOString(),
-        version: '2.0.0'
-    });
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
-// Main processing endpoint
-app.post('/process', authMiddleware, async (req, res) => {
+// Process video endpoint
+app.post('/process', validateAuth, async (req, res) => {
     try {
-        const { uploadId, blobUrl, fileName, plan, dataConsent, } = req.body;
-        // Validation
+        const { uploadId, blobUrl, fileName, dataConsent } = req.body;
         if (!uploadId || !blobUrl) {
-            return res.status(400).json({
-                error: 'Missing required fields: uploadId, blobUrl'
+            res.status(400).json({
+                error: 'Invalid request',
+                message: 'Missing uploadId or blobUrl'
             });
+            return;
         }
-        console.log(`[${uploadId}] Starting processing for: ${fileName}`);
-        // Call processing service (核心処理)
-        const result = await handleProcessing({
-            uploadId,
-            blobUrl,
-            fileName,
-            plan,
-            dataConsent,
+        console.log(`[${uploadId}] Starting video processing`, { fileName });
+        // Start processing asynchronously
+        processVideo(uploadId, blobUrl, fileName, dataConsent)
+            .catch(err => {
+            console.error(`[${uploadId}] Processing error:`, err);
         });
-        // Return success with result URL
-        return res.status(200).json({
+        // Return immediately - processing happens in background
+        res.json({
             success: true,
             uploadId,
-            resultUrl: result.resultUrl,
-            duration: result.processingDuration,
-            metadata: result.metadata,
+            message: 'Video processing started',
+            status: 'processing'
         });
     }
     catch (error) {
-        console.error('Processing error:', error);
-        const message = error instanceof Error ? error.message : 'Unknown error';
-        return res.status(500).json({
-            error: 'Processing failed',
-            message,
+        console.error('[Process endpoint] Error:', error);
+        res.status(500).json({
+            error: 'Server error',
+            message: error instanceof Error ? error.message : 'Unknown error'
         });
     }
 });
-// Status check endpoint
-app.get('/status/:uploadId', authMiddleware, async (req, res) => {
+// Get status endpoint
+app.get('/status/:uploadId', validateAuth, async (req, res) => {
     try {
         const { uploadId } = req.params;
-        // Initialize Supabase if available
-        if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
-            const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
-            const { data, error } = await supabase
-                .from('video_analytics')
-                .select('*')
-                .eq('upload_id', uploadId)
-                .single();
-            if (error || !data) {
-                return res.status(404).json({ error: 'Upload not found' });
-            }
-            return res.json({
-                uploadId,
-                status: 'completed',
-                data,
-            });
+        const status = await getStatus(uploadId);
+        if (!status) {
+            res.status(404).json({ error: 'Upload not found' });
+            return;
         }
-        return res.status(200).json({
-            uploadId,
-            status: 'pending',
-            message: 'Status tracking not configured'
-        });
+        res.json(status);
     }
     catch (error) {
-        console.error('Status check error:', error);
-        return res.status(500).json({ error: 'Status check failed' });
+        console.error('[Status endpoint] Error:', error);
+        res.status(500).json({
+            error: 'Server error',
+            message: error instanceof Error ? error.message : 'Unknown error'
+        });
     }
 });
-// Error handling middleware
+// Environment validation
+const requiredEnvVars = ['WORKER_SECRET', 'GEMINI_API_KEY', 'OPENAI_API_KEY'];
+const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]);
+if (missingEnvVars.length > 0) {
+    console.warn('[Cloud Run Worker] Missing environment variables:', missingEnvVars.join(', '));
+    console.warn('[Cloud Run Worker] Some features may not work properly');
+}
+// Error handling
 app.use((err, req, res, next) => {
     console.error('Unhandled error:', err);
     res.status(500).json({
         error: 'Internal server error',
-        message: err.message,
+        message: process.env.NODE_ENV === 'development' ? err.message : 'An error occurred'
     });
 });
-// Start server
-app.listen(PORT, () => {
-    console.log(`Cloud Run Worker listening on port ${PORT}`);
-    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`Openness: Public (requires WORKER_SECRET)`);
+app.listen(port, () => {
+    console.log(`[Cloud Run Worker] Server running on port ${port}`);
+    console.log(`[Cloud Run Worker] NODE_ENV: ${process.env.NODE_ENV}`);
 });
-export default app;
+//# sourceMappingURL=index.js.map

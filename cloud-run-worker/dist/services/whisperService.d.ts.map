@@ -1,0 +1,1 @@
+{"version":3,"file":"whisperService.d.ts","sourceRoot":"","sources":["../../src/services/whisperService.ts"],"names":[],"mappings":"AAOA,UAAU,oBAAoB;IAC5B,SAAS,EAAE,MAAM,CAAC;IAClB,QAAQ,EAAE,MAAM,CAAC;IACjB,IAAI,EAAE,MAAM,CAAC;IACb,UAAU,EAAE,MAAM,CAAC;CACpB;AAED,eAAO,MAAM,eAAe,GAC1B,WAAW,MAAM,EACjB,UAAU,MAAM,KACf,OAAO,CAAC,oBAAoB,EAAE,CAsEhC,CAAC"}

@@ -95,7 +95,20 @@ Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 ### Deploy Backend to Cloud Run
 
-See [`cloud-run-worker/README.md`](./cloud-run-worker/README.md) for Cloud Run deployment instructions.
+See [`cloud-run-worker/DEPLOYMENT_GUIDE.md`](./cloud-run-worker/DEPLOYMENT_GUIDE.md) for detailed Cloud Run deployment instructions.
+
+**Quick Start**:
+```bash
+cd cloud-run-worker
+npm run build
+docker build -t video-analyzer-worker:latest .
+gcloud run deploy video-analyzer-worker \
+  --source . \
+  --platform managed \
+  --region us-central1 \
+  --memory 2Gi \
+  --timeout 3600
+```
 
 ## Usage
 
