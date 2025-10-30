@@ -8,7 +8,9 @@ Upload videos and get AI-powered transcription using **Whisper** and OCR using *
 
 - 🎤 **Whisper AI Transcription** - Accurate speech-to-text with timestamps
 - 👁️ **Gemini Vision OCR** - Extract text from video frames
-- 📊 **Excel Export** - Comprehensive reports with screenshots and text
+- 📊 **Ideal Excel Format** - Scene-based layout with embedded screenshots
+- 🎬 **Scene Detection** - Multi-pass FFmpeg algorithm for accurate scene changes
+- 🖼️ **Screenshot Embedding** - Pixel-perfect image placement with aspect ratio preservation
 - 🔐 **Clerk Authentication** - Secure user authentication
 - ☁️ **Cloud Processing** - Scalable processing on Google Cloud Run
 - 📱 **Smartphone Support** - Handles portrait videos, rotation metadata, and 4K content
@@ -125,8 +127,50 @@ gcloud run deploy video-analyzer-worker \
 - Stereo or mono audio
 - Silent videos (OCR only)
 
-## Recent Improvements
+## Excel Output Format (V2.1)
 
+The generated Excel report features an **ideal scene-based layout**:
+
+| Column | Header | Description |
+|--------|--------|-------------|
+| A | **Scene #** | Sequential scene number (1, 2, 3...) |
+| B | **Timecode** | Scene start time (HH:MM:SS) |
+| C | **Screenshot** | Embedded PNG at scene mid-point |
+| D | **OCR Text** | Text detected by Gemini Vision |
+| E | **NA Text** | Narration from Whisper transcription |
+
+### Key Features
+
+- **Scene Detection**: FFmpeg multi-pass algorithm (thresholds: 0.03, 0.05, 0.10)
+- **Mid-Point Extraction**: Screenshots taken at 50% between scene changes
+- **Time-Based Mapping**: OCR matched by closest timestamp, narration by overlap
+- **Aspect Ratio Preservation**: Images maintain video's native aspect ratio
+- **Pixel-Perfect Positioning**: EMU units (9525 EMU/pixel) for precise placement
+
+### Example Test
+
+```bash
+cd cloud-run-worker
+npm run build
+node dist/test-ideal-pipeline.js /path/to/video.mp4
+```
+
+## Recent Improvements (V2.1.0 - 2025-10-30)
+
+### Excel Format Overhaul
+- ✅ **Ideal 5-column layout** with embedded screenshots
+- ✅ **Scene-based structure** replacing fixed-interval extraction
+- ✅ **Multi-pass scene detection** for maximum accuracy
+- ✅ **Time-based OCR/narration mapping** to scenes
+- ✅ **Statistics worksheet** with coverage metrics
+
+### Processing Pipeline
+- ✅ **Modular architecture** (ffmpeg.ts, excel-generator.ts, pipeline.ts)
+- ✅ **E2E testing support** with mock data generators
+- ✅ **Automatic frame cleanup** after processing
+- ✅ **Processing statistics** calculation
+
+### Previous Improvements (V2.0.0)
 - ✅ **Rotation metadata handling** for portrait smartphone videos
 - ✅ **Aspect ratio preservation** (no more distorted frames)
 - ✅ **Extended timeouts** for 4K videos (up to 10 minutes)

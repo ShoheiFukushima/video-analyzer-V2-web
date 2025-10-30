@@ -208,11 +208,31 @@ All API endpoints (except `/api/health`) require authentication using Clerk. Use
 - Content-Type: `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
 - Content-Disposition: `attachment; filename="video-analysis-{uploadId}.xlsx"`
 
-**Excel Report Structure:**
-- **Sheet 1: Summary** - Overview of the analysis
-- **Sheet 2: Transcription** - Time-coded speech transcription
-- **Sheet 3: OCR Results** - Text extracted from video frames
-- **Sheet 4: Full Analysis** - Combined timeline of all content
+**Excel Report Structure (V2 Ideal Format):**
+
+**Sheet 1: Video Analysis** - Scene-based format with embedded screenshots
+
+| Column | Header | Description |
+|--------|--------|-------------|
+| A | Scene # | Sequential scene number (1, 2, 3...) |
+| B | Timecode | Scene start time in HH:MM:SS format |
+| C | Screenshot | Embedded PNG image at scene mid-point |
+| D | OCR Text | Text detected by Gemini Vision OCR |
+| E | NA Text | Narration from audio transcription (Whisper) |
+
+**Key Features:**
+- Scene detection based on FFmpeg multi-pass algorithm (thresholds: 0.03, 0.05, 0.10)
+- Screenshot extracted at scene mid-point (50% between detection points)
+- OCR mapped to scenes by closest timestamp
+- Narration aggregated by time-based overlap with scenes
+- Aspect ratio preservation from video metadata
+- Embedded images with pixel-perfect positioning (EMU units)
+
+**Sheet 2: Statistics** (Optional) - Processing metrics
+- Total scenes count
+- OCR detection rate
+- Narration coverage rate
+- Video metadata (resolution, aspect ratio, duration)
 
 **Status Codes:**
 - `200 OK` - Excel file returned successfully
@@ -351,6 +371,18 @@ For issues or questions:
 - Email: support@example.com
 
 ## Changelog
+
+### Version 2.1.0 (2025-10-30) - Ideal Excel Format
+- **NEW**: Implemented ideal Excel output format (Scene # | Timecode | Screenshot | OCR | NA Text)
+- **NEW**: FFmpeg multi-pass scene detection (thresholds: 0.03, 0.05, 0.10)
+- **NEW**: Mid-point frame extraction for accurate screenshots
+- **NEW**: Scene-based OCR and narration mapping
+- **NEW**: Embedded screenshots with aspect ratio preservation
+- **NEW**: Statistics worksheet with processing metrics
+- **NEW**: E2E testing pipeline with mock data support
+- Improved: Time-based overlap detection for narration aggregation
+- Improved: EMU unit positioning for pixel-perfect image embedding
+- Architecture: Modular pipeline (ffmpeg.ts, excel-generator.ts, pipeline.ts)
 
 ### Version 2.0.0 (2025-10-30)
 - Added Clerk authentication to all endpoints
