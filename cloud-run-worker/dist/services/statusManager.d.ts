@@ -11,6 +11,9 @@ export interface ProcessingStatus {
         segmentCount: number;
         ocrResultCount: number;
         transcriptionLength: number;
+        totalScenes?: number;
+        scenesWithOCR?: number;
+        scenesWithNarration?: number;
     };
     error?: string;
 }

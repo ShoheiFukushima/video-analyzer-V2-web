@@ -1,132 +1,42 @@
-import { exec } from 'child_process';
-import { promisify } from 'util';
+/**
+ * FFmpeg Scene Detection Service
+ * Implements multi-pass scene detection with mid-point frame extraction
+ * Based on VideoContentAnalyzer V2's proven algorithm (100% OCR accuracy)
+ *
+ * Adapted from V1 for V2 architecture with Scene interface
+ */
+import ffmpeg from 'fluent-ffmpeg';
 import { promises as fs } from 'fs';
 import path from 'path';
-const execAsync = promisify(exec);
+import { formatTimecode } from '../utils/timecode';
+/**
+ * Default configuration based on V2 implementation
+ */
 const DEFAULT_CONFIG = {
     thresholds: [0.03, 0.05, 0.10], // Multi-pass detection for maximum accuracy
     minSceneDuration: 0.5 // Filter out very short scenes
 };
-export async function extractMetadata(videoPath) {
-    try {
-        const command = `ffprobe -v quiet -print_format json -show_format -show_streams "${videoPath}"`;
-        const { stdout } = await execAsync(command);
-        const probeData = JSON.parse(stdout);
-        const videoStream = probeData.streams?.find((s) => s.codec_type === 'video');
-        const format = probeData.format;
-        const width = videoStream?.width || 1920;
-        const height = videoStream?.height || 1080;
-
-        // Extract rotation metadata (common in smartphone videos)
-        const rotationTag = videoStream?.tags?.rotate ||
-                           videoStream?.side_data_list?.find(d => d.rotation)?.rotation ||
-                           '0';
-        const rotation = Math.abs(parseInt(rotationTag));
-
-        // Swap width/height if video is rotated 90 or 270 degrees (portrait mode)
-        const isPortrait = rotation === 90 || rotation === 270;
-        const displayWidth = isPortrait ? height : width;
-        const displayHeight = isPortrait ? width : height;
-        const aspectRatio = displayWidth / displayHeight;
-
-        return {
-            duration: parseFloat(format.duration) || 0,
-            width: displayWidth,
-            height: displayHeight,
-            resolution: `${displayWidth}x${displayHeight}`,
-            codec: videoStream?.codec_name || 'h264',
-            bitrate: parseInt(format.bit_rate) || 0,
-            fps: videoStream?.r_frame_rate ? evaluateFraction(videoStream.r_frame_rate) : 30,
-            fileSize: parseInt(format.size) || 0,
-            aspectRatio,
-            rotation, // Add rotation info for frame extraction
-        };
-    }
-    catch (error) {
-        console.warn('Metadata extraction failed, using defaults:', error);
-        return {
-            duration: 0,
-            width: 1920,
-            height: 1080,
-            resolution: '1920x1080',
-            codec: 'unknown',
-            bitrate: 0,
-            fps: 30,
-            fileSize: 0,
-            aspectRatio: 16 / 9,
-            rotation: 0,
-        };
-    }
-}
-function evaluateFraction(fraction) {
-    const [num, denom] = fraction.split('/').map(Number);
-    return denom ? num / denom : num;
-}
-/**
- * Format seconds to HH:MM:SS timecode
- */
-function formatTimecode(seconds) {
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = Math.floor(seconds % 60);
-    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-}
-/**
- * Run FFmpeg scene detection with single threshold
- */
-async function runSceneDetection(videoPath, threshold) {
-    const cuts = [];
-    try {
-        // Use ffmpeg scene detection filter and capture stderr output
-        const command = `ffmpeg -i "${videoPath}" -vf "select='gt(scene,${threshold})',showinfo" -f null - 2>&1`;
-        // Increased maxBuffer to 50MB for high-resolution videos
-        const { stdout } = await execAsync(command, { maxBuffer: 50 * 1024 * 1024, timeout: 600000 });
-        // Parse FFmpeg output for scene timestamps
-        const lines = stdout.split('\n');
-        for (const line of lines) {
-            const match = line.match(/pts_time:(\d+\.?\d*)/);
-            if (match) {
-                const timestamp = parseFloat(match[1]);
-                cuts.push({
-                    timestamp: Math.floor(timestamp * 10) / 10, // Round to 0.1s precision
-                    confidence: threshold
-                });
-            }
-        }
-    }
-    catch (error) {
-        // FFmpeg writes to stderr even on success, so we need to check the actual error
-        if (error.stdout) {
-            const lines = error.stdout.split('\n');
-            for (const line of lines) {
-                const match = line.match(/pts_time:(\d+\.?\d*)/);
-                if (match) {
-                    const timestamp = parseFloat(match[1]);
-                    cuts.push({
-                        timestamp: Math.floor(timestamp * 10) / 10,
-                        confidence: threshold
-                    });
-                }
-            }
-        }
-    }
-    return cuts;
-}
 /**
  * Multi-pass FFmpeg scene detection
+ * Runs detection with multiple thresholds and merges results
+ * @param videoPath - Path to the video file
+ * @param config - Detection configuration
+ * @returns Array of scene cuts with confidence scores
  */
 async function detectSceneCuts(videoPath, config = DEFAULT_CONFIG) {
-    const allCuts = new Map();
+    const allCuts = new Map(); // timestamp -> confidence
     console.log(`🔍 Starting multi-pass scene detection with thresholds: ${config.thresholds.join(', ')}`);
     for (const threshold of config.thresholds) {
         console.log(`  📊 Running detection pass with threshold ${threshold}...`);
         const cuts = await runSceneDetection(videoPath, threshold);
         console.log(`  ✓ Found ${cuts.length} cuts at threshold ${threshold}`);
+        // Merge cuts with maximum confidence
         cuts.forEach(cut => {
             const existingConfidence = allCuts.get(cut.timestamp) || 0;
             allCuts.set(cut.timestamp, Math.max(existingConfidence, cut.confidence));
         });
     }
+    // Convert map to array and sort by timestamp
     const mergedCuts = Array.from(allCuts.entries())
         .map(([timestamp, confidence]) => ({ timestamp, confidence }))
         .sort((a, b) => a.timestamp - b.timestamp);
@@ -134,7 +44,44 @@ async function detectSceneCuts(videoPath, config = DEFAULT_CONFIG) {
     return mergedCuts;
 }
 /**
+ * Run FFmpeg scene detection with single threshold
+ * @param videoPath - Path to the video file
+ * @param threshold - Scene detection threshold (0.0-1.0)
+ * @returns Array of scene cuts
+ */
+function runSceneDetection(videoPath, threshold) {
+    return new Promise((resolve, reject) => {
+        const cuts = [];
+        ffmpeg(videoPath)
+            .outputOptions([
+            '-vf', `select='gt(scene,${threshold})',showinfo`,
+            '-f', 'null'
+        ])
+            .output('-')
+            .on('stderr', (stderrLine) => {
+            // Parse FFmpeg output for scene timestamps
+            // Format: "pts_time:12.345 pos:678912 ..."
+            const match = stderrLine.match(/pts_time:(\d+\.?\d*)/);
+            if (match) {
+                const timestamp = parseFloat(match[1]);
+                cuts.push({
+                    timestamp: Math.floor(timestamp * 10) / 10, // Round to 0.1s precision
+                    confidence: threshold
+                });
+            }
+        })
+            .on('end', () => resolve(cuts))
+            .on('error', (err) => reject(err))
+            .run();
+    });
+}
+/**
  * Generate scene ranges from detected cuts
+ * Calculates mid-point (50% between scene detection points)
+ * @param cuts - Array of scene cuts
+ * @param videoDuration - Total video duration in seconds
+ * @param config - Scene detection configuration
+ * @returns Array of scene ranges with mid-points
  */
 async function generateSceneRanges(cuts, videoDuration, config = DEFAULT_CONFIG) {
     const scenes = [];
@@ -144,17 +91,21 @@ async function generateSceneRanges(cuts, videoDuration, config = DEFAULT_CONFIG)
         const startTime = cuts[i].timestamp;
         const endTime = i < cuts.length - 1 ? cuts[i + 1].timestamp : videoDuration;
         const duration = endTime - startTime;
+        // Filter out very short scenes
+        // Note: sceneNumber increments ONLY for valid scenes (duration >= minSceneDuration)
+        // This ensures sequential numbering (1, 2, 3...) even when short scenes are skipped
         if (duration < config.minSceneDuration) {
             console.log(`  ⏭️  Skipping short scene (${duration.toFixed(2)}s < ${config.minSceneDuration}s)`);
-            continue;
+            continue; // Skip without consuming a scene number
         }
+        // Calculate mid-point (50% between detection points)
         const midTime = (startTime + endTime) / 2;
         scenes.push({
             sceneNumber,
-            startTime,
-            endTime,
-            midTime,
-            timecode: formatTimecode(startTime)
+            startTime, // Detection point A (前)
+            endTime, // Detection point B (後)
+            midTime, // 50% position for screenshot
+            timecode: formatTimecode(startTime) // Timecode assigned to scene start
         });
         sceneNumber++;
     }
@@ -162,76 +113,100 @@ async function generateSceneRanges(cuts, videoDuration, config = DEFAULT_CONFIG)
     return scenes;
 }
 /**
- * Extract frame at specific timestamp with aspect ratio preservation and rotation
+ * Extract frame at specific timestamp
+ * @param videoPath - Path to the video file
+ * @param timestamp - Time in seconds
+ * @param outputPath - Output file path for frame
  */
-async function extractFrameAtTime(videoPath, timestamp, outputPath, metadata) {
-    // Build video filter for scaling and rotation
-    const maxWidth = 1280;
-    const maxHeight = 720;
-
-    // Scale filter that maintains aspect ratio
-    const scaleFilter = `scale='min(${maxWidth}\\,iw)':'min(${maxHeight}\\,ih)':force_original_aspect_ratio=decrease`;
-
-    // Rotation filter for smartphone videos
-    let rotationFilter = '';
-    if (metadata.rotation === 90) {
-        rotationFilter = ',transpose=1'; // 90 degrees clockwise
-    } else if (metadata.rotation === 270) {
-        rotationFilter = ',transpose=2'; // 90 degrees counter-clockwise
-    } else if (metadata.rotation === 180) {
-        rotationFilter = ',hflip,vflip'; // 180 degrees
-    }
-
-    const videoFilter = `${scaleFilter}${rotationFilter}`;
-    const command = `ffmpeg -ss ${timestamp} -i "${videoPath}" -vf "${videoFilter}" -frames:v 1 "${outputPath}" -y`;
-
-    try {
-        await execAsync(command);
-    }
-    catch (error) {
-        // FFmpeg may write to stderr even on success
-        if (error.code !== 0) {
-            throw error;
-        }
-    }
+async function extractFrameAtTime(videoPath, timestamp, outputPath) {
+    return new Promise((resolve, reject) => {
+        ffmpeg(videoPath)
+            .seekInput(timestamp)
+            .frames(1)
+            .size('1280x720') // Optimize size for OCR
+            .output(outputPath)
+            .on('end', () => resolve())
+            .on('error', (err) => reject(err))
+            .run();
+    });
 }
 /**
- * Main frame extraction function
- * Implements FFmpeg scene detection + mid-point frame extraction
+ * Get video metadata (duration, width, height, aspect ratio)
  */
-export async function extractFrames(videoPath) {
-    const outputDir = path.join('/tmp', `frames-${Date.now()}`);
+export function getVideoMetadata(videoPath) {
+    return new Promise((resolve, reject) => {
+        ffmpeg.ffprobe(videoPath, (err, metadata) => {
+            if (err) {
+                reject(err);
+            }
+            else {
+                const duration = Math.floor(metadata.format.duration || 0);
+                const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+                if (!videoStream || !videoStream.width || !videoStream.height) {
+                    reject(new Error('Could not extract video dimensions from metadata'));
+                    return;
+                }
+                const width = videoStream.width;
+                const height = videoStream.height;
+                const aspectRatio = width / height;
+                console.log(`📹 Video Metadata: ${width}x${height} (${aspectRatio.toFixed(2)}:1), ${duration}s`);
+                resolve({
+                    width,
+                    height,
+                    aspectRatio,
+                    duration
+                });
+            }
+        });
+    });
+}
+/**
+ * Get video duration in seconds (helper function)
+ */
+function getVideoDuration(videoPath) {
+    return getVideoMetadata(videoPath).then(metadata => metadata.duration);
+}
+/**
+ * Main scene detection and frame extraction function
+ * Implements FFmpeg scene detection + mid-point frame extraction
+ * @param videoPath - Path to the video file
+ * @param outputDir - Directory for extracted frames (optional, defaults to /tmp/frames-{timestamp})
+ * @returns Array of Scene objects with screenshot paths
+ */
+export async function extractScenesWithFrames(videoPath, outputDir) {
+    const framesDir = outputDir || path.join('/tmp', `frames-${Date.now()}`);
     try {
-        await fs.mkdir(outputDir, { recursive: true });
-        console.log(`📁 Created output directory: ${outputDir}`);
-        const metadata = await extractMetadata(videoPath);
-        const duration = metadata.duration;
-        console.log(`🎬 Video duration: ${duration}s, rotation: ${metadata.rotation}°`);
+        // Create output directory
+        await fs.mkdir(framesDir, { recursive: true });
+        console.log(`📁 Created output directory: ${framesDir}`);
+        // Get video duration
+        const duration = await getVideoDuration(videoPath);
+        console.log(`🎬 Video duration: ${duration}s`);
+        // Step 1: Multi-pass scene detection
         const cuts = await detectSceneCuts(videoPath);
         if (cuts.length === 0) {
             console.warn('⚠️ No scene cuts detected, falling back to single scene');
+            // Fallback: treat entire video as one scene
             cuts.push({ timestamp: 0, confidence: 0.03 });
         }
+        // Step 2: Generate scene ranges with mid-points
         const scenes = await generateSceneRanges(cuts, duration);
         console.log(`📸 Extracting ${scenes.length} frames at mid-points...`);
-        const frames = [];
+        // Step 3: Extract frames at mid-points
         for (const scene of scenes) {
-            const filename = path.join(outputDir, `scene-${scene.sceneNumber.toString().padStart(4, '0')}.jpg`);
-            await extractFrameAtTime(videoPath, scene.midTime, filename, metadata);
-            frames.push({
-                filename,
-                timecode: scene.timecode,
-                timestamp: scene.startTime,
-                sceneNumber: scene.sceneNumber
-            });
+            const filename = path.join(framesDir, `scene-${scene.sceneNumber.toString().padStart(4, '0')}.png`);
+            await extractFrameAtTime(videoPath, scene.midTime, filename);
+            // Set screenshot path
+            scene.screenshotPath = filename;
             console.log(`  ✓ Scene ${scene.sceneNumber}: ${scene.timecode} (mid-point: ${scene.midTime.toFixed(1)}s)`);
         }
-        console.log(`✅ Extracted ${frames.length} frames at mid-points`);
-        return frames;
+        console.log(`✅ Extracted ${scenes.length} frames at mid-points`);
+        return scenes;
     }
     catch (error) {
+        // Clean up on error
         try {
-            await fs.rm(outputDir, { recursive: true, force: true });
+            await fs.rm(framesDir, { recursive: true, force: true });
         }
         catch (cleanupError) {
             console.error('⚠️ Cleanup error:', cleanupError);
@@ -240,67 +215,13 @@ export async function extractFrames(videoPath) {
     }
 }
 /**
- * Voice Activity Detection (VAD) using FFmpeg volumedetect
- * Returns true if audio is detected, false otherwise
- */
-export async function detectAudioActivity(videoPath) {
-    try {
-        console.log('🎤 Running Voice Activity Detection (VAD)...');
-        // Use FFmpeg volumedetect filter to analyze audio levels
-        const command = `ffmpeg -i "${videoPath}" -af volumedetect -f null - 2>&1`;
-        // Increased maxBuffer to 50MB for high-resolution videos
-        const { stdout } = await execAsync(command, { maxBuffer: 50 * 1024 * 1024, timeout: 300000 });
-        // Parse volumedetect output
-        // Example output:
-        // [Parsed_volumedetect_0 @ 0x...] mean_volume: -25.3 dB
-        // [Parsed_volumedetect_0 @ 0x...] max_volume: -5.1 dB
-        const meanVolumeMatch = stdout.match(/mean_volume:\s*(-?\d+\.?\d*)\s*dB/);
-        const maxVolumeMatch = stdout.match(/max_volume:\s*(-?\d+\.?\d*)\s*dB/);
-        if (!meanVolumeMatch || !maxVolumeMatch) {
-            console.warn('⚠️ Could not parse audio volume data, assuming audio exists');
-            return true; // Default to true if parsing fails
-        }
-        const meanVolume = parseFloat(meanVolumeMatch[1]);
-        const maxVolume = parseFloat(maxVolumeMatch[1]);
-        // Thresholds for audio detection (adjusted for smartphone videos):
-        // - mean_volume > -70 dB: Lower threshold for phone-recorded audio with AGC
-        // - max_volume > -60 dB: Lower threshold for quiet recordings
-        // Smartphone microphones apply automatic gain control (AGC) which can result in lower volume levels
-        const MEAN_VOLUME_THRESHOLD = -70;
-        const MAX_VOLUME_THRESHOLD = -60;
-        const hasAudio = meanVolume > MEAN_VOLUME_THRESHOLD && maxVolume > MAX_VOLUME_THRESHOLD;
-        console.log(`  📊 Audio levels: mean=${meanVolume.toFixed(1)}dB, max=${maxVolume.toFixed(1)}dB`);
-        console.log(`  ${hasAudio ? '✅ Audio detected' : '❌ No audio detected (silent video)'}`);
-        return hasAudio;
-    }
-    catch (error) {
-        // Check if error output contains volume data (FFmpeg writes to stderr)
-        if (error.stdout) {
-            const meanVolumeMatch = error.stdout.match(/mean_volume:\s*(-?\d+\.?\d*)\s*dB/);
-            const maxVolumeMatch = error.stdout.match(/max_volume:\s*(-?\d+\.?\d*)\s*dB/);
-            if (meanVolumeMatch && maxVolumeMatch) {
-                const meanVolume = parseFloat(meanVolumeMatch[1]);
-                const maxVolume = parseFloat(maxVolumeMatch[1]);
-                // Same thresholds as above for smartphone audio
-                const MEAN_VOLUME_THRESHOLD = -70;
-                const MAX_VOLUME_THRESHOLD = -60;
-                const hasAudio = meanVolume > MEAN_VOLUME_THRESHOLD && maxVolume > MAX_VOLUME_THRESHOLD;
-                console.log(`  📊 Audio levels: mean=${meanVolume.toFixed(1)}dB, max=${maxVolume.toFixed(1)}dB`);
-                console.log(`  ${hasAudio ? '✅ Audio detected' : '❌ No audio detected (silent video)'}`);
-                return hasAudio;
-            }
-        }
-        console.warn('⚠️ VAD error, assuming audio exists:', error.message);
-        return true; // Default to true on error
-    }
-}
-/**
  * Clean up temporary frame files
+ * @param scenes - Array of scenes with screenshot paths
  */
-export async function cleanupFrames(frames) {
-    if (frames.length === 0)
+export async function cleanupFrames(scenes) {
+    if (scenes.length === 0 || !scenes[0].screenshotPath)
         return;
-    const outputDir = path.dirname(frames[0].filename);
+    const outputDir = path.dirname(scenes[0].screenshotPath);
     try {
         await fs.rm(outputDir, { recursive: true, force: true });
         console.log(`🧹 Cleaned up temporary frames: ${outputDir}`);
@@ -309,3 +230,4 @@ export async function cleanupFrames(frames) {
         console.error('⚠️ Error cleaning up frames:', error);
     }
 }
+//# sourceMappingURL=ffmpeg.js.map
