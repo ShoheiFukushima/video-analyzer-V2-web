@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
 import { createClient } from "@supabase/supabase-js";
+import { del } from "@vercel/blob";
 
 export const runtime = "nodejs";
 
@@ -122,6 +123,16 @@ export async function GET(
       // Stream file to client
       const blob = await response.blob();
       const arrayBuffer = await blob.arrayBuffer();
+
+      // Delete result blob after downloading
+      console.log(`[${uploadId}] [PROD] Deleting result blob...`);
+      try {
+        await del(blobUrl);
+        console.log(`[${uploadId}] [PROD] Result blob deleted successfully`);
+      } catch (error) {
+        console.error(`[${uploadId}] Failed to delete result blob:`, error);
+        // Don't fail the download if cleanup fails
+      }
 
       console.log(`[${uploadId}] [PROD] Download complete (${blob.size} bytes)`);
 
