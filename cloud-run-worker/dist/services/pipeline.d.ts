@@ -4,22 +4,13 @@
  *
  * Implements the ideal workflow for V2:
  * 1. Scene detection with mid-point frame extraction
- * 2. OCR on each scene frame
+ * 2. OCR on each scene frame (Gemini Vision)
  * 3. Map narration to scenes based on timestamps
  * 4. Generate Excel with ideal format (Scene # | Timecode | Screenshot | OCR | NA Text)
  */
 import { ProcessingStats } from '../types/excel.js';
 /**
- * OCR service result (from existing ocrService.ts)
- */
-interface OCRResult {
-    timestamp: number;
-    frameIndex: number;
-    text: string;
-    confidence: number;
-}
-/**
- * Transcription segment (from existing whisperService.ts)
+ * Transcription segment (from Whisper pipeline)
  */
 interface TranscriptionSegment {
     timestamp: number;
@@ -31,11 +22,10 @@ interface TranscriptionSegment {
  * Main pipeline execution
  * @param videoPath - Path to video file
  * @param projectTitle - Project/video title
- * @param ocrResults - OCR results from ocrService
  * @param transcription - Transcription from whisperService
  * @returns Path to generated Excel file
  */
-export declare function executeIdealPipeline(videoPath: string, projectTitle: string, ocrResults: OCRResult[], transcription: TranscriptionSegment[]): Promise<{
+export declare function executeIdealPipeline(videoPath: string, projectTitle: string, transcription: TranscriptionSegment[]): Promise<{
     excelPath: string;
     stats: ProcessingStats;
 }>;

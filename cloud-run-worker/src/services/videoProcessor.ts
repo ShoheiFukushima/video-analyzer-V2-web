@@ -2,12 +2,27 @@ import axios from 'axios';
 import { initStatus, updateStatus, completeStatus, failStatus } from './statusManager.js';
 import { executeIdealPipeline } from './pipeline.js';
 import { getVideoMetadata } from './ffmpeg.js';
-import { transcribeAudio } from './whisperService.js';
-import { extractFramesAndOCR } from './ocrService.js';
 import { uploadResultFile } from './blobUploader.js';
+import { extractAudioForWhisper, hasAudioStream } from './audioExtractor.js';
+import { processAudioWithVADAndWhisper } from './audioWhisperPipeline.js';
+import { resultFileMap } from '../index.js';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+
+/**
+ * Safe status update wrapper - non-fatal in development mode
+ */
+async function safeUpdateStatus(uploadId: string, updates: any): Promise<void> {
+  try {
+    await updateStatus(uploadId, updates);
+  } catch (error) {
+    console.warn(`[${uploadId}] Failed to update status (non-fatal in dev):`, error);
+    if (process.env.NODE_ENV === 'production') {
+      throw error;
+    }
+  }
+}
 
 export const processVideo = async (
   uploadId: string,
@@ -17,7 +32,16 @@ export const processVideo = async (
 ) => {
   try {
     console.log(`[${uploadId}] Starting video processing`);
-    await initStatus(uploadId);
+
+    // Try to initialize status in Supabase (optional in dev mode)
+    try {
+      await initStatus(uploadId);
+    } catch (statusError) {
+      console.warn(`[${uploadId}] Failed to initialize Supabase status (continuing):`, statusError);
+      if (process.env.NODE_ENV === 'production') {
+        throw statusError;
+      }
+    }
 
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'video-analyzer-'));
     const videoPath = path.join(tempDir, 'video.mp4');
@@ -25,65 +49,119 @@ export const processVideo = async (
     try {
       // Step 1: Download video
       console.log(`[${uploadId}] Downloading video from blob...`);
-      await updateStatus(uploadId, { status: 'downloading', progress: 10, stage: 'downloading' });
+      await safeUpdateStatus(uploadId, { status: 'downloading', progress: 10, stage: 'downloading' });
 
       await downloadFile(blobUrl, videoPath);
 
       // Step 2: Extract video metadata
       console.log(`[${uploadId}] Extracting video metadata...`);
-      await updateStatus(uploadId, { status: 'processing', progress: 20, stage: 'metadata' });
+      await safeUpdateStatus(uploadId, { status: 'processing', progress: 20, stage: 'metadata' });
 
       const videoMetadata = await getVideoMetadata(videoPath);
 
-      // Step 3: Extract audio
-      console.log(`[${uploadId}] Extracting audio...`);
-      await updateStatus(uploadId, { status: 'processing', progress: 30, stage: 'audio' });
+      // Step 3: Extract audio (Whisper-optimized)
+      console.log(`[${uploadId}] Checking for audio stream...`);
+      await safeUpdateStatus(uploadId, { status: 'processing', progress: 30, stage: 'audio' });
 
       const audioPath = path.join(tempDir, 'audio.mp3');
-      await extractAudio(videoPath, audioPath);
+      const hasAudio = await hasAudioStream(videoPath);
 
-      // Step 4: Transcribe with Whisper
-      console.log(`[${uploadId}] Transcribing audio with Whisper...`);
-      await updateStatus(uploadId, { status: 'processing', progress: 45, stage: 'whisper' });
+      let transcription: any[] = [];
+      let vadStats: any = null;
 
-      const transcription = await transcribeAudio(audioPath, uploadId);
+      if (hasAudio) {
+        console.log(`[${uploadId}] Extracting audio (16kHz mono, noise reduction)...`);
+        await extractAudioForWhisper(videoPath, audioPath);
 
-      // Step 5: Perform OCR with Gemini Vision
-      console.log(`[${uploadId}] Performing OCR with Gemini Vision...`);
-      await updateStatus(uploadId, { status: 'processing', progress: 60, stage: 'ocr' });
+        // Step 4: VAD + Whisper pipeline (optimized processing)
+        console.log(`[${uploadId}] Processing with VAD + Whisper pipeline...`);
+        await safeUpdateStatus(uploadId, { status: 'processing', progress: 45, stage: 'vad_whisper' });
 
-      const ocrResults = await extractFramesAndOCR(videoPath, uploadId);
+        const pipelineResult = await processAudioWithVADAndWhisper(audioPath, uploadId);
+        transcription = pipelineResult.segments;
+        vadStats = pipelineResult.vadStats;
 
-      // Step 6: Execute ideal Excel pipeline (Scene detection + Excel generation)
-      console.log(`[${uploadId}] Executing ideal Excel pipeline...`);
-      await updateStatus(uploadId, { status: 'processing', progress: 75, stage: 'excel' });
+        console.log(`[${uploadId}] VAD + Whisper complete: ${transcription.length} segments`);
+        console.log(`[${uploadId}]   Voice ratio: ${(vadStats.voiceRatio * 100).toFixed(1)}%`);
+        console.log(`[${uploadId}]   Cost savings: ${vadStats.estimatedSavings.toFixed(1)}%`);
+      } else {
+        console.log(`[${uploadId}] ⚠️ No audio stream detected, skipping transcription`);
+        await safeUpdateStatus(uploadId, { status: 'processing', progress: 45, stage: 'audio_skipped' });
+      }
+
+      // Step 5: Execute ideal Excel pipeline (Scene detection + OCR + Excel generation)
+      console.log(`[${uploadId}] Executing ideal Excel pipeline (Scene-based OCR + Excel)...`);
+      await safeUpdateStatus(uploadId, { status: 'processing', progress: 60, stage: 'scene_ocr_excel' });
 
       const pipelineResult = await executeIdealPipeline(
         videoPath,
         fileName,
-        ocrResults,
         transcription
       );
 
       const excelPath = pipelineResult.excelPath;
 
-      // Step 9: Upload result file
+      // Step 9: Upload result file or store locally for development
       console.log(`[${uploadId}] Uploading results...`);
-      await updateStatus(uploadId, { status: 'processing', progress: 90, stage: 'upload_result' });
+      await safeUpdateStatus(uploadId, { status: 'processing', progress: 90, stage: 'upload_result' });
 
-      const resultUrl = await uploadResultFile(excelPath, uploadId);
+      let resultUrl: string;
+      let resultBlobUrl: string | null = null;
 
-      // Complete
+      if (process.env.NODE_ENV === 'development') {
+        // Development mode: Store file path locally
+        const persistentPath = path.join('/tmp', `result_${uploadId}.xlsx`);
+        fs.copyFileSync(excelPath, persistentPath);
+        resultFileMap.set(uploadId, persistentPath);
+
+        // Return uploadId only - frontend will construct /api/download/${uploadId}
+        // This ensures consistent authentication flow
+        resultUrl = uploadId;
+
+        console.log(`[${uploadId}] Development mode: File stored at ${persistentPath}`);
+        console.log(`[${uploadId}] Result URL (uploadId): ${resultUrl}`);
+      } else {
+        // Production mode: Upload to Vercel Blob
+        resultBlobUrl = await uploadResultFile(excelPath, uploadId);
+
+        // Return uploadId to maintain consistent authentication flow
+        // resultBlobUrl will be stored in metadata for /api/download to retrieve
+        resultUrl = uploadId;
+
+        console.log(`[${uploadId}] Production mode: Uploaded to Blob`);
+        console.log(`[${uploadId}] Blob URL: ${resultBlobUrl}`);
+        console.log(`[${uploadId}] Result URL (uploadId): ${resultUrl}`);
+      }
+
+      // Complete with metadata (including resultBlobUrl for production downloads)
       console.log(`[${uploadId}] Processing completed!`);
-      await completeStatus(uploadId, resultUrl, {
+
+      const completionMetadata: any = {
         duration: videoMetadata.duration,
         segmentCount: transcription.length,
-        ocrResultCount: ocrResults.length,
+        ocrResultCount: pipelineResult.stats.scenesWithOCRText,
         transcriptionLength: transcription.reduce((sum, seg) => sum + seg.text.length, 0),
         totalScenes: pipelineResult.stats.totalScenes,
         scenesWithOCR: pipelineResult.stats.scenesWithOCRText,
         scenesWithNarration: pipelineResult.stats.scenesWithNarration,
-      });
+      };
+
+      // Store resultBlobUrl in metadata for production downloads
+      if (resultBlobUrl) {
+        completionMetadata.blobUrl = resultBlobUrl;
+      }
+
+      // Try to update Supabase status, but don't fail if it errors (dev mode resilience)
+      try {
+        await completeStatus(uploadId, resultUrl, completionMetadata);
+      } catch (statusError) {
+        console.error(`[${uploadId}] Failed to update Supabase status (non-fatal in dev):`, statusError);
+        if (process.env.NODE_ENV === 'production') {
+          throw statusError; // Re-throw in production
+        }
+        // In development, continue - file is already saved locally
+        console.log(`[${uploadId}] Continuing despite status update failure (dev mode)`);
+      }
 
     } finally {
       // Cleanup
@@ -114,8 +192,3 @@ async function downloadFile(url: string, dest: string) {
   });
 }
 
-async function extractAudio(videoPath: string, audioPath: string) {
-  // TODO: Implement real audio extraction using fluent-ffmpeg
-  // For now, create a dummy file for testing
-  fs.writeFileSync(audioPath, Buffer.from('dummy audio'));
-}

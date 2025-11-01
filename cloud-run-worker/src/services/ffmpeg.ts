@@ -9,8 +9,8 @@
 import ffmpeg from 'fluent-ffmpeg';
 import { promises as fs } from 'fs';
 import path from 'path';
-import { Scene, SceneCut, VideoMetadata } from '../types/excel';
-import { formatTimecode } from '../utils/timecode';
+import { Scene, SceneCut, VideoMetadata } from '../types/excel.js';
+import { formatTimecode } from '../utils/timecode.js';
 
 /**
  * Scene detection configuration

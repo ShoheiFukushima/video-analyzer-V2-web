@@ -14,27 +14,28 @@ export interface ProcessingStatus {
         totalScenes?: number;
         scenesWithOCR?: number;
         scenesWithNarration?: number;
+        blobUrl?: string;
     };
     error?: string;
 }
 /**
- * Initialize processing status in Supabase
+ * Initialize processing status (Dual mode: Supabase or In-memory)
  */
 export declare const initStatus: (uploadId: string) => Promise<ProcessingStatus>;
 /**
- * Update processing status in Supabase
+ * Update processing status (Dual mode: Supabase or In-memory)
  */
 export declare const updateStatus: (uploadId: string, updates: Partial<ProcessingStatus>) => Promise<ProcessingStatus>;
 /**
- * Get processing status from Supabase
+ * Get processing status (Dual mode: Supabase or In-memory)
  */
 export declare const getStatus: (uploadId: string) => Promise<ProcessingStatus | null>;
 /**
- * Mark processing as complete
+ * Mark processing as complete (Dual mode: Supabase or In-memory)
  */
 export declare const completeStatus: (uploadId: string, resultUrl: string, metadata: ProcessingStatus["metadata"]) => Promise<ProcessingStatus>;
 /**
- * Mark processing as failed
+ * Mark processing as failed (Dual mode: Supabase or In-memory)
  */
 export declare const failStatus: (uploadId: string, error: string) => Promise<ProcessingStatus>;
 //# sourceMappingURL=statusManager.d.ts.map

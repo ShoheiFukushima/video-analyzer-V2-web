@@ -8,7 +8,7 @@
 import ffmpeg from 'fluent-ffmpeg';
 import { promises as fs } from 'fs';
 import path from 'path';
-import { formatTimecode } from '../utils/timecode';
+import { formatTimecode } from '../utils/timecode.js';
 /**
  * Default configuration based on V2 implementation
  */

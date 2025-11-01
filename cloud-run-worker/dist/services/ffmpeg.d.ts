@@ -5,7 +5,7 @@
  *
  * Adapted from V1 for V2 architecture with Scene interface
  */
-import { Scene, VideoMetadata } from '../types/excel';
+import { Scene, VideoMetadata } from '../types/excel.js';
 /**
  * Get video metadata (duration, width, height, aspect ratio)
  */

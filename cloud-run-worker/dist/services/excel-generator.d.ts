@@ -5,7 +5,7 @@
  *
  * Adapted from V1 for V2 architecture with narration text support
  */
-import { ExcelGenerationOptions } from '../types/excel';
+import { ExcelGenerationOptions } from '../types/excel.js';
 /**
  * Generate Excel file with OCR results, narration, and embedded screenshots
  * Format: Scene # | Timecode | Screenshot | OCR Text | NA Text

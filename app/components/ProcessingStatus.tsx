@@ -101,9 +101,34 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
     };
   }, [uploadId, onComplete]);
 
-  const downloadResult = () => {
-    if (resultUrl) {
-      window.open(resultUrl, "_blank");
+  const downloadResult = async () => {
+    try {
+      // Always use Next.js API endpoint for authenticated downloads
+      // This ensures consistent authentication flow in both dev and production
+      const downloadUrl = `/api/download/${uploadId}`;
+
+      // Use fetch to handle errors gracefully
+      const response = await fetch(downloadUrl);
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Download failed' }));
+        throw new Error(errorData.error || `Download failed with status ${response.status}`);
+      }
+
+      // Convert response to blob and trigger download
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `result_${uploadId}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (error) {
+      console.error('Download error:', error);
+      setError(error instanceof Error ? error.message : 'Failed to download result');
+      setStatus('error');
     }
   };
 

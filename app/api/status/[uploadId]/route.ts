@@ -15,85 +15,42 @@ export async function GET(
     }
 
     const { uploadId } = params;
-    const cloudRunUrl = process.env.CLOUD_RUN_URL;
+
+    // Use localhost for development, production URL for deployment
+    const cloudRunUrl = process.env.NODE_ENV === 'development'
+      ? process.env.CLOUD_RUN_URL || 'http://localhost:8080'
+      : process.env.CLOUD_RUN_URL;
+
     const workerSecret = process.env.WORKER_SECRET;
 
-    // Production: Fetch status from Cloud Run Worker
-    if (cloudRunUrl && workerSecret && process.env.NODE_ENV === 'production') {
-      try {
-        console.log(`[${uploadId}] Fetching status from Cloud Run...`);
-        const response = await fetch(`${cloudRunUrl}/status/${uploadId}`, {
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${workerSecret}`,
-          },
-          signal: AbortSignal.timeout(5000),
-        });
-
-        if (response.ok) {
-          const status = await response.json();
-          console.log(`[${uploadId}] Cloud Run status:`, status);
-          return NextResponse.json(status);
-        } else {
-          console.warn(`[${uploadId}] Cloud Run returned status ${response.status}`);
-        }
-      } catch (err) {
-        console.warn(`[${uploadId}] Cloud Run fetch failed:`, err);
-        // Fall through to simulation as fallback
-      }
+    // Fetch status from Worker (local or production)
+    if (!cloudRunUrl || !workerSecret) {
+      return NextResponse.json(
+        { error: "Server configuration error: Missing CLOUD_RUN_URL or WORKER_SECRET" },
+        { status: 500 }
+      );
     }
 
-    // Fallback: Return simulated status (development or Cloud Run unavailable)
-    console.log(`[${uploadId}] Using simulated status (development mode)`);
-
-    // Simulate progress based on elapsed time since upload
-    const uploadTime = parseInt(uploadId.split('_')[1] || '0');
-    const elapsedMs = Date.now() - uploadTime;
-    const totalDurationMs = 40000; // 40 second simulation
-    const progress = Math.min(100, Math.floor((elapsedMs / totalDurationMs) * 100));
-
-    // Define processing stages
-    const stages = [
-      'downloading',
-      'metadata',
-      'vad',
-      'frames',
-      'whisper',
-      'ocr',
-      'excel',
-      'upload_result',
-      'completed',
-    ];
-
-    let currentStageIndex = Math.floor((progress / 100) * (stages.length - 1));
-    currentStageIndex = Math.min(currentStageIndex, stages.length - 1);
-    const currentStage = stages[currentStageIndex];
-
-    if (progress >= 100) {
-      // Completed - return with result URL
-      return NextResponse.json({
-        uploadId,
-        status: 'completed',
-        progress: 100,
-        stage: 'completed',
-        resultUrl: `/api/dummy-excel/${uploadId}`,
-        metadata: {
-          duration: 120.5,
-          segmentCount: 8,
-          ocrResultCount: 12,
-          transcriptionLength: 2543,
-        },
-      });
-    }
-
-    // Processing in progress
-    return NextResponse.json({
-      uploadId,
-      status: 'processing',
-      progress,
-      stage: currentStage,
-      message: `Processing: ${currentStage}...`,
+    console.log(`[${uploadId}] Fetching status from Worker...`);
+    const response = await fetch(`${cloudRunUrl}/status/${uploadId}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${workerSecret}`,
+      },
+      signal: AbortSignal.timeout(10000),
     });
+
+    if (!response.ok) {
+      console.error(`[${uploadId}] Worker returned status ${response.status}`);
+      return NextResponse.json(
+        { error: "Failed to fetch status from Worker" },
+        { status: response.status }
+      );
+    }
+
+    const status = await response.json();
+    console.log(`[${uploadId}] Worker status:`, status);
+    return NextResponse.json(status);
   } catch (error) {
     console.error("Status check error:", error);
     return NextResponse.json(

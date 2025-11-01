@@ -4,25 +4,26 @@
  *
  * Implements the ideal workflow for V2:
  * 1. Scene detection with mid-point frame extraction
- * 2. OCR on each scene frame
+ * 2. OCR on each scene frame (Gemini Vision)
  * 3. Map narration to scenes based on timestamps
  * 4. Generate Excel with ideal format (Scene # | Timecode | Screenshot | OCR | NA Text)
  */
 import { extractScenesWithFrames, getVideoMetadata, cleanupFrames } from './ffmpeg.js';
 import { generateExcel, generateExcelFilename } from './excel-generator.js';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import fs from 'fs';
+import { promises as fsPromises } from 'fs';
 import path from 'path';
 /**
  * Main pipeline execution
  * @param videoPath - Path to video file
  * @param projectTitle - Project/video title
- * @param ocrResults - OCR results from ocrService
  * @param transcription - Transcription from whisperService
  * @returns Path to generated Excel file
  */
-export async function executeIdealPipeline(videoPath, projectTitle, ocrResults, transcription) {
+export async function executeIdealPipeline(videoPath, projectTitle, transcription) {
     console.log('🎬 Starting Ideal Pipeline Execution');
     console.log(`  📹 Video: ${videoPath}`);
-    console.log(`  📊 OCR Results: ${ocrResults.length} frames`);
     console.log(`  🎙️ Transcription: ${transcription.length} segments`);
     // Step 1: Extract video metadata
     console.log('\n📐 Step 1: Extracting video metadata...');
@@ -31,9 +32,12 @@ export async function executeIdealPipeline(videoPath, projectTitle, ocrResults, 
     console.log('\n🎞️ Step 2: Scene detection and frame extraction...');
     const scenes = await extractScenesWithFrames(videoPath);
     console.log(`  ✓ Detected ${scenes.length} scenes`);
-    // Step 3: Map OCR results to scenes
-    console.log('\n🔍 Step 3: Mapping OCR results to scenes...');
-    const scenesWithOCR = mapOCRToScenes(scenes, ocrResults);
+    // Step 3: Perform OCR on each scene frame
+    console.log('\n🔍 Step 3: Performing OCR on scene frames...');
+    const scenesWithRawOCR = await performSceneBasedOCR(scenes);
+    // Step 3.5: Filter out persistent overlays (logos, watermarks)
+    console.log('\n🧹 Step 3.5: Filtering persistent overlays...');
+    const scenesWithOCR = filterPersistentOverlays(scenesWithRawOCR);
     // Step 4: Map transcription to scenes
     console.log('\n🎙️ Step 4: Mapping transcription to scenes...');
     const scenesWithNarration = mapTranscriptionToScenes(scenesWithOCR, transcription);
@@ -44,12 +48,14 @@ export async function executeIdealPipeline(videoPath, projectTitle, ocrResults, 
     console.log('\n📊 Step 6: Generating Excel file...');
     const excelFilename = generateExcelFilename(projectTitle);
     const excelPath = path.join('/tmp', excelFilename);
-    await generateExcel({
+    const excelBuffer = await generateExcel({
         projectTitle,
         rows: excelRows,
         videoMetadata,
         includeStatistics: true
     });
+    // Write Excel buffer to file
+    await fsPromises.writeFile(excelPath, excelBuffer);
     // Step 7: Calculate statistics
     const stats = {
         totalScenes: scenes.length,
@@ -66,19 +72,146 @@ export async function executeIdealPipeline(videoPath, projectTitle, ocrResults, 
     return { excelPath, stats };
 }
 /**
- * Map OCR results to scenes based on timestamps
- * Finds the closest OCR result for each scene's frame timestamp
+ * Perform OCR on each scene's frame using Gemini Vision
  */
-function mapOCRToScenes(scenes, ocrResults) {
-    return scenes.map(scene => {
-        // Find OCR result closest to scene's mid-point timestamp
-        const closestOCR = findClosestOCR(scene.midTime, ocrResults);
+async function performSceneBasedOCR(scenes) {
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+    // Use latest stable model: gemini-2.5-flash (fast, supports Japanese text)
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const scenesWithOCR = [];
+    for (const scene of scenes) {
+        if (!scene.screenshotPath) {
+            console.log(`  ⚠️ Scene ${scene.sceneNumber}: No screenshot, skipping OCR`);
+            scenesWithOCR.push({
+                ...scene,
+                ocrText: '',
+                ocrConfidence: 0
+            });
+            continue;
+        }
+        try {
+            // Read screenshot file
+            const imageBuffer = fs.readFileSync(scene.screenshotPath);
+            const base64Image = imageBuffer.toString('base64');
+            // Gemini Vision OCR prompt
+            const prompt = `Analyze this video frame and extract ALL visible text.
+
+Please provide a JSON response with this structure:
+{
+  "text": "all extracted text concatenated",
+  "confidence": 0.95
+}
+
+Focus on:
+- Japanese text (kanji, hiragana, katakana)
+- English text
+- Numbers and symbols
+- Screen overlays, titles, captions
+
+Return empty string if no text detected.`;
+            const result = await model.generateContent([
+                prompt,
+                { inlineData: { mimeType: 'image/png', data: base64Image } }
+            ]);
+            const responseText = result.response.text();
+            // Parse JSON response
+            let ocrResult;
+            try {
+                // Remove markdown code blocks if present
+                const jsonText = responseText.replace(/```json\n?|\n?```/g, '').trim();
+                ocrResult = JSON.parse(jsonText);
+            }
+            catch {
+                // Fallback: use raw text
+                ocrResult = { text: responseText, confidence: 0.5 };
+            }
+            scenesWithOCR.push({
+                ...scene,
+                ocrText: ocrResult.text || '',
+                ocrConfidence: ocrResult.confidence || 0
+            });
+            console.log(`  ✓ Scene ${scene.sceneNumber}: OCR complete (${ocrResult.text.length} chars)`);
+        }
+        catch (error) {
+            console.error(`  ✗ Scene ${scene.sceneNumber}: OCR failed`);
+            if (error instanceof Error) {
+                console.error(`    Error: ${error.message}`);
+                console.error(`    Stack: ${error.stack?.split('\n')[0]}`);
+            }
+            else {
+                console.error(`    Error:`, error);
+            }
+            scenesWithOCR.push({
+                ...scene,
+                ocrText: '',
+                ocrConfidence: 0
+            });
+        }
+    }
+    console.log(`  ✓ OCR complete: ${scenesWithOCR.filter(s => s.ocrText).length}/${scenes.length} scenes with text`);
+    return scenesWithOCR;
+}
+/**
+ * Filter out persistent overlays (logos, watermarks, constant UI elements)
+ * Removes text that appears in 50% or more of scenes
+ */
+function filterPersistentOverlays(scenesWithOCR) {
+    if (scenesWithOCR.length === 0)
+        return scenesWithOCR;
+    // Step 1: Split each scene's OCR text into lines
+    const allLines = scenesWithOCR.map(scene => scene.ocrText
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0));
+    // Step 2: Count how many scenes each unique line appears in
+    const lineFrequency = new Map();
+    const totalScenes = scenesWithOCR.length;
+    for (const lines of allLines) {
+        const uniqueLines = new Set(lines); // Count each line once per scene
+        for (const line of uniqueLines) {
+            lineFrequency.set(line, (lineFrequency.get(line) || 0) + 1);
+        }
+    }
+    // Step 3: Identify persistent lines (appear in >= 50% of scenes)
+    const persistentThreshold = Math.ceil(totalScenes * 0.5);
+    const persistentLines = new Set();
+    for (const [line, count] of lineFrequency.entries()) {
+        if (count >= persistentThreshold) {
+            persistentLines.add(line);
+        }
+    }
+    // Debug: Log all unique lines and their frequencies
+    console.log(`  🔍 Debug: Analyzing ${lineFrequency.size} unique lines`);
+    const sortedLines = Array.from(lineFrequency.entries()).sort((a, b) => b[1] - a[1]);
+    console.log(`  📊 Top 10 most frequent lines:`);
+    for (const [line, count] of sortedLines.slice(0, 10)) {
+        const percentage = ((count / totalScenes) * 100).toFixed(0);
+        console.log(`    [${count}/${totalScenes} = ${percentage}%] "${line.substring(0, 60)}${line.length > 60 ? '...' : ''}"`);
+    }
+    console.log(`  ✓ Detected ${persistentLines.size} persistent overlay lines (threshold: ${persistentThreshold}/${totalScenes} scenes, ≥50%)`);
+    if (persistentLines.size > 0) {
+        console.log(`  📌 Persistent lines:`);
+        for (const line of persistentLines) {
+            const count = lineFrequency.get(line) || 0;
+            console.log(`    - "${line.substring(0, 50)}${line.length > 50 ? '...' : ''}" (${count}/${totalScenes} scenes)`);
+        }
+    }
+    // Step 4: Remove persistent lines from each scene
+    const filteredScenes = scenesWithOCR.map(scene => {
+        const lines = scene.ocrText
+            .split('\n')
+            .map(line => line.trim())
+            .filter(line => line.length > 0 && !persistentLines.has(line));
+        const filteredText = lines.join('\n');
         return {
             ...scene,
-            ocrText: closestOCR?.text || '',
-            ocrConfidence: closestOCR?.confidence || 0
+            ocrText: filteredText
         };
     });
+    const scenesWithTextBefore = scenesWithOCR.filter(s => s.ocrText.trim().length > 0).length;
+    const scenesWithTextAfter = filteredScenes.filter(s => s.ocrText.trim().length > 0).length;
+    console.log(`  ✓ Filtered: ${scenesWithTextBefore} → ${scenesWithTextAfter} scenes with unique text`);
+    return filteredScenes;
 }
 /**
  * Map transcription segments to scenes based on timestamps
@@ -105,23 +238,6 @@ function mapTranscriptionToScenes(scenesWithOCR, transcription) {
             narrationText
         };
     });
-}
-/**
- * Find OCR result closest to target timestamp
- */
-function findClosestOCR(targetTime, ocrResults) {
-    if (ocrResults.length === 0)
-        return undefined;
-    let closest = ocrResults[0];
-    let minDiff = Math.abs(targetTime - closest.timestamp);
-    for (const ocr of ocrResults) {
-        const diff = Math.abs(targetTime - ocr.timestamp);
-        if (diff < minDiff) {
-            minDiff = diff;
-            closest = ocr;
-        }
-    }
-    return closest;
 }
 /**
  * Convert scenes to Excel rows

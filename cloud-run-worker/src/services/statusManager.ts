@@ -1,9 +1,33 @@
-import { createClient } from '@supabase/supabase-js';
+import dotenv from 'dotenv';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-const supabase = createClient(
-  process.env.SUPABASE_URL || '',
-  process.env.SUPABASE_SERVICE_ROLE_KEY || ''
-);
+// Load environment variables
+dotenv.config();
+
+// Determine if Supabase should be used
+const USE_SUPABASE = process.env.USE_SUPABASE === 'true';
+
+// In-memory status storage (development mode only)
+const inMemoryStatusMap = new Map<string, ProcessingStatus>();
+
+// Supabase client (production mode only)
+let supabase: SupabaseClient | null = null;
+
+// Initialize Supabase client if enabled
+if (USE_SUPABASE) {
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error(
+      'Missing required Supabase environment variables: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY'
+    );
+  }
+  supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+  console.log('[StatusManager] Supabase mode enabled');
+} else {
+  console.log('[StatusManager] In-memory mode enabled (development)');
+}
 
 export interface ProcessingStatus {
   uploadId: string;
@@ -21,12 +45,53 @@ export interface ProcessingStatus {
     totalScenes?: number;
     scenesWithOCR?: number;
     scenesWithNarration?: number;
+    blobUrl?: string; // Vercel Blob URL for production downloads
   };
   error?: string;
 }
 
 /**
- * Initialize processing status in Supabase
+ * Enhanced error handler with detailed diagnostics
+ */
+function handleSupabaseError(uploadId: string, operation: string, error: any): never {
+  console.error(`[${uploadId}] Supabase ${operation} failed:`, {
+    code: error.code,
+    message: error.message,
+    details: error.details,
+    hint: error.hint,
+  });
+
+  // PGRST205: Schema cache issue
+  if (error.code === 'PGRST205') {
+    throw new Error(
+      `Supabase schema cache error: Table 'processing_status' not found in cache. ` +
+      `Please reload schema in Supabase Dashboard (Settings → API → Reload Schema) ` +
+      `or run: NOTIFY pgrst, 'reload schema'; in SQL Editor`
+    );
+  }
+
+  // PGRST116: No rows returned
+  if (error.code === 'PGRST116') {
+    throw new Error(
+      `No rows returned for upload_id: ${uploadId}. ` +
+      `Ensure the record exists before calling ${operation}.`
+    );
+  }
+
+  // RLS violation
+  if (error.code === '42501') {
+    throw new Error(
+      `Permission denied: Row-level security policy violation. ` +
+      `Ensure service_role key is used and RLS policies are configured correctly.`
+    );
+  }
+
+  // Generic error
+  throw new Error(`Supabase ${operation} failed: ${error.message}`);
+}
+
+/**
+ * Initialize processing status (Dual mode: Supabase or In-memory)
  */
 export const initStatus = async (uploadId: string): Promise<ProcessingStatus> => {
   const now = new Date().toISOString();
@@ -39,85 +104,130 @@ export const initStatus = async (uploadId: string): Promise<ProcessingStatus> =>
     updatedAt: now,
   };
 
-  const { data, error } = await supabase
-    .from('processing_status')
-    .upsert({
-      upload_id: uploadId,
-      status: status.status,
-      progress: status.progress,
-      stage: status.stage,
-      started_at: status.startedAt,
-      updated_at: status.updatedAt,
-    })
-    .select()
-    .single();
+  if (USE_SUPABASE && supabase) {
+    // Supabase mode
+    const { data, error } = await supabase
+      .from('processing_status')
+      .upsert({
+        upload_id: uploadId,
+        status: status.status,
+        progress: status.progress,
+        stage: status.stage,
+        started_at: status.startedAt,
+        updated_at: status.updatedAt,
+      })
+      .select()
+      .single();
 
-  if (error) {
-    console.error(`[${uploadId}] Failed to init status:`, error);
-    throw error;
+    if (error) {
+      handleSupabaseError(uploadId, 'initStatus', error);
+    }
+
+    return status;
+  } else {
+    // In-memory mode
+    inMemoryStatusMap.set(uploadId, status);
+    console.log(`[${uploadId}] [InMemory] Status initialized`);
+    return status;
   }
-
-  return status;
 };
 
 /**
- * Update processing status in Supabase
+ * Update processing status (Dual mode: Supabase or In-memory)
  */
 export const updateStatus = async (
   uploadId: string,
   updates: Partial<ProcessingStatus>
 ): Promise<ProcessingStatus> => {
-  const updatePayload: any = {
-    updated_at: new Date().toISOString(),
-  };
+  if (USE_SUPABASE && supabase) {
+    // Supabase mode
+    const updatePayload: any = {
+      updated_at: new Date().toISOString(),
+    };
 
-  // Map camelCase to snake_case for Supabase
-  if (updates.status) updatePayload.status = updates.status;
-  if (updates.progress !== undefined) updatePayload.progress = updates.progress;
-  if (updates.stage) updatePayload.stage = updates.stage;
-  if (updates.resultUrl) updatePayload.result_url = updates.resultUrl;
-  if (updates.error) updatePayload.error = updates.error;
-  if (updates.metadata) updatePayload.metadata = updates.metadata;
+    // Map camelCase to snake_case for Supabase
+    if (updates.status) updatePayload.status = updates.status;
+    if (updates.progress !== undefined) updatePayload.progress = updates.progress;
+    if (updates.stage) updatePayload.stage = updates.stage;
+    if (updates.resultUrl) updatePayload.result_url = updates.resultUrl;
+    if (updates.error) updatePayload.error = updates.error;
+    if (updates.metadata) updatePayload.metadata = updates.metadata;
 
-  const { data, error } = await supabase
-    .from('processing_status')
-    .update(updatePayload)
-    .eq('upload_id', uploadId)
-    .select()
-    .single();
+    const { data, error } = await supabase
+      .from('processing_status')
+      .update(updatePayload)
+      .eq('upload_id', uploadId)
+      .select()
+      .single();
 
-  if (error) {
-    console.error(`[${uploadId}] Failed to update status:`, error);
-    throw error;
+    if (error) {
+      handleSupabaseError(uploadId, 'updateStatus', error);
+    }
+
+    return mapDbRowToStatus(data);
+  } else {
+    // In-memory mode
+    const currentStatus = inMemoryStatusMap.get(uploadId);
+    if (!currentStatus) {
+      throw new Error(`[${uploadId}] Status not found in memory. Initialize first.`);
+    }
+
+    const updatedStatus: ProcessingStatus = {
+      ...currentStatus,
+      ...updates,
+      updatedAt: new Date().toISOString(),
+    };
+
+    inMemoryStatusMap.set(uploadId, updatedStatus);
+    console.log(`[${uploadId}] [InMemory] Status updated:`, {
+      status: updatedStatus.status,
+      progress: updatedStatus.progress,
+      stage: updatedStatus.stage,
+    });
+
+    return updatedStatus;
   }
-
-  return mapDbRowToStatus(data);
 };
 
 /**
- * Get processing status from Supabase
+ * Get processing status (Dual mode: Supabase or In-memory)
  */
 export const getStatus = async (uploadId: string): Promise<ProcessingStatus | null> => {
-  const { data, error } = await supabase
-    .from('processing_status')
-    .select()
-    .eq('upload_id', uploadId)
-    .single();
+  if (USE_SUPABASE && supabase) {
+    // Supabase mode
+    const { data, error } = await supabase
+      .from('processing_status')
+      .select()
+      .eq('upload_id', uploadId)
+      .single();
 
-  if (error) {
-    if (error.code === 'PGRST116') {
-      // Not found
-      return null;
+    if (error) {
+      if (error.code === 'PGRST116') {
+        // Not found (this is expected)
+        return null;
+      }
+      handleSupabaseError(uploadId, 'getStatus', error);
     }
-    console.error(`[${uploadId}] Failed to get status:`, error);
-    throw error;
-  }
 
-  return mapDbRowToStatus(data);
+    return mapDbRowToStatus(data);
+  } else {
+    // In-memory mode
+    const status = inMemoryStatusMap.get(uploadId);
+    if (status) {
+      console.log(`[${uploadId}] [InMemory] Status retrieved:`, {
+        status: status.status,
+        progress: status.progress,
+        stage: status.stage,
+      });
+    } else {
+      console.log(`[${uploadId}] [InMemory] Status not found`);
+    }
+    return status || null;
+  }
 };
 
 /**
- * Mark processing as complete
+ * Mark processing as complete (Dual mode: Supabase or In-memory)
  */
 export const completeStatus = async (
   uploadId: string,
@@ -134,7 +244,7 @@ export const completeStatus = async (
 };
 
 /**
- * Mark processing as failed
+ * Mark processing as failed (Dual mode: Supabase or In-memory)
  */
 export const failStatus = async (uploadId: string, error: string): Promise<ProcessingStatus> => {
   return updateStatus(uploadId, {

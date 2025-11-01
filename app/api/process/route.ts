@@ -47,7 +47,12 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const cloudRunUrl = process.env.CLOUD_RUN_URL;
+    // Use localhost for development, production URL for deployment
+    const cloudRunUrl = process.env.NODE_ENV === 'development'
+      ? process.env.CLOUD_RUN_URL || 'http://localhost:8080'
+      : process.env.CLOUD_RUN_URL;
+
+    // Always require WORKER_SECRET from environment (no defaults for security)
     const workerSecret = process.env.WORKER_SECRET;
 
     if (!cloudRunUrl || !workerSecret) {
@@ -62,33 +67,30 @@ export async function POST(request: NextRequest) {
     }
 
     // MVP: Trigger processing asynchronously (without waiting for completion)
-    // In development, we can use a simple timeout-based simulation
-    // In production, this will call Cloud Run Worker
+    // Works for both local development (localhost:8080) and production (Cloud Run)
 
-    if (process.env.NODE_ENV === 'development' || !cloudRunUrl) {
-      console.log(`[${uploadId}] Development mode: Processing will be simulated`);
-    } else {
-      // Try to call Cloud Run Worker, but don't fail if it's unavailable
-      try {
-        fetch(`${cloudRunUrl}/process`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${workerSecret}`,
-          },
-          body: JSON.stringify({
-            uploadId,
-            blobUrl,
-            fileName,
-            dataConsent: dataConsent || false,
-          }),
-          signal: AbortSignal.timeout(25000),
-        }).catch(err => {
-          console.warn(`[${uploadId}] Cloud Run request failed:`, err);
-        });
-      } catch (err) {
-        console.warn(`[${uploadId}] Failed to trigger Cloud Run:`, err);
-      }
+    console.log(`[${uploadId}] Sending processing request to worker: ${cloudRunUrl}`);
+
+    // Call worker (local or production)
+    try {
+      fetch(`${cloudRunUrl}/process`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${workerSecret}`,
+        },
+        body: JSON.stringify({
+          uploadId,
+          blobUrl,
+          fileName,
+          dataConsent: dataConsent || false,
+        }),
+        signal: AbortSignal.timeout(25000),
+      }).catch(err => {
+        console.warn(`[${uploadId}] Worker request failed:`, err);
+      });
+    } catch (err) {
+      console.warn(`[${uploadId}] Failed to trigger worker:`, err);
     }
 
     // Return immediately - processing happens in background

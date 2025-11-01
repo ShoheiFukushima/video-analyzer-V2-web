@@ -8,7 +8,7 @@
 
 import ExcelJS from 'exceljs';
 import { promises as fs } from 'fs';
-import { ExcelRow, ExcelGenerationOptions, ProcessingStats, VideoMetadata } from '../types/excel';
+import { ExcelRow, ExcelGenerationOptions, ProcessingStats, VideoMetadata } from '../types/excel.js';
 
 // Excel layout constants
 const EXCEL_IMAGE_WIDTH_PX = 320; // Target image width in pixels
