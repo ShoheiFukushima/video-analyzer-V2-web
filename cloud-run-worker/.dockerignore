@@ -1,13 +1,45 @@
+# Build artifacts (will be rebuilt in Docker)
 node_modules
-npm-debug.log
+dist
+
+# Environment files
 .env
 .env.local
+
+# Git files
 .git
 .gitignore
+.gitattributes
+
+# Documentation
 README.md
-tsconfig.json
-src
+*.md
+
+# Test files
 *.test.ts
-.DS_Store
-dist/test
+*.test.js
+__tests__
+test-output
 coverage
+
+# Development files
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+*.log
+
+# IDE files
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+.cache
