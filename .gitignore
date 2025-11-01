@@ -40,5 +40,13 @@ next-env.d.ts
 cloud-run-worker/.env
 cloud-run-worker/.env.local
 cloud-run-worker/node_modules
+cloud-run-worker/test-output/
 # Note: Including dist/ to commit built V2 implementation files
 # cloud-run-worker/dist
+
+# Supabase
+supabase/.temp/
+
+# Test files
+test-*.js
+test-*.sh
