@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     python3 \
     python3-pip \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -13,12 +14,19 @@ WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
+COPY tsconfig.json ./
 
-# Install dependencies
-RUN npm ci --only=production
+# Install all dependencies (including devDependencies for build)
+RUN npm ci
 
-# Copy built application
-COPY dist ./dist
+# Copy source files
+COPY src ./src
+
+# Build the application
+RUN npm run build
+
+# Remove devDependencies
+RUN npm prune --production
 
 # Create directories for temporary files
 RUN mkdir -p /tmp/video-analyzer
