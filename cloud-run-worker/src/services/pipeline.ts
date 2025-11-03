@@ -194,66 +194,114 @@ Return empty string if no text detected.`;
 
 /**
  * Filter out persistent overlays (logos, watermarks, constant UI elements)
- * Removes text that appears in 50% or more of scenes
+ * Removes text that appears in 50% or more of scenes using substring matching
  */
 function filterPersistentOverlays(scenesWithOCR: SceneWithOCR[]): SceneWithOCR[] {
   if (scenesWithOCR.length === 0) return scenesWithOCR;
 
-  // Step 1: Split each scene's OCR text into lines
-  const allLines: string[][] = scenesWithOCR.map(scene =>
-    scene.ocrText
-      .split('\n')
-      .map(line => line.trim())
-      .filter(line => line.length > 0)
-  );
-
-  // Step 2: Count how many scenes each unique line appears in
-  const lineFrequency = new Map<string, number>();
   const totalScenes = scenesWithOCR.length;
-
-  for (const lines of allLines) {
-    const uniqueLines = new Set(lines); // Count each line once per scene
-    for (const line of uniqueLines) {
-      lineFrequency.set(line, (lineFrequency.get(line) || 0) + 1);
-    }
-  }
-
-  // Step 3: Identify persistent lines (appear in >= 50% of scenes)
   const persistentThreshold = Math.ceil(totalScenes * 0.5);
-  const persistentLines = new Set<string>();
 
-  for (const [line, count] of lineFrequency.entries()) {
-    if (count >= persistentThreshold) {
-      persistentLines.add(line);
+  console.log(`  🔍 Analyzing ${totalScenes} scenes for persistent overlays (threshold: ${persistentThreshold}/${totalScenes} scenes, ≥50%)`);
+
+  // Step 1: Extract candidate phrases (substrings) from all scenes
+  const candidatePhrases = new Set<string>();
+  const minPhraseLength = 8; // Minimum 8 characters to be considered
+  const maxPhraseLength = 100; // Maximum 100 characters
+  const maxCandidates = 5000; // Performance limit
+
+  for (const scene of scenesWithOCR) {
+    const text = scene.ocrText.trim();
+    if (text.length === 0) continue;
+
+    // Extract all substrings between minPhraseLength and maxPhraseLength
+    for (let len = minPhraseLength; len <= Math.min(maxPhraseLength, text.length); len++) {
+      for (let i = 0; i <= text.length - len; i++) {
+        const phrase = text.substring(i, i + len).trim();
+
+        // Only add meaningful phrases (not just spaces or symbols)
+        if (phrase.length >= minPhraseLength && !/^\s*$/.test(phrase)) {
+          candidatePhrases.add(phrase);
+        }
+
+        // Performance safeguard
+        if (candidatePhrases.size >= maxCandidates) break;
+      }
+      if (candidatePhrases.size >= maxCandidates) break;
     }
   }
 
-  // Debug: Log all unique lines and their frequencies
-  console.log(`  🔍 Debug: Analyzing ${lineFrequency.size} unique lines`);
-  const sortedLines = Array.from(lineFrequency.entries()).sort((a, b) => b[1] - a[1]);
-  console.log(`  📊 Top 10 most frequent lines:`);
-  for (const [line, count] of sortedLines.slice(0, 10)) {
-    const percentage = ((count / totalScenes) * 100).toFixed(0);
-    console.log(`    [${count}/${totalScenes} = ${percentage}%] "${line.substring(0, 60)}${line.length > 60 ? '...' : ''}"`);
-  }
+  console.log(`  📊 Extracted ${candidatePhrases.size} candidate phrases`);
 
-  console.log(`  ✓ Detected ${persistentLines.size} persistent overlay lines (threshold: ${persistentThreshold}/${totalScenes} scenes, ≥50%)`);
-  if (persistentLines.size > 0) {
-    console.log(`  📌 Persistent lines:`);
-    for (const line of persistentLines) {
-      const count = lineFrequency.get(line) || 0;
-      console.log(`    - "${line.substring(0, 50)}${line.length > 50 ? '...' : ''}" (${count}/${totalScenes} scenes)`);
+  // Step 2: Count how many scenes each phrase appears in (substring match)
+  const phraseFrequency = new Map<string, number>();
+
+  for (const phrase of candidatePhrases) {
+    let count = 0;
+    for (const scene of scenesWithOCR) {
+      if (scene.ocrText.includes(phrase)) {  // ← KEY CHANGE: substring match instead of exact match
+        count++;
+      }
+    }
+
+    // Only track phrases that appear in multiple scenes
+    if (count >= 2) {
+      phraseFrequency.set(phrase, count);
     }
   }
 
-  // Step 4: Remove persistent lines from each scene
+  console.log(`  📈 Found ${phraseFrequency.size} phrases appearing in multiple scenes`);
+
+  // Step 3: Identify persistent phrases (appear in >= 50% of scenes)
+  const persistentPhrases = Array.from(phraseFrequency.entries())
+    .filter(([_, count]) => count >= persistentThreshold)
+    .sort((a, b) => {
+      // Sort by length (longer first) then by frequency
+      if (b[0].length !== a[0].length) {
+        return b[0].length - a[0].length;
+      }
+      return b[1] - a[1];
+    })
+    .map(([phrase, _]) => phrase);
+
+  // Remove redundant phrases (if a longer phrase contains a shorter one)
+  const deduplicatedPhrases: string[] = [];
+  for (const phrase of persistentPhrases) {
+    const isSubstring = deduplicatedPhrases.some(longer =>
+      longer.length > phrase.length && longer.includes(phrase)
+    );
+    if (!isSubstring) {
+      deduplicatedPhrases.push(phrase);
+    }
+  }
+
+  console.log(`  ✓ Detected ${deduplicatedPhrases.length} persistent overlay phrases (after deduplication)`);
+
+  if (deduplicatedPhrases.length > 0) {
+    console.log(`  📌 Persistent phrases:`);
+    for (const phrase of deduplicatedPhrases.slice(0, 10)) { // Show top 10
+      const count = phraseFrequency.get(phrase) || 0;
+      const percentage = ((count / totalScenes) * 100).toFixed(0);
+      console.log(`    [${count}/${totalScenes} = ${percentage}%] "${phrase.substring(0, 50)}${phrase.length > 50 ? '...' : ''}"`);
+    }
+    if (deduplicatedPhrases.length > 10) {
+      console.log(`    ... and ${deduplicatedPhrases.length - 10} more`);
+    }
+  }
+
+  // Step 4: Remove persistent phrases from each scene
   const filteredScenes = scenesWithOCR.map(scene => {
-    const lines = scene.ocrText
-      .split('\n')
-      .map(line => line.trim())
-      .filter(line => line.length > 0 && !persistentLines.has(line));
+    let filteredText = scene.ocrText;
 
-    const filteredText = lines.join('\n');
+    // Remove each persistent phrase
+    for (const phrase of deduplicatedPhrases) {
+      filteredText = filteredText.split(phrase).join(''); // Remove all occurrences
+    }
+
+    // Clean up extra whitespace
+    filteredText = filteredText
+      .replace(/\s+/g, ' ') // Multiple spaces to single space
+      .trim();
 
     return {
       ...scene,
