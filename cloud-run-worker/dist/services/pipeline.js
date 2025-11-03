@@ -151,13 +151,18 @@ Return empty string if no text detected.`;
     console.log(`  ✓ OCR complete: ${scenesWithOCR.filter(s => s.ocrText).length}/${scenes.length} scenes with text`);
     return scenesWithOCR;
 }
-/**
- * Filter out persistent overlays (logos, watermarks, constant UI elements)
- * Removes text that appears in 50% or more of scenes
- */
-function filterPersistentOverlays(scenesWithOCR) {
+function filterPersistentOverlays(scenesWithOCR, options = {}) {
+    const { threshold = 0.5, minScenes = 3 } = options;
+    // Early return for empty array
     if (scenesWithOCR.length === 0)
         return scenesWithOCR;
+    // Skip filtering for very small scene counts (insufficient data for statistical analysis)
+    if (scenesWithOCR.length < minScenes) {
+        console.log(`  ⚠️ Only ${scenesWithOCR.length} scenes detected. Skipping persistent overlay filter (minimum: ${minScenes} scenes required).`);
+        return scenesWithOCR;
+    }
+    // Log filter configuration
+    console.log(`  🔧 Filter config: threshold=${(threshold * 100).toFixed(0)}%, minScenes=${minScenes}`);
     // Step 1: Split each scene's OCR text into lines
     const allLines = scenesWithOCR.map(scene => scene.ocrText
         .split('\n')
@@ -172,8 +177,9 @@ function filterPersistentOverlays(scenesWithOCR) {
             lineFrequency.set(line, (lineFrequency.get(line) || 0) + 1);
         }
     }
-    // Step 3: Identify persistent lines (appear in >= 50% of scenes)
-    const persistentThreshold = Math.ceil(totalScenes * 0.5);
+    // Step 3: Identify persistent lines (appear in >= threshold% of scenes)
+    // Use float comparison for accurate threshold calculation
+    const persistentThreshold = totalScenes * threshold;
     const persistentLines = new Set();
     for (const [line, count] of lineFrequency.entries()) {
         if (count >= persistentThreshold) {
@@ -188,12 +194,13 @@ function filterPersistentOverlays(scenesWithOCR) {
         const percentage = ((count / totalScenes) * 100).toFixed(0);
         console.log(`    [${count}/${totalScenes} = ${percentage}%] "${line.substring(0, 60)}${line.length > 60 ? '...' : ''}"`);
     }
-    console.log(`  ✓ Detected ${persistentLines.size} persistent overlay lines (threshold: ${persistentThreshold}/${totalScenes} scenes, ≥50%)`);
+    console.log(`  ✓ Detected ${persistentLines.size} persistent overlay lines (threshold: ≥${(threshold * 100).toFixed(0)}% of ${totalScenes} scenes)`);
     if (persistentLines.size > 0) {
         console.log(`  📌 Persistent lines:`);
         for (const line of persistentLines) {
             const count = lineFrequency.get(line) || 0;
-            console.log(`    - "${line.substring(0, 50)}${line.length > 50 ? '...' : ''}" (${count}/${totalScenes} scenes)`);
+            const percentage = ((count / totalScenes) * 100).toFixed(0);
+            console.log(`    - "${line.substring(0, 50)}${line.length > 50 ? '...' : ''}" (${count}/${totalScenes} = ${percentage}%)`);
         }
     }
     // Step 4: Remove persistent lines from each scene

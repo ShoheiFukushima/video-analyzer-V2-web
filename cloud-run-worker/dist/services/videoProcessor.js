@@ -5,6 +5,7 @@ import { getVideoMetadata } from './ffmpeg.js';
 import { uploadResultFile } from './blobUploader.js';
 import { extractAudioForWhisper, hasAudioStream } from './audioExtractor.js';
 import { processAudioWithVADAndWhisper } from './audioWhisperPipeline.js';
+import { deleteBlob } from './blobCleaner.js';
 import { resultFileMap } from '../index.js';
 import path from 'path';
 import fs from 'fs';
@@ -43,6 +44,9 @@ export const processVideo = async (uploadId, blobUrl, fileName, dataConsent) => 
             console.log(`[${uploadId}] Downloading video from blob...`);
             await safeUpdateStatus(uploadId, { status: 'downloading', progress: 10, stage: 'downloading' });
             await downloadFile(blobUrl, videoPath);
+            // Delete source video blob after successful download
+            console.log(`[${uploadId}] Deleting source video blob...`);
+            await deleteBlob(blobUrl);
             // Step 2: Extract video metadata
             console.log(`[${uploadId}] Extracting video metadata...`);
             await safeUpdateStatus(uploadId, { status: 'processing', progress: 20, stage: 'metadata' });
