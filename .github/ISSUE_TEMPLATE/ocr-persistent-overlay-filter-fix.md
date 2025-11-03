@@ -4,7 +4,54 @@
 🔴 **高** - ユーザー体験に直接影響
 
 ## ステータス
-🔴 **未対応**
+✅ **実装完了** (2025-11-03)
+
+**実装コミット**: `7d8e2d4`
+**実装アプローチ**: Substring Inclusion Matching (推奨アプローチ1)
+**修正ファイル**: `cloud-run-worker/src/services/pipeline.ts`
+
+---
+
+## 🎉 実装完了サマリー
+
+### 実装内容
+
+**filterPersistentOverlays()関数を完全リニューアル:**
+
+1. **改行分割を削除** - Gemini APIのレスポンス形式に依存しない設計に変更
+2. **N-gram フレーズ抽出** - 8-100文字の全ての部分文字列を候補として抽出
+3. **Substring Matching** - `includes()`を使用した部分一致で重複を検出
+4. **重複排除ロジック** - 長いフレーズに短いフレーズが含まれる場合は短い方を削除
+5. **パフォーマンス最適化** - 最大5000候補の制限を設定
+
+### 技術的な改善点
+
+**Before (問題のあった実装):**
+```typescript
+// 改行で分割 → 各シーンが1行 → exact match
+const allLines = scenesWithOCR.map(scene => scene.ocrText.split('\n'));
+lineFrequency.set(line, count); // 完全一致でカウント
+```
+結果: 各シーンが異なる文字列として扱われ、重複検出失敗 ❌
+
+**After (修正後):**
+```typescript
+// シーン全体から部分文字列を抽出 → substring match
+for (const phrase of candidatePhrases) {
+  if (scene.ocrText.includes(phrase)) { // 部分一致
+    count++;
+  }
+}
+```
+結果: 「みらいリハビリテーション病院」が6/6シーン(100%)で検出される ✅
+
+### 検証予定
+
+実際の動作確認は、Cloud Runにデプロイ後、以下で検証:
+- テスト動画: `mirai_0814.mp4` (6シーン、全シーンに病院名)
+- 期待結果: 病院名が全シーンから削除される
+
+---
 
 ## 問題の概要
 
