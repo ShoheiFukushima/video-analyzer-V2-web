@@ -56,7 +56,7 @@ export function useProcessingStatus(uploadId: string | null, enabled = true) {
       return response.data;
     },
     enabled: !!uploadId && enabled,
-    refetchInterval: 5000, // Poll every 5 seconds
+    refetchInterval: 10000, // Poll every 10 seconds (reduced from 5s to minimize Supabase load)
     refetchIntervalInBackground: false,
     retry: 3,
     retryDelay: (attemptIndex) => Math.min(1000 * 2 ** attemptIndex, 5000),

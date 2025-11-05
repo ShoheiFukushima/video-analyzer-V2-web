@@ -91,8 +91,8 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
     // Start progress simulation (slower, as backup)
     const progressInterval = setInterval(simulateProgress, 5000);
 
-    // Start polling every 3 seconds
-    pollInterval = setInterval(pollStatus, 3000);
+    // Start polling every 10 seconds (reduced from 3s to minimize Supabase load)
+    pollInterval = setInterval(pollStatus, 10000);
     pollStatus(); // Initial poll immediately
 
     return () => {
