@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
+import { isValidVercelBlobUrl } from "@/lib/blob-url-validator";
 
 export const runtime = "nodejs";
 export const maxDuration = 30; // 30 second timeout for processing request
@@ -39,10 +40,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Validate blob URL format (vercel-storage is the actual Blob domain)
-    if (!blobUrl.includes('vercel-storage') && !blobUrl.includes('blob.vercel')) {
+    // Security: Validate blob URL format with strict hostname checking (SSRF protection)
+    if (!isValidVercelBlobUrl(blobUrl)) {
       return NextResponse.json(
-        { error: "Invalid request", message: "Blob URL must be from Vercel Blob storage" },
+        {
+          error: "Invalid request",
+          message: "Invalid Vercel Blob Storage URL. Must be HTTPS from vercel-storage.com domain"
+        },
         { status: 400 }
       );
     }
@@ -71,27 +75,38 @@ export async function POST(request: NextRequest) {
 
     console.log(`[${uploadId}] Sending processing request to worker: ${cloudRunUrl}`);
 
-    // Call worker (local or production)
-    try {
-      fetch(`${cloudRunUrl}/process`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${workerSecret}`,
+    // Call worker (local or production) - MUST await to ensure request is sent
+    const workerResponse = await fetch(`${cloudRunUrl}/process`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${workerSecret}`,
+      },
+      body: JSON.stringify({
+        uploadId,
+        blobUrl,
+        fileName,
+        dataConsent: dataConsent || false,
+      }),
+      signal: AbortSignal.timeout(25000),
+    });
+
+    // Check if worker accepted the request
+    if (!workerResponse.ok) {
+      console.error(`[${uploadId}] Worker returned status ${workerResponse.status}`);
+      const errorText = await workerResponse.text().catch(() => 'Unable to read error response');
+      return NextResponse.json(
+        {
+          error: "Processing failed to start",
+          message: `Worker service returned error: ${workerResponse.status}`,
+          details: errorText,
         },
-        body: JSON.stringify({
-          uploadId,
-          blobUrl,
-          fileName,
-          dataConsent: dataConsent || false,
-        }),
-        signal: AbortSignal.timeout(25000),
-      }).catch(err => {
-        console.warn(`[${uploadId}] Worker request failed:`, err);
-      });
-    } catch (err) {
-      console.warn(`[${uploadId}] Failed to trigger worker:`, err);
+        { status: 502 }
+      );
     }
+
+    const workerData = await workerResponse.json().catch(() => ({}));
+    console.log(`[${uploadId}] Worker accepted request:`, workerData);
 
     // Return immediately - processing happens in background
     return NextResponse.json({
