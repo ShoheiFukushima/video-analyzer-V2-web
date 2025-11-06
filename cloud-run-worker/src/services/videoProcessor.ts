@@ -32,6 +32,9 @@ export const processVideo = async (
   userId: string, // Security: User ID for IDOR protection
   dataConsent: boolean
 ) => {
+  let blobDeleted = false; // Track if blob has been deleted
+  let tempDir: string | null = null;
+
   try {
     console.log(`[${uploadId}] Starting video processing for user ${userId}`);
 
@@ -45,7 +48,7 @@ export const processVideo = async (
       }
     }
 
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'video-analyzer-'));
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'video-analyzer-'));
     const videoPath = path.join(tempDir, 'video.mp4');
 
     try {
@@ -55,9 +58,15 @@ export const processVideo = async (
 
       await downloadFile(blobUrl, videoPath);
 
-      // Delete source video blob after successful download
-      console.log(`[${uploadId}] Deleting source video blob...`);
-      await deleteBlob(blobUrl);
+      // Delete source video blob after successful download (early cleanup)
+      console.log(`[${uploadId}] Deleting source video blob (early cleanup)...`);
+      try {
+        await deleteBlob(blobUrl);
+        blobDeleted = true;
+        console.log(`[${uploadId}] ✅ Blob deleted successfully`);
+      } catch (deleteError) {
+        console.warn(`[${uploadId}] ⚠️  Failed to delete blob (will retry in finally):`, deleteError);
+      }
 
       // Step 2: Extract video metadata
       console.log(`[${uploadId}] Extracting video metadata...`);
@@ -170,14 +179,37 @@ export const processVideo = async (
       }
 
     } finally {
-      // Cleanup
-      fs.rmSync(tempDir, { recursive: true, force: true });
+      // Cleanup temporary directory
+      if (tempDir) {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
     }
 
   } catch (error) {
     console.error(`[${uploadId}] Processing failed:`, error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
     await failStatus(uploadId, errorMessage);
+  } finally {
+    // CRITICAL: Always delete the source blob, even on error
+    // This prevents storage quota exhaustion
+    if (!blobDeleted) {
+      console.log(`[${uploadId}] Attempting final blob cleanup...`);
+      try {
+        await deleteBlob(blobUrl);
+        console.log(`[${uploadId}] ✅ Blob deleted in final cleanup`);
+      } catch (deleteError: any) {
+        // Ignore 404 errors (blob already deleted)
+        if (deleteError?.message?.includes('404') || deleteError?.message?.includes('not found')) {
+          console.log(`[${uploadId}] ℹ️  Blob already deleted (404), skipping`);
+        } else {
+          console.error(`[${uploadId}] ❌ CRITICAL: Failed to delete blob in final cleanup:`, deleteError);
+          // Log to error tracking service in production
+          if (process.env.NODE_ENV === 'production') {
+            // TODO: Send alert to monitoring service (e.g., Sentry)
+          }
+        }
+      }
+    }
   }
 };
 
