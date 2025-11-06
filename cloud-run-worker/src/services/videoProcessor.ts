@@ -204,14 +204,18 @@ async function downloadFile(url: string, dest: string) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
     let downloadedBytes = 0;
+    let lastLoggedBytes = 0; // Track last logged position for progress reporting
     const totalBytes = parseInt(response.headers['content-length'] || '0');
+    const LOG_INTERVAL = 10 * 1024 * 1024; // 10MB
 
     response.data.on('data', (chunk: Buffer) => {
       downloadedBytes += chunk.length;
-      if (totalBytes > 0 && downloadedBytes % (10 * 1024 * 1024) === 0) {
-        // Log progress every 10MB
+
+      // Log progress when 10MB or more has been downloaded since last log
+      if (totalBytes > 0 && downloadedBytes - lastLoggedBytes >= LOG_INTERVAL) {
         const percent = ((downloadedBytes / totalBytes) * 100).toFixed(1);
         console.log(`[downloadFile] Progress: ${percent}% (${(downloadedBytes / 1024 / 1024).toFixed(1)}MB / ${(totalBytes / 1024 / 1024).toFixed(1)}MB)`);
+        lastLoggedBytes = downloadedBytes;
       }
     });
 
