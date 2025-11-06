@@ -80,17 +80,18 @@ export async function GET(
 
       const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-      // Get status with metadata containing blobUrl
+      // Security: Get status with user_id verification to prevent IDOR attacks
       const { data, error } = await supabase
         .from('processing_status')
         .select('metadata')
         .eq('upload_id', uploadId)
+        .eq('user_id', userId) // Critical: Verify ownership
         .single();
 
       if (error || !data) {
         console.error(`[${uploadId}] Failed to fetch metadata:`, error);
         return NextResponse.json(
-          { error: "Upload not found" },
+          { error: "Upload not found or access denied" },
           { status: 404 }
         );
       }

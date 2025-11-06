@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
+import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
@@ -8,7 +9,7 @@ export async function GET(
   { params }: { params: { uploadId: string } }
 ) {
   try {
-    // Verify authentication - Required for all environments
+    // Security: Verify authentication
     const { userId } = await auth();
     if (!userId) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -16,41 +17,37 @@ export async function GET(
 
     const { uploadId } = params;
 
-    // Use localhost for development, production URL for deployment
-    const cloudRunUrl = process.env.NODE_ENV === 'development'
-      ? process.env.CLOUD_RUN_URL || 'http://localhost:8080'
-      : process.env.CLOUD_RUN_URL;
+    // Security: Fetch from Supabase with user_id verification (IDOR protection)
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-    const workerSecret = process.env.WORKER_SECRET;
-
-    // Fetch status from Worker (local or production)
-    if (!cloudRunUrl || !workerSecret) {
+    if (!supabaseUrl || !supabaseServiceKey) {
       return NextResponse.json(
-        { error: "Server configuration error: Missing CLOUD_RUN_URL or WORKER_SECRET" },
+        { error: "Server configuration error: Missing Supabase credentials" },
         { status: 500 }
       );
     }
 
-    console.log(`[${uploadId}] Fetching status from Worker...`);
-    const response = await fetch(`${cloudRunUrl}/status/${uploadId}`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${workerSecret}`,
-      },
-      signal: AbortSignal.timeout(10000),
-    });
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    if (!response.ok) {
-      console.error(`[${uploadId}] Worker returned status ${response.status}`);
+    // Security: Query with both upload_id AND user_id to prevent IDOR attacks
+    const { data, error } = await supabase
+      .from('processing_status')
+      .select('*')
+      .eq('upload_id', uploadId)
+      .eq('user_id', userId) // Critical: Verify ownership
+      .single();
+
+    if (error || !data) {
+      console.error(`[${uploadId}] Supabase query failed:`, error);
       return NextResponse.json(
-        { error: "Failed to fetch status from Worker" },
-        { status: response.status }
+        { error: "Upload not found or access denied" },
+        { status: 404 }
       );
     }
 
-    const status = await response.json();
-    console.log(`[${uploadId}] Worker status:`, status);
-    return NextResponse.json(status);
+    console.log(`[${uploadId}] Status retrieved:`, data.status);
+    return NextResponse.json(data);
   } catch (error) {
     console.error("Status check error:", error);
     return NextResponse.json(

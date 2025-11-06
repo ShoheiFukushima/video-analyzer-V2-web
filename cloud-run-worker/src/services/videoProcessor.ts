@@ -29,14 +29,15 @@ export const processVideo = async (
   uploadId: string,
   blobUrl: string,
   fileName: string,
+  userId: string, // Security: User ID for IDOR protection
   dataConsent: boolean
 ) => {
   try {
-    console.log(`[${uploadId}] Starting video processing`);
+    console.log(`[${uploadId}] Starting video processing for user ${userId}`);
 
-    // Try to initialize status in Supabase (optional in dev mode)
+    // Security: Initialize status with userId for access control
     try {
-      await initStatus(uploadId);
+      await initStatus(uploadId, userId);
     } catch (statusError) {
       console.warn(`[${uploadId}] Failed to initialize Supabase status (continuing):`, statusError);
       if (process.env.NODE_ENV === 'production') {

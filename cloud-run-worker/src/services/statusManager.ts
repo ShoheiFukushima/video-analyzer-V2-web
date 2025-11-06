@@ -5,7 +5,8 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 dotenv.config();
 
 // Determine if Supabase should be used
-const USE_SUPABASE = process.env.USE_SUPABASE === 'true';
+// Use Supabase in production, or when explicitly enabled
+const USE_SUPABASE = process.env.NODE_ENV === 'production' || process.env.USE_SUPABASE === 'true';
 
 // In-memory status storage (development mode only)
 const inMemoryStatusMap = new Map<string, ProcessingStatus>();
@@ -31,6 +32,7 @@ if (USE_SUPABASE) {
 
 export interface ProcessingStatus {
   uploadId: string;
+  userId?: string; // Security: Clerk user ID for IDOR protection
   status: 'pending' | 'downloading' | 'processing' | 'completed' | 'error';
   progress: number;
   stage?: string;
@@ -92,11 +94,14 @@ function handleSupabaseError(uploadId: string, operation: string, error: any): n
 
 /**
  * Initialize processing status (Dual mode: Supabase or In-memory)
+ * @param uploadId - Unique upload identifier
+ * @param userId - Clerk user ID for IDOR protection
  */
-export const initStatus = async (uploadId: string): Promise<ProcessingStatus> => {
+export const initStatus = async (uploadId: string, userId: string): Promise<ProcessingStatus> => {
   const now = new Date().toISOString();
   const status: ProcessingStatus = {
     uploadId,
+    userId, // Security: Store userId for access control
     status: 'pending',
     progress: 0,
     stage: 'downloading',
@@ -105,11 +110,12 @@ export const initStatus = async (uploadId: string): Promise<ProcessingStatus> =>
   };
 
   if (USE_SUPABASE && supabase) {
-    // Supabase mode
+    // Supabase mode - store userId for RLS
     const { data, error } = await supabase
       .from('processing_status')
       .upsert({
         upload_id: uploadId,
+        user_id: userId, // Security: Critical for IDOR protection
         status: status.status,
         progress: status.progress,
         stage: status.stage,
@@ -127,7 +133,7 @@ export const initStatus = async (uploadId: string): Promise<ProcessingStatus> =>
   } else {
     // In-memory mode
     inMemoryStatusMap.set(uploadId, status);
-    console.log(`[${uploadId}] [InMemory] Status initialized`);
+    console.log(`[${uploadId}] [InMemory] Status initialized for user ${userId}`);
     return status;
   }
 };
@@ -260,6 +266,7 @@ export const failStatus = async (uploadId: string, error: string): Promise<Proce
 function mapDbRowToStatus(row: any): ProcessingStatus {
   return {
     uploadId: row.upload_id,
+    userId: row.user_id, // Security: Include userId for access control
     status: row.status,
     progress: row.progress,
     stage: row.stage,

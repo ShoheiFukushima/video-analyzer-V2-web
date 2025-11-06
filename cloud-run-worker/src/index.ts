@@ -38,20 +38,21 @@ app.get('/health', (req: Request, res: Response) => {
 // Process video endpoint
 app.post('/process', validateAuth, async (req: Request, res: Response): Promise<void> => {
   try {
-    const { uploadId, blobUrl, fileName, dataConsent } = req.body;
+    const { uploadId, blobUrl, fileName, userId, dataConsent } = req.body;
 
-    if (!uploadId || !blobUrl) {
+    // Security: Validate required fields including userId for IDOR protection
+    if (!uploadId || !blobUrl || !userId) {
       res.status(400).json({
         error: 'Invalid request',
-        message: 'Missing uploadId or blobUrl'
+        message: 'Missing uploadId, blobUrl, or userId'
       });
       return;
     }
 
-    console.log(`[${uploadId}] Starting video processing`, { fileName });
+    console.log(`[${uploadId}] Starting video processing`, { fileName, userId });
 
-    // Start processing asynchronously
-    processVideo(uploadId, blobUrl, fileName, dataConsent)
+    // Start processing asynchronously with userId for access control
+    processVideo(uploadId, blobUrl, fileName, userId, dataConsent)
       .catch(err => {
         console.error(`[${uploadId}] Processing error:`, err);
       });

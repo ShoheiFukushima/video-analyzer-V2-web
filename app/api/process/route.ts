@@ -86,6 +86,7 @@ export async function POST(request: NextRequest) {
         uploadId,
         blobUrl,
         fileName,
+        userId, // Security: Pass userId to Worker for IDOR protection
         dataConsent: dataConsent || false,
       }),
       signal: AbortSignal.timeout(25000),
