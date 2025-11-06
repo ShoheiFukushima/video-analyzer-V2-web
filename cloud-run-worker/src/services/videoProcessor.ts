@@ -182,19 +182,59 @@ export const processVideo = async (
 };
 
 async function downloadFile(url: string, dest: string) {
+  console.log(`[downloadFile] Starting download from: ${url.substring(0, 100)}...`);
+
   const response = await axios.get(url, {
     responseType: 'stream',
-    timeout: 60000
+    timeout: 300000, // 5 minutes timeout (increased from 60s for large videos)
+    maxContentLength: 500 * 1024 * 1024, // 500MB max
+    maxBodyLength: 500 * 1024 * 1024
+  }).catch(err => {
+    console.error(`[downloadFile] Axios request failed:`, {
+      message: err.message,
+      code: err.code,
+      timeout: err.timeout,
+      url: url.substring(0, 100)
+    });
+    throw new Error(`Failed to download video: ${err.message}`);
   });
+
+  console.log(`[downloadFile] Response received, content-length: ${response.headers['content-length'] || 'unknown'}`);
 
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
+    let downloadedBytes = 0;
+    const totalBytes = parseInt(response.headers['content-length'] || '0');
+
+    response.data.on('data', (chunk: Buffer) => {
+      downloadedBytes += chunk.length;
+      if (totalBytes > 0 && downloadedBytes % (10 * 1024 * 1024) === 0) {
+        // Log progress every 10MB
+        const percent = ((downloadedBytes / totalBytes) * 100).toFixed(1);
+        console.log(`[downloadFile] Progress: ${percent}% (${(downloadedBytes / 1024 / 1024).toFixed(1)}MB / ${(totalBytes / 1024 / 1024).toFixed(1)}MB)`);
+      }
+    });
+
     response.data.pipe(file);
+
     file.on('finish', () => {
       file.close();
+      console.log(`[downloadFile] Download complete: ${(downloadedBytes / 1024 / 1024).toFixed(1)}MB`);
       resolve(null);
     });
-    file.on('error', reject);
+
+    file.on('error', (err) => {
+      console.error(`[downloadFile] File write error:`, err);
+      fs.unlink(dest, () => {}); // Clean up partial file
+      reject(new Error(`Failed to write file: ${err.message}`));
+    });
+
+    response.data.on('error', (err: Error) => {
+      console.error(`[downloadFile] Stream error:`, err);
+      file.close();
+      fs.unlink(dest, () => {}); // Clean up partial file
+      reject(new Error(`Download stream error: ${err.message}`));
+    });
   });
 }
 
