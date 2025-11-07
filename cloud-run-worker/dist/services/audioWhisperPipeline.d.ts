@@ -1,15 +1,4 @@
-export interface TranscriptionSegment {
-    /** Start time in seconds (absolute) */
-    timestamp: number;
-    /** Duration in seconds */
-    duration: number;
-    /** Transcribed text */
-    text: string;
-    /** Confidence score (0-1) */
-    confidence: number;
-    /** Which audio chunk this came from */
-    chunkIndex?: number;
-}
+import type { TranscriptionSegment } from '../types/shared.js';
 export interface PipelineResult {
     /** Transcription segments with timestamps */
     segments: TranscriptionSegment[];

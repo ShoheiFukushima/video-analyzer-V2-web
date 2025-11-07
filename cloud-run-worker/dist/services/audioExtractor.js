@@ -53,8 +53,9 @@ export async function extractAudioForWhisper(videoPath, outputPath, config = {})
     catch (error) {
         throw new Error(`Input video file not found: ${videoPath}`);
     }
-    // Timeout configuration (2 minutes default)
-    const TIMEOUT_MS = 120000;
+    // Timeout configuration (15 minutes - increased for large videos with noise reduction filters)
+    // Based on analysis: 195-second video needs ~11 minutes, so 15 minutes provides safety margin
+    const TIMEOUT_MS = 900000; // 15 minutes
     return new Promise((resolve, reject) => {
         let command = ffmpeg(videoPath);
         let isTimedOut = false;

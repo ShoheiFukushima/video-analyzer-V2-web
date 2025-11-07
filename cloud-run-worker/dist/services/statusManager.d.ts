@@ -1,27 +1,11 @@
-export interface ProcessingStatus {
-    uploadId: string;
-    status: 'pending' | 'downloading' | 'processing' | 'completed' | 'error';
-    progress: number;
-    stage?: string;
-    startedAt: string;
-    updatedAt: string;
-    resultUrl?: string;
-    metadata?: {
-        duration: number;
-        segmentCount: number;
-        ocrResultCount: number;
-        transcriptionLength: number;
-        totalScenes?: number;
-        scenesWithOCR?: number;
-        scenesWithNarration?: number;
-        blobUrl?: string;
-    };
-    error?: string;
-}
+import type { ProcessingStatus } from '../types/shared.js';
+export type { ProcessingStatus };
 /**
  * Initialize processing status (Dual mode: Supabase or In-memory)
+ * @param uploadId - Unique upload identifier
+ * @param userId - Clerk user ID for IDOR protection
  */
-export declare const initStatus: (uploadId: string) => Promise<ProcessingStatus>;
+export declare const initStatus: (uploadId: string, userId: string) => Promise<ProcessingStatus>;
 /**
  * Update processing status (Dual mode: Supabase or In-memory)
  */

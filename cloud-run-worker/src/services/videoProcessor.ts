@@ -1,20 +1,31 @@
 import axios from 'axios';
-import { initStatus, updateStatus, completeStatus, failStatus } from './statusManager.js';
+import { initStatus, updateStatus, completeStatus, failStatus, ProcessingStatus } from './statusManager.js';
 import { executeIdealPipeline } from './pipeline.js';
 import { getVideoMetadata } from './ffmpeg.js';
 import { uploadResultFile } from './blobUploader.js';
 import { extractAudioForWhisper, hasAudioStream } from './audioExtractor.js';
 import { processAudioWithVADAndWhisper } from './audioWhisperPipeline.js';
 import { deleteBlob } from './blobCleaner.js';
+import { logCriticalError } from './errorTracking.js';
 import { resultFileMap } from '../index.js';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import type {
+  TranscriptionSegment,
+  VADStats,
+  CompressionResult,
+  ProcessingMetadata
+} from '../types/shared.js';
+
+const execFileAsync = promisify(execFile);
 
 /**
  * Safe status update wrapper - non-fatal in development mode
  */
-async function safeUpdateStatus(uploadId: string, updates: any): Promise<void> {
+async function safeUpdateStatus(uploadId: string, updates: Partial<ProcessingStatus>): Promise<void> {
   try {
     await updateStatus(uploadId, updates);
   } catch (error) {
@@ -68,6 +79,30 @@ export const processVideo = async (
         console.warn(`[${uploadId}] ⚠️  Failed to delete blob (will retry in finally):`, deleteError);
       }
 
+      // Step 1.5: Compress video if needed
+      console.log(`[${uploadId}] Checking if compression needed...`);
+      await safeUpdateStatus(uploadId, {
+        status: 'processing',
+        progress: 15,
+        stage: 'compressing'
+      });
+
+      try {
+        const compressionResult = await compressVideoIfNeeded(videoPath, uploadId);
+        if (compressionResult.compressed) {
+          const originalMB = (compressionResult.originalSize / 1024 / 1024).toFixed(1);
+          const newMB = (compressionResult.newSize / 1024 / 1024).toFixed(1);
+          const reductionPercent = (((compressionResult.originalSize - compressionResult.newSize) / compressionResult.originalSize) * 100).toFixed(1);
+          console.log(`[${uploadId}] ✅ Compressed: ${originalMB}MB → ${newMB}MB (${reductionPercent}% reduction)`);
+        } else {
+          const sizeMB = (compressionResult.originalSize / 1024 / 1024).toFixed(1);
+          console.log(`[${uploadId}] ℹ️  Compression skipped: ${sizeMB}MB (under 200MB threshold)`);
+        }
+      } catch (compressionError) {
+        console.warn(`[${uploadId}] ⚠️  Compression failed, continuing with original file:`, compressionError);
+        // Continue processing with original file (compression failure is not fatal)
+      }
+
       // Step 2: Extract video metadata
       console.log(`[${uploadId}] Extracting video metadata...`);
       await safeUpdateStatus(uploadId, { status: 'processing', progress: 20, stage: 'metadata' });
@@ -81,8 +116,8 @@ export const processVideo = async (
       const audioPath = path.join(tempDir, 'audio.mp3');
       const hasAudio = await hasAudioStream(videoPath);
 
-      let transcription: any[] = [];
-      let vadStats: any = null;
+      let transcription: TranscriptionSegment[] = [];
+      let vadStats: VADStats | null = null;
 
       if (hasAudio) {
         console.log(`[${uploadId}] Extracting audio (16kHz mono, noise reduction)...`);
@@ -151,7 +186,7 @@ export const processVideo = async (
       // Complete with metadata (including resultBlobUrl for production downloads)
       console.log(`[${uploadId}] Processing completed!`);
 
-      const completionMetadata: any = {
+      const completionMetadata: ProcessingMetadata = {
         duration: videoMetadata.duration,
         segmentCount: transcription.length,
         ocrResultCount: pipelineResult.stats.scenesWithOCRText,
@@ -197,21 +232,116 @@ export const processVideo = async (
       try {
         await deleteBlob(blobUrl);
         console.log(`[${uploadId}] ✅ Blob deleted in final cleanup`);
-      } catch (deleteError: any) {
+      } catch (deleteError) {
         // Ignore 404 errors (blob already deleted)
-        if (deleteError?.message?.includes('404') || deleteError?.message?.includes('not found')) {
+        const errorMessage = deleteError instanceof Error ? deleteError.message : String(deleteError);
+        if (errorMessage.includes('404') || errorMessage.includes('not found')) {
           console.log(`[${uploadId}] ℹ️  Blob already deleted (404), skipping`);
         } else {
           console.error(`[${uploadId}] ❌ CRITICAL: Failed to delete blob in final cleanup:`, deleteError);
-          // Log to error tracking service in production
-          if (process.env.NODE_ENV === 'production') {
-            // TODO: Send alert to monitoring service (e.g., Sentry)
-          }
+
+          // Log to error tracking service (Cloud Monitoring)
+          logCriticalError(deleteError instanceof Error ? deleteError : new Error(String(deleteError)), {
+            uploadId,
+            blobUrl,
+            operation: 'blob_cleanup',
+            stage: 'final_cleanup',
+          });
         }
       }
     }
   }
 };
+
+/**
+ * Compress video if file size exceeds 200MB
+ * Uses ffmpeg with CRF 28 and fast preset for optimal compression
+ *
+ * @param inputPath - Path to the input video file
+ * @param uploadId - Upload ID for logging
+ * @returns Object containing compression status and file sizes
+ */
+async function compressVideoIfNeeded(
+  inputPath: string,
+  uploadId: string
+): Promise<CompressionResult> {
+  const COMPRESSION_THRESHOLD = 200 * 1024 * 1024; // 200MB in bytes
+
+  // Check file size
+  const stats = fs.statSync(inputPath);
+  const originalSize = stats.size;
+
+  if (originalSize < COMPRESSION_THRESHOLD) {
+    console.log(`[${uploadId}] File size ${(originalSize / 1024 / 1024).toFixed(1)}MB is under ${COMPRESSION_THRESHOLD / 1024 / 1024}MB threshold, skipping compression`);
+    return { compressed: false, originalSize, newSize: originalSize };
+  }
+
+  console.log(`[${uploadId}] File size ${(originalSize / 1024 / 1024).toFixed(1)}MB exceeds threshold, starting compression...`);
+
+  // Create temporary output path
+  const outputPath = inputPath.replace('.mp4', '_compressed.mp4');
+
+  try {
+    const startTime = Date.now();
+
+    // Execute ffmpeg compression
+    // -vcodec libx264: H.264 video codec (widely compatible)
+    // -crf 28: Constant Rate Factor (quality), 28 = good balance of quality/size
+    // -preset fast: Encoding speed preset (faster encoding, slightly larger file)
+    // -acodec aac: AAC audio codec (widely compatible)
+    // -b:a 96k: Audio bitrate 96kbps (sufficient for speech)
+    // -movflags +faststart: Optimize for web streaming
+    // -y: Overwrite output file without asking
+    const ffmpegArgs = [
+      '-i', inputPath,
+      '-vcodec', 'libx264',
+      '-crf', '28',
+      '-preset', 'fast',
+      '-acodec', 'aac',
+      '-b:a', '96k',
+      '-movflags', '+faststart',
+      '-y',
+      outputPath
+    ];
+
+    console.log(`[${uploadId}] Running ffmpeg compression (CRF 28, fast preset)...`);
+
+    const { stdout, stderr } = await execFileAsync('ffmpeg', ffmpegArgs, {
+      maxBuffer: 10 * 1024 * 1024 // 10MB buffer for ffmpeg output
+    });
+
+    const endTime = Date.now();
+    const durationSec = ((endTime - startTime) / 1000).toFixed(1);
+
+    // Check output file
+    if (!fs.existsSync(outputPath)) {
+      throw new Error('Compression completed but output file not found');
+    }
+
+    const compressedStats = fs.statSync(outputPath);
+    const newSize = compressedStats.size;
+
+    console.log(`[${uploadId}] Compression completed in ${durationSec}s`);
+
+    // Replace original file with compressed version
+    fs.unlinkSync(inputPath);
+    fs.renameSync(outputPath, inputPath);
+
+    console.log(`[${uploadId}] Replaced original file with compressed version`);
+
+    return { compressed: true, originalSize, newSize };
+
+  } catch (error) {
+    // Clean up temporary file if it exists
+    if (fs.existsSync(outputPath)) {
+      fs.unlinkSync(outputPath);
+    }
+
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error(`[${uploadId}] Compression failed: ${errorMessage}`);
+    throw error;
+  }
+}
 
 async function downloadFile(url: string, dest: string) {
   console.log(`[downloadFile] Starting download from: ${url.substring(0, 100)}...`);

@@ -1,31 +1,15 @@
 import { useMutation, useQuery } from '@tanstack/react-query';
 import axios, { AxiosError } from 'axios';
+import type {
+  ProcessVideoRequest,
+  ProcessVideoResponse,
+  StatusResponse,
+} from '@/types/shared';
 
-export interface ProcessRequest {
-  uploadId: string;
-  blobUrl: string;
-  fileName: string;
-  dataConsent: boolean;
-}
-
-export interface ProcessResponse {
-  success: boolean;
-  uploadId: string;
-  message: string;
-  data?: any;
-}
-
-export interface ProcessingStatus {
-  uploadId: string;
-  status: 'pending' | 'processing' | 'completed' | 'error';
-  resultUrl?: string;
-  metadata?: {
-    duration: number;
-    segmentCount: number;
-    ocrResultCount: number;
-  };
-  message?: string;
-}
+// Re-export shared types for backward compatibility
+export type ProcessRequest = ProcessVideoRequest;
+export type ProcessResponse = ProcessVideoResponse;
+export type ProcessingStatus = StatusResponse;
 
 export interface ProcessError {
   error: string;

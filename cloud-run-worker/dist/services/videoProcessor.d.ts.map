@@ -1,1 +1,1 @@
-{"version":3,"file":"videoProcessor.d.ts","sourceRoot":"","sources":["../../src/services/videoProcessor.ts"],"names":[],"mappings":"AA2BA,eAAO,MAAM,YAAY,GACvB,UAAU,MAAM,EAChB,SAAS,MAAM,EACf,UAAU,MAAM,EAChB,aAAa,OAAO,kBAqJrB,CAAC"}
+{"version":3,"file":"videoProcessor.d.ts","sourceRoot":"","sources":["../../src/services/videoProcessor.ts"],"names":[],"mappings":"AAsCA,eAAO,MAAM,YAAY,GACvB,UAAU,MAAM,EAChB,SAAS,MAAM,EACf,UAAU,MAAM,EAChB,QAAQ,MAAM,EAAE,wCAAwC;AACxD,aAAa,OAAO,kBAkNrB,CAAC"}

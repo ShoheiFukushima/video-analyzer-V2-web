@@ -1,0 +1,148 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Install worker dependencies
+        working-directory: cloud-run-worker
+        run: npm ci
+
+      - name: Build worker
+        working-directory: cloud-run-worker
+        run: npm run build
+
+  deploy-frontend:
+    name: Deploy Frontend to Vercel
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://video-analyzer-v2.vercel.app
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to Vercel
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: '--prod'
+          working-directory: ./
+
+      - name: Verify deployment
+        run: |
+          echo "Deployment completed"
+          echo "Production URL: https://video-analyzer-v2.vercel.app"
+
+  deploy-worker:
+    name: Deploy Worker to Cloud Run
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: production-worker
+      url: https://video-analyzer-worker-820467345033.us-central1.run.app
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker authentication
+        run: |
+          gcloud auth configure-docker us-central1-docker.pkg.dev
+
+      - name: Deploy to Cloud Run
+        working-directory: cloud-run-worker
+        run: |
+          gcloud run deploy video-analyzer-worker \
+            --source . \
+            --region us-central1 \
+            --platform managed \
+            --allow-unauthenticated \
+            --memory 2Gi \
+            --cpu 1 \
+            --timeout 600 \
+            --max-instances 10 \
+            --set-env-vars "NODE_ENV=production" \
+            --quiet
+
+      - name: Get Cloud Run URL
+        id: get-url
+        run: |
+          URL=$(gcloud run services describe video-analyzer-worker \
+            --region us-central1 \
+            --format 'value(status.url)')
+          echo "url=$URL" >> $GITHUB_OUTPUT
+
+      - name: Verify deployment
+        run: |
+          echo "Deployment completed"
+          echo "Worker URL: ${{ steps.get-url.outputs.url }}"
+
+          # Health check
+          curl -f -s -o /dev/null -w "%{http_code}" \
+            ${{ steps.get-url.outputs.url }}/health || exit 1
+          echo "Health check passed"
+
+  notify-deployment:
+    name: Notify Deployment Status
+    needs: [deploy-frontend, deploy-worker]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Check deployment status
+        run: |
+          if [ "${{ needs.deploy-frontend.result }}" != "success" ] || [ "${{ needs.deploy-worker.result }}" != "success" ]; then
+            echo "Deployment failed"
+            exit 1
+          fi
+          echo "All deployments succeeded"
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Frontend: ${{ needs.deploy-frontend.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Worker: ${{ needs.deploy-worker.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### URLs" >> $GITHUB_STEP_SUMMARY
+          echo "- Frontend: https://video-analyzer-v2.vercel.app" >> $GITHUB_STEP_SUMMARY
+          echo "- Worker: https://video-analyzer-worker-820467345033.us-central1.run.app" >> $GITHUB_STEP_SUMMARY

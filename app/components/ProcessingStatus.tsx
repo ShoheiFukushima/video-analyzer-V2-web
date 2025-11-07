@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { Loader2, CheckCircle2, Download, AlertCircle } from "lucide-react";
+import type { ProcessingMetadata } from "@/types/shared";
 
 interface ProcessingStatusProps {
   uploadId: string;
@@ -26,9 +27,50 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
   const [status, setStatus] = useState<ProcessingStage>("uploading");
   const [error, setError] = useState<string | null>(null);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
-  const [metadata, setMetadata] = useState<any>(null);
+  const [metadata, setMetadata] = useState<ProcessingMetadata | null>(null);
   const [progress, setProgress] = useState(0);
+  const [autoDownloadTriggered, setAutoDownloadTriggered] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
 
+  // Download function (defined before useEffects)
+  const downloadResult = useCallback(async () => {
+    try {
+      setIsDownloading(true);
+
+      // Always use Next.js API endpoint for authenticated downloads
+      // This ensures consistent authentication flow in both dev and production
+      const downloadUrl = `/api/download/${uploadId}`;
+
+      // Use fetch to handle errors gracefully
+      const response = await fetch(downloadUrl);
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Download failed' }));
+        throw new Error(errorData.error || `Download failed with status ${response.status}`);
+      }
+
+      // Convert response to blob and trigger download
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `result_${uploadId}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+
+      console.log('Download completed successfully');
+    } catch (error) {
+      console.error('Download error:', error);
+      setError(error instanceof Error ? error.message : 'Failed to download result');
+      setStatus('error');
+    } finally {
+      setIsDownloading(false);
+    }
+  }, [uploadId]);
+
+  // Poll for processing status
   useEffect(() => {
     let pollInterval: NodeJS.Timeout;
     let currentStage = 0;
@@ -101,36 +143,17 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
     };
   }, [uploadId, onComplete]);
 
-  const downloadResult = async () => {
-    try {
-      // Always use Next.js API endpoint for authenticated downloads
-      // This ensures consistent authentication flow in both dev and production
-      const downloadUrl = `/api/download/${uploadId}`;
-
-      // Use fetch to handle errors gracefully
-      const response = await fetch(downloadUrl);
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ error: 'Download failed' }));
-        throw new Error(errorData.error || `Download failed with status ${response.status}`);
-      }
-
-      // Convert response to blob and trigger download
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `result_${uploadId}.xlsx`;
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
-    } catch (error) {
-      console.error('Download error:', error);
-      setError(error instanceof Error ? error.message : 'Failed to download result');
-      setStatus('error');
+  // Auto-download when processing completes
+  useEffect(() => {
+    if (status === "completed" && resultUrl && !autoDownloadTriggered) {
+      setAutoDownloadTriggered(true);
+      console.log('Auto-download triggered for uploadId:', uploadId);
+      // Delay to allow UI to update
+      setTimeout(() => {
+        downloadResult();
+      }, 500);
     }
-  };
+  }, [status, resultUrl, autoDownloadTriggered, uploadId, downloadResult]);
 
   const getStageLabel = (stage: ProcessingStage): string => {
     const labels: Record<ProcessingStage, string> = {
@@ -178,7 +201,11 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
                 Processing Completed!
               </h3>
               <p className="text-green-700 dark:text-green-300">
-                Your video has been processed successfully. Download the Excel file below.
+                {isDownloading
+                  ? 'Downloading Excel file...'
+                  : autoDownloadTriggered
+                    ? 'Excel file download started automatically. If it didn\'t start, click the button below.'
+                    : 'Your video has been processed successfully. Download the Excel file below.'}
               </p>
             </div>
           </div>
@@ -211,10 +238,20 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
         {/* Download Button */}
         <button
           onClick={downloadResult}
-          className="w-full py-4 px-6 bg-green-600 text-white rounded-xl font-semibold text-lg hover:bg-green-700 transition-all hover:shadow-lg flex items-center justify-center gap-2"
+          disabled={isDownloading}
+          className="w-full py-4 px-6 bg-green-600 text-white rounded-xl font-semibold text-lg hover:bg-green-700 transition-all hover:shadow-lg flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          <Download className="w-5 h-5" />
-          Download Excel Report
+          {isDownloading ? (
+            <>
+              <Loader2 className="w-5 h-5 animate-spin" />
+              Downloading...
+            </>
+          ) : (
+            <>
+              <Download className="w-5 h-5" />
+              {autoDownloadTriggered ? 'Download Again' : 'Download Excel Report'}
+            </>
+          )}
         </button>
       </div>
     );

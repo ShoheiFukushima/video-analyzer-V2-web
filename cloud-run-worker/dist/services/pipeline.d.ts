@@ -9,15 +9,7 @@
  * 4. Generate Excel with ideal format (Scene # | Timecode | Screenshot | OCR | NA Text)
  */
 import { ProcessingStats } from '../types/excel.js';
-/**
- * Transcription segment (from Whisper pipeline)
- */
-interface TranscriptionSegment {
-    timestamp: number;
-    duration: number;
-    text: string;
-    confidence: number;
-}
+import type { TranscriptionSegment } from '../types/shared.js';
 /**
  * Main pipeline execution
  * @param videoPath - Path to video file
@@ -29,5 +21,4 @@ export declare function executeIdealPipeline(videoPath: string, projectTitle: st
     excelPath: string;
     stats: ProcessingStats;
 }>;
-export {};
 //# sourceMappingURL=pipeline.d.ts.map

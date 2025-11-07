@@ -1,5 +1,11 @@
 import dotenv from 'dotenv';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import type {
+  ProcessingStatus,
+  SupabaseError,
+  SupabaseStatusUpdate,
+  SupabaseStatusRow,
+} from '../types/shared.js';
 
 // Load environment variables
 dotenv.config();
@@ -30,32 +36,13 @@ if (USE_SUPABASE) {
   console.log('[StatusManager] In-memory mode enabled (development)');
 }
 
-export interface ProcessingStatus {
-  uploadId: string;
-  userId?: string; // Security: Clerk user ID for IDOR protection
-  status: 'pending' | 'downloading' | 'processing' | 'completed' | 'error';
-  progress: number;
-  stage?: string;
-  startedAt: string;
-  updatedAt: string;
-  resultUrl?: string;
-  metadata?: {
-    duration: number;
-    segmentCount: number;
-    ocrResultCount: number;
-    transcriptionLength: number;
-    totalScenes?: number;
-    scenesWithOCR?: number;
-    scenesWithNarration?: number;
-    blobUrl?: string; // Vercel Blob URL for production downloads
-  };
-  error?: string;
-}
+// Re-export ProcessingStatus for backward compatibility
+export type { ProcessingStatus };
 
 /**
  * Enhanced error handler with detailed diagnostics
  */
-function handleSupabaseError(uploadId: string, operation: string, error: any): never {
+function handleSupabaseError(uploadId: string, operation: string, error: SupabaseError): never {
   console.error(`[${uploadId}] Supabase ${operation} failed:`, {
     code: error.code,
     message: error.message,
@@ -147,7 +134,7 @@ export const updateStatus = async (
 ): Promise<ProcessingStatus> => {
   if (USE_SUPABASE && supabase) {
     // Supabase mode
-    const updatePayload: any = {
+    const updatePayload: SupabaseStatusUpdate = {
       updated_at: new Date().toISOString(),
     };
 
@@ -263,7 +250,7 @@ export const failStatus = async (uploadId: string, error: string): Promise<Proce
 /**
  * Map database row to ProcessingStatus type
  */
-function mapDbRowToStatus(row: any): ProcessingStatus {
+function mapDbRowToStatus(row: SupabaseStatusRow): ProcessingStatus {
   return {
     uploadId: row.upload_id,
     userId: row.user_id, // Security: Include userId for access control

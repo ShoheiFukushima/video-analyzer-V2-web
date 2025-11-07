@@ -99,6 +99,24 @@ Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 See [`cloud-run-worker/DEPLOYMENT_GUIDE.md`](./cloud-run-worker/DEPLOYMENT_GUIDE.md) for detailed Cloud Run deployment instructions.
 
+### Security: Secret Manager Migration (Recommended)
+
+For enhanced security, migrate API keys from plain-text environment variables to GCP Secret Manager:
+
+```bash
+# See detailed guide in DEPLOYMENT_DESIGN.md (Secret Manager section)
+./scripts/migrate-to-secret-manager.sh
+./scripts/verify-secrets.sh
+```
+
+This migration provides:
+- **Encrypted storage** for sensitive credentials
+- **Audit logging** for secret access
+- **Version control** for secret rotation
+- **IAM-based access control**
+
+See `DEPLOYMENT_DESIGN.md` → "Secret Manager移行ガイド" for complete instructions.
+
 **Quick Start**:
 ```bash
 cd cloud-run-worker
@@ -126,6 +144,20 @@ gcloud run deploy video-analyzer-worker \
 - Up to 4K resolution
 - Stereo or mono audio
 - Silent videos (OCR only)
+
+### Video Compression Details
+
+For videos over 200MB, automatic compression is applied to optimize processing and storage:
+
+- **Threshold**: 200MB
+- **Codec**: H.264 (libx264)
+- **Quality**: CRF 28 (good balance of quality/size)
+- **Preset**: fast (optimized for Cloud Run)
+- **Audio**: AAC 96kbps (optimized for speech)
+- **Optimization**: Web streaming (faststart)
+- **Typical reduction**: 40-60%
+
+This ensures efficient processing while maintaining quality for transcription and OCR.
 
 ## Excel Output Format (V2.1)
 
@@ -155,22 +187,30 @@ npm run build
 node dist/test-ideal-pipeline.js /path/to/video.mp4
 ```
 
-## Recent Improvements (V2.1.0 - 2025-10-30)
+## Recent Improvements
 
-### Excel Format Overhaul
+### V2.1.1 (2025-11-07)
+- ✅ **Automatic video compression** - Videos over 200MB are automatically compressed using FFmpeg (CRF 28)
+- ✅ **Download timeout extension** - 60s → 300s (5 minutes) for large videos (400MB+)
+- ✅ **Download progress logging** - Fixed logging condition for better visibility
+- ✅ **Automatic blob cleanup** - Source video and Excel result deletion (Proposal A+B)
+
+### V2.1.0 (2025-10-30)
+
+#### Excel Format Overhaul
 - ✅ **Ideal 5-column layout** with embedded screenshots
 - ✅ **Scene-based structure** replacing fixed-interval extraction
 - ✅ **Multi-pass scene detection** for maximum accuracy
 - ✅ **Time-based OCR/narration mapping** to scenes
 - ✅ **Statistics worksheet** with coverage metrics
 
-### Processing Pipeline
+#### Processing Pipeline
 - ✅ **Modular architecture** (ffmpeg.ts, excel-generator.ts, pipeline.ts)
 - ✅ **E2E testing support** with mock data generators
 - ✅ **Automatic frame cleanup** after processing
 - ✅ **Processing statistics** calculation
 
-### Previous Improvements (V2.0.0)
+### V2.0.0 (Previous Improvements)
 - ✅ **Rotation metadata handling** for portrait smartphone videos
 - ✅ **Aspect ratio preservation** (no more distorted frames)
 - ✅ **Extended timeouts** for 4K videos (up to 10 minutes)
