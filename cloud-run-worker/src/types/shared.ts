@@ -18,6 +18,8 @@ export type ProcessingStage =
   | 'audio_skipped'
   | 'vad_whisper'
   | 'scene_ocr_excel'
+  | 'ocr_processing'
+  | 'ocr_completed'
   | 'upload_result'
   | 'completed';
 
@@ -38,6 +40,7 @@ export interface ProcessingStatus {
   status: ProcessingStatusType;
   progress: number;
   stage?: ProcessingStage;
+  message?: string;
   startedAt: string;
   updatedAt: string;
   resultUrl?: string;
@@ -61,6 +64,7 @@ export interface SupabaseStatusUpdate {
   status?: ProcessingStatusType;
   progress?: number;
   stage?: ProcessingStage;
+  message?: string;
   result_url?: string;
   error?: string;
   metadata?: ProcessingMetadata;
@@ -72,6 +76,7 @@ export interface SupabaseStatusRow {
   status: ProcessingStatusType;
   progress: number;
   stage?: ProcessingStage;
+  message?: string;
   started_at: string;
   updated_at: string;
   result_url?: string;

@@ -23,6 +23,38 @@ import type {
 const execFileAsync = promisify(execFile);
 
 /**
+ * Progress range for download operations
+ * Maps download progress (0-100%) to overall progress percentage
+ */
+interface ProgressRange {
+  start: number; // Starting progress percentage (e.g., 10)
+  end: number;   // Ending progress percentage (e.g., 20)
+}
+
+/**
+ * Utility function to measure and log execution time of async operations
+ * @param uploadId - Upload ID for logging
+ * @param stepName - Name of the step being timed
+ * @param fn - Async function to execute
+ * @returns Result of the async function
+ */
+async function timeStep<T>(uploadId: string, stepName: string, fn: () => Promise<T>): Promise<T> {
+  const startTime = Date.now();
+  console.log(`[${uploadId}] ⏱️  [${stepName}] Starting...`);
+
+  try {
+    const result = await fn();
+    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+    console.log(`[${uploadId}] ✅ [${stepName}] Completed in ${duration}s`);
+    return result;
+  } catch (error) {
+    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+    console.error(`[${uploadId}] ❌ [${stepName}] Failed after ${duration}s`);
+    throw error;
+  }
+}
+
+/**
  * Safe status update wrapper - non-fatal in development mode
  */
 async function safeUpdateStatus(uploadId: string, updates: Partial<ProcessingStatus>): Promise<void> {
@@ -43,10 +75,12 @@ export const processVideo = async (
   userId: string, // Security: User ID for IDOR protection
   dataConsent: boolean
 ) => {
+  const overallStartTime = Date.now();
   let blobDeleted = false; // Track if blob has been deleted
   let tempDir: string | null = null;
 
   try {
+    console.log(`[${uploadId}] ═══════════════════════════════════════════════`);
     console.log(`[${uploadId}] Starting video processing for user ${userId}`);
 
     // Security: Initialize status with userId for access control
@@ -64,23 +98,23 @@ export const processVideo = async (
 
     try {
       // Step 1: Download video
-      console.log(`[${uploadId}] Downloading video from blob...`);
       await safeUpdateStatus(uploadId, { status: 'downloading', progress: 10, stage: 'downloading' });
 
-      await downloadFile(blobUrl, videoPath);
+      await timeStep(uploadId, 'Download Video', async () => {
+        await downloadFile(blobUrl, videoPath, uploadId, { start: 10, end: 20 });
+      });
 
       // Delete source video blob after successful download (early cleanup)
-      console.log(`[${uploadId}] Deleting source video blob (early cleanup)...`);
       try {
-        await deleteBlob(blobUrl);
-        blobDeleted = true;
-        console.log(`[${uploadId}] ✅ Blob deleted successfully`);
+        await timeStep(uploadId, 'Delete Source Blob', async () => {
+          await deleteBlob(blobUrl);
+          blobDeleted = true;
+        });
       } catch (deleteError) {
         console.warn(`[${uploadId}] ⚠️  Failed to delete blob (will retry in finally):`, deleteError);
       }
 
       // Step 1.5: Compress video if needed
-      console.log(`[${uploadId}] Checking if compression needed...`);
       await safeUpdateStatus(uploadId, {
         status: 'processing',
         progress: 15,
@@ -88,7 +122,9 @@ export const processVideo = async (
       });
 
       try {
-        const compressionResult = await compressVideoIfNeeded(videoPath, uploadId);
+        const compressionResult = await timeStep(uploadId, 'Compress Video (if needed)', async () => {
+          return await compressVideoIfNeeded(videoPath, uploadId);
+        });
         if (compressionResult.compressed) {
           const originalMB = (compressionResult.originalSize / 1024 / 1024).toFixed(1);
           const newMB = (compressionResult.newSize / 1024 / 1024).toFixed(1);
@@ -104,30 +140,34 @@ export const processVideo = async (
       }
 
       // Step 2: Extract video metadata
-      console.log(`[${uploadId}] Extracting video metadata...`);
       await safeUpdateStatus(uploadId, { status: 'processing', progress: 20, stage: 'metadata' });
 
-      const videoMetadata = await getVideoMetadata(videoPath);
+      const videoMetadata = await timeStep(uploadId, 'Extract Video Metadata', async () => {
+        return await getVideoMetadata(videoPath);
+      });
 
       // Step 3: Extract audio (Whisper-optimized)
-      console.log(`[${uploadId}] Checking for audio stream...`);
       await safeUpdateStatus(uploadId, { status: 'processing', progress: 30, stage: 'audio' });
 
       const audioPath = path.join(tempDir, 'audio.mp3');
-      const hasAudio = await hasAudioStream(videoPath);
+      const hasAudio = await timeStep(uploadId, 'Detect Audio Stream', async () => {
+        return await hasAudioStream(videoPath);
+      });
 
       let transcription: TranscriptionSegment[] = [];
       let vadStats: VADStats | null = null;
 
       if (hasAudio) {
-        console.log(`[${uploadId}] Extracting audio (16kHz mono, noise reduction)...`);
-        await extractAudioForWhisper(videoPath, audioPath);
+        await timeStep(uploadId, 'Extract Audio (16kHz mono)', async () => {
+          await extractAudioForWhisper(videoPath, audioPath);
+        });
 
         // Step 4: VAD + Whisper pipeline (optimized processing)
-        console.log(`[${uploadId}] Processing with VAD + Whisper pipeline...`);
         await safeUpdateStatus(uploadId, { status: 'processing', progress: 45, stage: 'vad_whisper' });
 
-        const pipelineResult = await processAudioWithVADAndWhisper(audioPath, uploadId);
+        const pipelineResult = await timeStep(uploadId, 'VAD + Whisper Pipeline', async () => {
+          return await processAudioWithVADAndWhisper(audioPath, uploadId);
+        });
         transcription = pipelineResult.segments;
         vadStats = pipelineResult.vadStats;
 
@@ -140,48 +180,43 @@ export const processVideo = async (
       }
 
       // Step 5: Execute ideal Excel pipeline (Scene detection + OCR + Excel generation)
-      console.log(`[${uploadId}] Executing ideal Excel pipeline (Scene-based OCR + Excel)...`);
       await safeUpdateStatus(uploadId, { status: 'processing', progress: 60, stage: 'scene_ocr_excel' });
 
-      const pipelineResult = await executeIdealPipeline(
-        videoPath,
-        fileName,
-        transcription
-      );
+      const pipelineResult = await timeStep(uploadId, 'Scene Detection + OCR + Excel Generation', async () => {
+        return await executeIdealPipeline(
+          videoPath,
+          fileName,
+          transcription,
+          uploadId
+        );
+      });
 
       const excelPath = pipelineResult.excelPath;
 
       // Step 9: Upload result file or store locally for development
-      console.log(`[${uploadId}] Uploading results...`);
       await safeUpdateStatus(uploadId, { status: 'processing', progress: 90, stage: 'upload_result' });
 
-      let resultUrl: string;
+      let resultUrl: string = uploadId; // Initialize with uploadId
       let resultBlobUrl: string | null = null;
 
-      if (process.env.NODE_ENV === 'development') {
-        // Development mode: Store file path locally
-        const persistentPath = path.join('/tmp', `result_${uploadId}.xlsx`);
-        fs.copyFileSync(excelPath, persistentPath);
-        resultFileMap.set(uploadId, persistentPath);
+      await timeStep(uploadId, 'Upload Result File', async () => {
+        if (process.env.NODE_ENV === 'development') {
+          // Development mode: Store file path locally
+          const persistentPath = path.join('/tmp', `result_${uploadId}.xlsx`);
+          fs.copyFileSync(excelPath, persistentPath);
+          resultFileMap.set(uploadId, persistentPath);
 
-        // Return uploadId only - frontend will construct /api/download/${uploadId}
-        // This ensures consistent authentication flow
-        resultUrl = uploadId;
+          console.log(`[${uploadId}] Development mode: File stored at ${persistentPath}`);
+          console.log(`[${uploadId}] Result URL (uploadId): ${resultUrl}`);
+        } else {
+          // Production mode: Upload to Vercel Blob
+          resultBlobUrl = await uploadResultFile(excelPath, uploadId);
 
-        console.log(`[${uploadId}] Development mode: File stored at ${persistentPath}`);
-        console.log(`[${uploadId}] Result URL (uploadId): ${resultUrl}`);
-      } else {
-        // Production mode: Upload to Vercel Blob
-        resultBlobUrl = await uploadResultFile(excelPath, uploadId);
-
-        // Return uploadId to maintain consistent authentication flow
-        // resultBlobUrl will be stored in metadata for /api/download to retrieve
-        resultUrl = uploadId;
-
-        console.log(`[${uploadId}] Production mode: Uploaded to Blob`);
-        console.log(`[${uploadId}] Blob URL: ${resultBlobUrl}`);
-        console.log(`[${uploadId}] Result URL (uploadId): ${resultUrl}`);
-      }
+          console.log(`[${uploadId}] Production mode: Uploaded to Blob`);
+          console.log(`[${uploadId}] Blob URL: ${resultBlobUrl}`);
+          console.log(`[${uploadId}] Result URL (uploadId): ${resultUrl}`);
+        }
+      });
 
       // Complete with metadata (including resultBlobUrl for production downloads)
       console.log(`[${uploadId}] Processing completed!`);
@@ -212,6 +247,12 @@ export const processVideo = async (
         // In development, continue - file is already saved locally
         console.log(`[${uploadId}] Continuing despite status update failure (dev mode)`);
       }
+
+      // Log overall processing time
+      const overallDuration = ((Date.now() - overallStartTime) / 1000).toFixed(2);
+      console.log(`[${uploadId}] ═══════════════════════════════════════════════`);
+      console.log(`[${uploadId}] 🎉 TOTAL PROCESSING TIME: ${overallDuration}s`);
+      console.log(`[${uploadId}] ═══════════════════════════════════════════════`);
 
     } finally {
       // Cleanup temporary directory
@@ -343,7 +384,19 @@ async function compressVideoIfNeeded(
   }
 }
 
-async function downloadFile(url: string, dest: string) {
+/**
+ * Download file from URL with progress tracking
+ * @param url - URL to download from
+ * @param dest - Destination file path
+ * @param uploadId - Upload ID for progress updates (optional)
+ * @param progressRange - Progress range to map download progress to (default: 10-20%)
+ */
+async function downloadFile(
+  url: string,
+  dest: string,
+  uploadId?: string,
+  progressRange: ProgressRange = { start: 10, end: 20 }
+) {
   console.log(`[downloadFile] Starting download from: ${url.substring(0, 100)}...`);
 
   const response = await axios.get(url, {
@@ -366,18 +419,44 @@ async function downloadFile(url: string, dest: string) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
     let downloadedBytes = 0;
-    let lastLoggedBytes = 0; // Track last logged position for progress reporting
+    let lastLoggedBytes = 0; // Track last logged position for console logging
     const totalBytes = parseInt(response.headers['content-length'] || '0');
-    const LOG_INTERVAL = 10 * 1024 * 1024; // 10MB
+    const LOG_INTERVAL = 10 * 1024 * 1024; // 10MB for console logging
+
+    // Progress update tracking (for Supabase updates)
+    const PROGRESS_UPDATE_THRESHOLD = 0.02; // Update every 2% of download progress
+    let lastProgressUpdate = 0;
 
     response.data.on('data', (chunk: Buffer) => {
       downloadedBytes += chunk.length;
 
-      // Log progress when 10MB or more has been downloaded since last log
+      // Console logging (10MB intervals)
       if (totalBytes > 0 && downloadedBytes - lastLoggedBytes >= LOG_INTERVAL) {
         const percent = ((downloadedBytes / totalBytes) * 100).toFixed(1);
         console.log(`[downloadFile] Progress: ${percent}% (${(downloadedBytes / 1024 / 1024).toFixed(1)}MB / ${(totalBytes / 1024 / 1024).toFixed(1)}MB)`);
         lastLoggedBytes = downloadedBytes;
+      }
+
+      // Supabase progress updates (2% intervals)
+      if (uploadId && totalBytes > 0) {
+        const downloadProgress = downloadedBytes / totalBytes; // 0.0 - 1.0
+
+        // Update if progress changed by 2%
+        if (downloadProgress - lastProgressUpdate >= PROGRESS_UPDATE_THRESHOLD) {
+          const range = progressRange.end - progressRange.start;
+          const overallProgress = progressRange.start + (downloadProgress * range);
+
+          // Fire-and-forget (non-blocking) Supabase update
+          safeUpdateStatus(uploadId, {
+            progress: Math.floor(overallProgress),
+            stage: 'downloading'
+          }).catch((err) => {
+            // Non-fatal error - download continues even if Supabase update fails
+            console.error(`[${uploadId}] Progress update failed (non-fatal):`, err);
+          });
+
+          lastProgressUpdate = downloadProgress;
+        }
       }
     });
 
