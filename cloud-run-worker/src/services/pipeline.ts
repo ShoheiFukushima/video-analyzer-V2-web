@@ -17,28 +17,24 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import fs from 'fs';
 import { promises as fsPromises } from 'fs';
 import path from 'path';
-
-/**
- * Transcription segment (from Whisper pipeline)
- */
-interface TranscriptionSegment {
-  timestamp: number;
-  duration: number;
-  text: string;
-  confidence: number;
-}
+import type { TranscriptionSegment } from '../types/shared.js';
+import pLimit from 'p-limit';
+import { RateLimiter } from './rateLimiter.js';
+import { ProgressReporter } from './progressReporter.js';
 
 /**
  * Main pipeline execution
  * @param videoPath - Path to video file
  * @param projectTitle - Project/video title
  * @param transcription - Transcription from whisperService
+ * @param uploadId - Optional upload ID for progress tracking
  * @returns Path to generated Excel file
  */
 export async function executeIdealPipeline(
   videoPath: string,
   projectTitle: string,
-  transcription: TranscriptionSegment[]
+  transcription: TranscriptionSegment[],
+  uploadId?: string
 ): Promise<{ excelPath: string; stats: ProcessingStats }> {
   console.log('🎬 Starting Ideal Pipeline Execution');
   console.log(`  📹 Video: ${videoPath}`);
@@ -55,7 +51,7 @@ export async function executeIdealPipeline(
 
   // Step 3: Perform OCR on each scene frame
   console.log('\n🔍 Step 3: Performing OCR on scene frames...');
-  const scenesWithRawOCR = await performSceneBasedOCR(scenes);
+  const scenesWithRawOCR = await performSceneBasedOCR(scenes, uploadId);
 
   // Step 3.5: Filter out persistent overlays (logos, watermarks)
   console.log('\n🧹 Step 3.5: Filtering persistent overlays...');
@@ -104,33 +100,55 @@ export async function executeIdealPipeline(
 }
 
 /**
- * Perform OCR on each scene's frame using Gemini Vision
+ * Perform OCR on each scene's frame using Gemini Vision with parallel processing
+ * @param scenes - Array of scenes to process
+ * @param uploadId - Optional upload ID for progress tracking
+ * @returns Array of scenes with OCR results
  */
-async function performSceneBasedOCR(scenes: Scene[]): Promise<SceneWithOCR[]> {
+async function performSceneBasedOCR(scenes: Scene[], uploadId?: string): Promise<SceneWithOCR[]> {
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
   // Use latest stable model: gemini-2.5-flash (fast, supports Japanese text)
   const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
-  const scenesWithOCR: SceneWithOCR[] = [];
+  // Initialize parallel processing components
+  const limit = pLimit(3); // Parallel degree of 3
+  const rateLimiter = new RateLimiter(15); // 15 requests per minute for Gemini API
+  const progressReporter = uploadId ? new ProgressReporter(5) : null; // Report every 5%
 
-  for (const scene of scenes) {
-    if (!scene.screenshotPath) {
-      console.log(`  ⚠️ Scene ${scene.sceneNumber}: No screenshot, skipping OCR`);
-      scenesWithOCR.push({
-        ...scene,
-        ocrText: '',
-        ocrConfidence: 0
-      });
-      continue;
-    }
+  // Progress tracking
+  let completedScenes = 0;
+  const OCR_PROGRESS_START = 60;
+  const OCR_PROGRESS_END = 85;
+  const OCR_PROGRESS_RANGE = OCR_PROGRESS_END - OCR_PROGRESS_START;
 
-    try {
-      // Read screenshot file
-      const imageBuffer = fs.readFileSync(scene.screenshotPath);
-      const base64Image = imageBuffer.toString('base64');
+  console.log(`  🚀 Starting parallel OCR processing (${scenes.length} scenes, parallel degree: 3)`);
+  const startTime = Date.now();
 
-      // Gemini Vision OCR prompt
-      const prompt = `Analyze this video frame and extract ALL visible text.
+  // Process all scenes in parallel with Promise.allSettled
+  const results = await Promise.allSettled(
+    scenes.map((scene, index) =>
+      limit(async () => {
+        // Handle scenes without screenshots
+        if (!scene.screenshotPath) {
+          console.log(`  ⚠️ Scene ${scene.sceneNumber}: No screenshot, skipping OCR`);
+          completedScenes++;
+          return {
+            ...scene,
+            ocrText: '',
+            ocrConfidence: 0
+          };
+        }
+
+        try {
+          // Apply rate limiting
+          await rateLimiter.acquire();
+
+          // Read screenshot file
+          const imageBuffer = fs.readFileSync(scene.screenshotPath);
+          const base64Image = imageBuffer.toString('base64');
+
+          // Gemini Vision OCR prompt
+          const prompt = `Analyze this video frame and extract ALL visible text.
 
 Please provide a JSON response with this structure:
 {
@@ -146,46 +164,91 @@ Focus on:
 
 Return empty string if no text detected.`;
 
-      const result = await model.generateContent([
-        prompt,
-        { inlineData: { mimeType: 'image/png', data: base64Image } }
-      ]);
+          // Call Gemini Vision API
+          const result = await model.generateContent([
+            prompt,
+            { inlineData: { mimeType: 'image/png', data: base64Image } }
+          ]);
 
-      const responseText = result.response.text();
+          const responseText = result.response.text();
 
-      // Parse JSON response
-      let ocrResult: { text: string; confidence: number };
-      try {
-        // Remove markdown code blocks if present
-        const jsonText = responseText.replace(/```json\n?|\n?```/g, '').trim();
-        ocrResult = JSON.parse(jsonText);
-      } catch {
-        // Fallback: use raw text
-        ocrResult = { text: responseText, confidence: 0.5 };
-      }
+          // Parse JSON response
+          let ocrResult: { text: string; confidence: number };
+          try {
+            // Remove markdown code blocks if present
+            const jsonText = responseText.replace(/```json\n?|\n?```/g, '').trim();
+            ocrResult = JSON.parse(jsonText);
+          } catch {
+            // Fallback: use raw text
+            ocrResult = { text: responseText, confidence: 0.5 };
+          }
 
-      scenesWithOCR.push({
-        ...scene,
-        ocrText: ocrResult.text || '',
-        ocrConfidence: ocrResult.confidence || 0
-      });
+          completedScenes++;
 
-      console.log(`  ✓ Scene ${scene.sceneNumber}: OCR complete (${ocrResult.text.length} chars)`);
+          // Report progress if reporter is available
+          if (progressReporter && uploadId) {
+            const progress = Math.floor(
+              OCR_PROGRESS_START + (completedScenes / scenes.length) * OCR_PROGRESS_RANGE
+            );
+            await progressReporter.report(
+              uploadId,
+              progress,
+              'ocr_processing',
+              `OCR: ${completedScenes}/${scenes.length} scenes completed`
+            );
+          }
 
-    } catch (error) {
-      console.error(`  ✗ Scene ${scene.sceneNumber}: OCR failed`);
-      if (error instanceof Error) {
-        console.error(`    Error: ${error.message}`);
-        console.error(`    Stack: ${error.stack?.split('\n')[0]}`);
-      } else {
-        console.error(`    Error:`, error);
-      }
-      scenesWithOCR.push({
-        ...scene,
+          console.log(
+            `  ✓ Scene ${scene.sceneNumber}: OCR complete (${ocrResult.text.length} chars) ` +
+            `[${completedScenes}/${scenes.length}]`
+          );
+
+          return {
+            ...scene,
+            ocrText: ocrResult.text || '',
+            ocrConfidence: ocrResult.confidence || 0
+          };
+
+        } catch (error) {
+          console.error(`  ✗ Scene ${scene.sceneNumber}: OCR failed`);
+          if (error instanceof Error) {
+            console.error(`    Error: ${error.message}`);
+          }
+          completedScenes++;
+
+          // Return empty result on error
+          return {
+            ...scene,
+            ocrText: '',
+            ocrConfidence: 0
+          };
+        }
+      })
+    )
+  );
+
+  // Calculate and log performance metrics
+  const duration = (Date.now() - startTime) / 1000;
+  console.log(`  ✓ Parallel OCR completed in ${duration.toFixed(2)}s`);
+  console.log(`  📊 Average: ${(duration / scenes.length).toFixed(2)}s per scene`);
+
+  // Convert Promise.allSettled results to SceneWithOCR array
+  const scenesWithOCR: SceneWithOCR[] = results.map((result, index) => {
+    if (result.status === 'fulfilled') {
+      return result.value;
+    } else {
+      console.error(`  Scene ${scenes[index].sceneNumber} promise rejected:`, result.reason);
+      return {
+        ...scenes[index],
         ocrText: '',
         ocrConfidence: 0
-      });
+      };
     }
+  });
+
+  // Final progress report
+  if (progressReporter && uploadId) {
+    await progressReporter.forceReport(uploadId, OCR_PROGRESS_END, 'ocr_completed', 'OCR processing completed');
   }
 
   console.log(`  ✓ OCR complete: ${scenesWithOCR.filter(s => s.ocrText).length}/${scenes.length} scenes with text`);

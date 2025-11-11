@@ -2,6 +2,7 @@ import path from 'path';
 import fs from 'fs';
 import OpenAI from 'openai';
 import { processAudioWithVAD, extractAudioChunk, cleanupVADFiles, type AudioChunk, type VADResult } from './vadService.js';
+import type { TranscriptionSegment } from '../types/shared.js';
 
 /**
  * VAD + Whisper Integration Pipeline
@@ -31,19 +32,6 @@ if (!OPENAI_API_KEY || OPENAI_API_KEY.trim() === '') {
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
 });
-
-export interface TranscriptionSegment {
-  /** Start time in seconds (absolute) */
-  timestamp: number;
-  /** Duration in seconds */
-  duration: number;
-  /** Transcribed text */
-  text: string;
-  /** Confidence score (0-1) */
-  confidence: number;
-  /** Which audio chunk this came from */
-  chunkIndex?: number;
-}
 
 export interface PipelineResult {
   /** Transcription segments with timestamps */
@@ -94,8 +82,8 @@ export async function processAudioWithVADAndWhisper(
     console.log(`[${uploadId}] Step 1: Voice Activity Detection`);
     const vadResult = await processAudioWithVAD(audioPath, chunksDir, {
       maxChunkDuration: 10,  // 10-second chunks for Whisper
-      minSpeechDuration: 0.25,  // Filter out very short segments
-      sensitivity: 0.5,  // Balanced sensitivity
+      minSpeechDuration: 0.75,  // Filter out very short segments (increased to reduce BGM false positives)
+      sensitivity: 0.7,  // Higher sensitivity to reduce BGM detection (0.5 → 0.6 → 0.7)
     });
 
     if (vadResult.audioChunks.length === 0) {
