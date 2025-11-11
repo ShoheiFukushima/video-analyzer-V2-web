@@ -74,16 +74,39 @@ async function detectSceneCuts(
 function runSceneDetection(videoPath: string, threshold: number): Promise<SceneCut[]> {
   return new Promise((resolve, reject) => {
     const cuts: SceneCut[] = [];
+    const TIMEOUT_MS = 60000; // 60 seconds timeout
+    let timeoutId: NodeJS.Timeout;
+    let ffmpegCommand: any;
 
-    ffmpeg(videoPath)
+    const cleanup = () => {
+      clearTimeout(timeoutId);
+      if (ffmpegCommand) {
+        try {
+          ffmpegCommand.kill('SIGKILL');
+        } catch (err) {
+          // Ignore kill errors
+        }
+      }
+    };
+
+    // Set timeout
+    timeoutId = setTimeout(() => {
+      cleanup();
+      reject(new Error(`FFmpeg scene detection timed out after ${TIMEOUT_MS}ms (threshold: ${threshold})`));
+    }, TIMEOUT_MS);
+
+    ffmpegCommand = ffmpeg(videoPath)
       .outputOptions([
+        // Use 'showinfo' for reliable scene detection (Cloud Run compatible)
+        // showinfo always outputs to stderr (fluent-ffmpeg compatible)
+        // Buffer overflow prevented by 'select' filter (only scene cut frames)
         '-vf', `select='gt(scene,${threshold})',showinfo`,
         '-f', 'null'
       ])
-      .output('-')
+      .output('/dev/null')  // Null output for scene detection (FFmpeg standard)
       .on('stderr', (stderrLine: string) => {
         // Parse FFmpeg output for scene timestamps
-        // Format: "pts_time:12.345 pos:678912 ..."
+        // Format: "frame:123 pts:12345 pts_time:12.345"
         const match = stderrLine.match(/pts_time:(\d+\.?\d*)/);
         if (match) {
           const timestamp = parseFloat(match[1]);
@@ -93,8 +116,14 @@ function runSceneDetection(videoPath: string, threshold: number): Promise<SceneC
           });
         }
       })
-      .on('end', () => resolve(cuts))
-      .on('error', (err) => reject(err))
+      .on('end', () => {
+        clearTimeout(timeoutId);
+        resolve(cuts);
+      })
+      .on('error', (err) => {
+        clearTimeout(timeoutId);
+        reject(err);
+      })
       .run();
   });
 }
