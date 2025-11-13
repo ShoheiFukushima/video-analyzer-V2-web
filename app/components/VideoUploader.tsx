@@ -198,6 +198,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
       }
 
       // Step 2: Trigger processing on Cloud Run Worker
+      let processStarted = false;
       try {
         const processResponse = await fetch("/api/process", {
           method: "POST",
@@ -225,6 +226,8 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
           throw new Error(errorMessage);
         }
 
+        // Processing successfully started
+        processStarted = true;
         setProgress(100);
         onUploadSuccess(uploadId);
 
@@ -234,6 +237,17 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
           fileInputRef.current.value = "";
         }
       } catch (processErr) {
+        // If processing already started, ignore abort errors (too late to cancel)
+        if (processStarted && processErr instanceof Error) {
+          const isAbortError = processErr.name === 'AbortError' ||
+                              processErr.message.includes('aborted') ||
+                              processErr.message.includes('cancelled');
+          if (isAbortError) {
+            console.log('[VideoUploader] Cancel attempted after processing started - ignored');
+            return;
+          }
+        }
+
         const errorInfo = processErr instanceof Error
           ? processErr
           : new Error('Processing initialization failed');
