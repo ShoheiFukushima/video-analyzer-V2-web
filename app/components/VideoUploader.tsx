@@ -14,6 +14,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [abortController, setAbortController] = useState<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -137,6 +138,10 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
   const handleUploadWithFile = async (fileToUpload: File) => {
     if (!fileToUpload) return;
 
+    // Create new AbortController for this upload
+    const controller = new AbortController();
+    setAbortController(controller);
+
     setUploading(true);
     setProgress(0);
     setError(null);
@@ -191,9 +196,9 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
             uploadId,
             blobUrl,
             fileName: fileToUpload.name,
-            dataConsent: false, // Default to false since user consent UI is removed
+            dataConsent: true, // User agrees by using the service (see Terms of Service)
           }),
-          signal: AbortSignal.timeout(15000), // 15 second timeout
+          signal: controller.signal, // Use AbortController signal for cancellation
         });
 
         if (!processResponse.ok) {
@@ -226,16 +231,39 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
         return;
       }
     } catch (err) {
-      const { message } = getErrorMessage(err);
-      setError(message);
+      // Check if error is due to abort (user cancelled)
+      if (err instanceof Error && err.name === 'AbortError') {
+        console.log('[VideoUploader] Upload cancelled by user');
+        setError(null); // Don't show error for user-initiated cancellation
+      } else {
+        const { message } = getErrorMessage(err);
+        setError(message);
+      }
     } finally {
       setUploading(false);
+      setAbortController(null);
     }
   };
 
   const removeFile = () => {
     setFile(null);
     setError(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  };
+
+  const handleCancel = () => {
+    if (abortController) {
+      console.log('[VideoUploader] Cancelling upload...');
+      abortController.abort();
+    }
+    // Reset all states
+    setUploading(false);
+    setProgress(0);
+    setError(null);
+    setFile(null);
+    setAbortController(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -273,6 +301,29 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
               Supports MP4, MOV, AVI (max 500MB)
             </p>
           </>
+        ) : uploading ? (
+          <div className="space-y-4">
+            <div className="flex items-center justify-center gap-4">
+              <Film className="w-8 h-8 text-indigo-600 animate-pulse" />
+              <div className="flex-1 text-left">
+                <p className="font-semibold text-gray-900 dark:text-white">
+                  {file.name}
+                </p>
+                <p className="text-sm text-gray-600 dark:text-gray-400">
+                  {(file.size / 1024 / 1024).toFixed(2)} MB • Created: {new Date(file.lastModified).toLocaleDateString()}
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                handleCancel();
+              }}
+              className="px-6 py-2 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg transition-colors"
+            >
+              Cancel Upload
+            </button>
+          </div>
         ) : (
           <div className="flex items-center justify-center gap-4">
             <Film className="w-8 h-8 text-indigo-600" />
