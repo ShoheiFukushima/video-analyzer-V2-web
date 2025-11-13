@@ -107,12 +107,23 @@ export async function POST(request: Request) {
     return NextResponse.json(response);
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    console.error(`[blob-upload][${requestId}] ERROR:`, errorMsg);
+    const errorStack = error instanceof Error ? error.stack : undefined;
+    const errorType = error instanceof Error ? error.constructor.name : typeof error;
+
+    // Detailed error logging
+    console.error(`[blob-upload][${requestId}] ERROR:`, {
+      message: errorMsg,
+      stack: errorStack,
+      type: errorType,
+      fullError: error,
+    });
 
     return NextResponse.json(
       {
         error: 'Upload failed',
         message: errorMsg,
+        requestId,
+        type: errorType,
       },
       { status: 500 }
     );

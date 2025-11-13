@@ -14,10 +14,9 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [dataConsent, setDataConsent] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
     if (!selectedFile) return;
 
@@ -36,15 +35,35 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
 
     setFile(selectedFile);
     setError(null);
+
+    // Automatically start upload after file selection
+    await handleUploadWithFile(selectedFile);
   };
 
-  const handleDrop = (e: React.DragEvent) => {
+  const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     const droppedFile = e.dataTransfer.files[0];
-    if (droppedFile && droppedFile.type.startsWith("video/")) {
-      setFile(droppedFile);
-      setError(null);
+
+    if (!droppedFile) return;
+
+    // Validate file type
+    if (!droppedFile.type.startsWith("video/")) {
+      setError("Please select a valid video file");
+      return;
     }
+
+    // Validate file size (max 500MB)
+    const maxSize = 500 * 1024 * 1024; // 500MB
+    if (droppedFile.size > maxSize) {
+      setError("File size exceeds 500MB limit");
+      return;
+    }
+
+    setFile(droppedFile);
+    setError(null);
+
+    // Automatically start upload after file drop
+    await handleUploadWithFile(droppedFile);
   };
 
   /**
@@ -115,8 +134,8 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
     };
   };
 
-  const handleUpload = async () => {
-    if (!file) return;
+  const handleUploadWithFile = async (fileToUpload: File) => {
+    if (!fileToUpload) return;
 
     setUploading(true);
     setProgress(0);
@@ -132,12 +151,12 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
         setProgress(25); // Show upload starting
 
         console.log('[VideoUploader] Starting blob upload...', {
-          fileName: file.name,
-          fileSize: file.size,
-          fileType: file.type
+          fileName: fileToUpload.name,
+          fileSize: fileToUpload.size,
+          fileType: fileToUpload.type
         });
 
-        const newBlob = await upload(file.name, file, {
+        const newBlob = await upload(fileToUpload.name, fileToUpload, {
           access: 'public',
           handleUploadUrl: '/api/blob-upload',
         });
@@ -171,8 +190,8 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
           body: JSON.stringify({
             uploadId,
             blobUrl,
-            fileName: file.name,
-            dataConsent,
+            fileName: fileToUpload.name,
+            dataConsent: false, // Default to false since user consent UI is removed
           }),
           signal: AbortSignal.timeout(15000), // 15 second timeout
         });
@@ -310,7 +329,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
           </div>
           {file && (
             <button
-              onClick={handleUpload}
+              onClick={() => handleUploadWithFile(file)}
               disabled={uploading}
               className="text-sm font-medium text-red-700 dark:text-red-300 hover:text-red-800 dark:hover:text-red-200 underline"
             >
@@ -319,35 +338,6 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
           )}
         </div>
       )}
-
-      {/* Data Consent */}
-      <div className="flex items-start gap-3 p-4 bg-gray-50 dark:bg-gray-900 rounded-lg">
-        <input
-          type="checkbox"
-          id="dataConsent"
-          checked={dataConsent}
-          onChange={(e) => setDataConsent(e.target.checked)}
-          className="mt-1 w-4 h-4 text-indigo-600 rounded focus:ring-2 focus:ring-indigo-500"
-          disabled={disabled}
-        />
-        <label htmlFor="dataConsent" className="text-sm text-gray-700 dark:text-gray-300">
-          I consent to anonymously store video analytics (duration, resolution, etc.) for service improvement.
-          No personal data or video content is stored.
-        </label>
-      </div>
-
-      {/* Upload Button */}
-      <button
-        onClick={handleUpload}
-        disabled={!file || uploading || disabled}
-        className={`w-full py-4 px-6 rounded-xl font-semibold text-lg transition-all ${
-          !file || uploading || disabled
-            ? "bg-gray-300 dark:bg-gray-700 text-gray-500 cursor-not-allowed"
-            : "bg-indigo-600 text-white hover:bg-indigo-700 hover:shadow-lg"
-        }`}
-      >
-        {uploading ? "Uploading & Processing..." : "Upload & Process Video"}
-      </button>
     </div>
   );
 }
