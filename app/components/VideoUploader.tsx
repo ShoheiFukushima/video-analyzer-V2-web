@@ -14,7 +14,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [abortController, setAbortController] = useState<AbortController | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -152,7 +152,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
 
     // Create new AbortController for this upload
     const controller = new AbortController();
-    setAbortController(controller);
+    abortControllerRef.current = controller;
 
     setUploading(true);
     setProgress(0);
@@ -260,7 +260,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
       setError(message);
     } finally {
       setUploading(false);
-      setAbortController(null);
+      abortControllerRef.current = null;
     }
   };
 
@@ -276,8 +276,8 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
     console.log('[VideoUploader] Cancelling upload...');
 
     // Abort current upload
-    if (abortController) {
-      abortController.abort();
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
     }
 
     // Reset all states immediately
@@ -285,7 +285,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
     setProgress(0);
     setError(null);
     setFile(null);
-    setAbortController(null);
+    abortControllerRef.current = null;
 
     // Clear file input
     if (fileInputRef.current) {
