@@ -159,11 +159,6 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
     setError(null);
 
     try {
-      // Check if already aborted before starting
-      if (controller.signal.aborted) {
-        throw new Error('Upload cancelled');
-      }
-
       const uploadId = `upload_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
       // Step 1: Upload to Vercel Blob via client-side upload
@@ -177,11 +172,6 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
           fileSize: fileToUpload.size,
           fileType: fileToUpload.type
         });
-
-        // Check abort status before blob upload
-        if (controller.signal.aborted) {
-          throw new Error('Upload cancelled');
-        }
 
         const newBlob = await upload(fileToUpload.name, fileToUpload, {
           access: 'public',
@@ -209,11 +199,6 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
 
       // Step 2: Trigger processing on Cloud Run Worker
       try {
-        // Check abort status before processing
-        if (controller.signal.aborted) {
-          throw new Error('Upload cancelled');
-        }
-
         const processResponse = await fetch("/api/process", {
           method: "POST",
           headers: {
