@@ -21,6 +21,12 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
     const selectedFile = e.target.files?.[0];
     if (!selectedFile) return;
 
+    // Block if still uploading (prevent race condition after cancel)
+    if (uploading) {
+      console.warn('[VideoUploader] Upload in progress, ignoring new file selection');
+      return;
+    }
+
     // Validate file type
     if (!selectedFile.type.startsWith("video/")) {
       setError("Please select a valid video file");
@@ -46,6 +52,12 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
     const droppedFile = e.dataTransfer.files[0];
 
     if (!droppedFile) return;
+
+    // Block if still uploading (prevent race condition after cancel)
+    if (uploading) {
+      console.warn('[VideoUploader] Upload in progress, ignoring new file drop');
+      return;
+    }
 
     // Validate file type
     if (!droppedFile.type.startsWith("video/")) {
@@ -276,19 +288,26 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
   };
 
   const handleCancel = () => {
+    console.log('[VideoUploader] Cancelling upload...');
+
+    // Abort current upload
     if (abortController) {
-      console.log('[VideoUploader] Cancelling upload...');
       abortController.abort();
     }
-    // Reset all states
+
+    // Reset all states immediately
     setUploading(false);
     setProgress(0);
     setError(null);
     setFile(null);
     setAbortController(null);
+
+    // Clear file input
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
+
+    console.log('[VideoUploader] Upload cancelled, all states reset');
   };
 
   return (
@@ -298,11 +317,11 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
         onDrop={handleDrop}
         onDragOver={(e) => e.preventDefault()}
         className={`border-2 border-dashed rounded-xl p-12 text-center transition-colors ${
-          disabled
+          disabled || uploading
             ? "border-gray-200 bg-gray-50 cursor-not-allowed"
             : "border-indigo-300 hover:border-indigo-500 bg-indigo-50/50 dark:bg-indigo-900/10 cursor-pointer"
         }`}
-        onClick={() => !disabled && fileInputRef.current?.click()}
+        onClick={() => !disabled && !uploading && fileInputRef.current?.click()}
       >
         <input
           ref={fileInputRef}
@@ -310,7 +329,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
           accept="video/*"
           onChange={handleFileSelect}
           className="hidden"
-          disabled={disabled}
+          disabled={disabled || uploading}
         />
 
         {!file ? (
