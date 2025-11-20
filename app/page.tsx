@@ -48,7 +48,7 @@ export default function Home() {
               <SignInButton mode="modal">
                 <button className="px-5 py-2 bg-indigo-600 text-sm font-medium text-white rounded-lg hover:bg-indigo-700 transition-colors">
                   無料で始める
-                button>
+                </button>
               </SignInButton>
             </SignedOut>
             <SignedIn>
