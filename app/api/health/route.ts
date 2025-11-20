@@ -38,8 +38,8 @@ export async function GET(request: NextRequest) {
 
   // Check Cloud Run connectivity
   try {
-    const cloudRunUrl = process.env.CLOUD_RUN_URL;
-    const workerSecret = process.env.WORKER_SECRET;
+    const cloudRunUrl = process.env.CLOUD_RUN_URL?.trim();
+    const workerSecret = process.env.WORKER_SECRET?.trim();
 
     if (cloudRunUrl && workerSecret) {
       const controller = new AbortController();

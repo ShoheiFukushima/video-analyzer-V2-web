@@ -4,7 +4,7 @@
  * Common types used across frontend and backend to ensure type consistency.
  */
 export type ProcessingStatusType = 'pending' | 'downloading' | 'processing' | 'completed' | 'error';
-export type ProcessingStage = 'downloading' | 'compressing' | 'metadata' | 'audio' | 'audio_skipped' | 'vad_whisper' | 'scene_ocr_excel' | 'upload_result' | 'completed';
+export type ProcessingStage = 'downloading' | 'compressing' | 'metadata' | 'audio' | 'audio_skipped' | 'vad_whisper' | 'scene_ocr_excel' | 'ocr_processing' | 'ocr_completed' | 'upload_result' | 'completed';
 export interface ProcessingMetadata {
     duration: number;
     segmentCount: number;
@@ -21,6 +21,7 @@ export interface ProcessingStatus {
     status: ProcessingStatusType;
     progress: number;
     stage?: ProcessingStage;
+    message?: string;
     startedAt: string;
     updatedAt: string;
     resultUrl?: string;
@@ -38,6 +39,7 @@ export interface SupabaseStatusUpdate {
     status?: ProcessingStatusType;
     progress?: number;
     stage?: ProcessingStage;
+    message?: string;
     result_url?: string;
     error?: string;
     metadata?: ProcessingMetadata;
@@ -48,6 +50,7 @@ export interface SupabaseStatusRow {
     status: ProcessingStatusType;
     progress: number;
     stage?: ProcessingStage;
+    message?: string;
     started_at: string;
     updated_at: string;
     result_url?: string;

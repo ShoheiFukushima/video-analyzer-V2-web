@@ -1,0 +1,33 @@
+displayName: "Cloud Run - Max Instances Reached"
+documentation:
+  content: |
+    ## 最大インスタンス数到達アラート
+
+    **症状**: インスタンス数が最大値(10)に達しています
+
+    **影響**: 新規リクエストの待機、処理遅延
+
+    **対応手順**:
+    1. トラフィックスパイクの原因を特定
+    2. 不正なアクセスや攻撃の可能性を確認
+    3. 正当なトラフィックであればmax-instances増加を検討
+    4. キュー導入（Pub/Sub）を検討
+  mimeType: text/markdown
+conditions:
+  - displayName: "Instance count > 8"
+    conditionThreshold:
+      aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_MAX
+          crossSeriesReducer: REDUCE_MAX
+          groupByFields:
+            - resource.service_name
+      comparison: COMPARISON_GT
+      duration: 60s
+      filter: |
+        resource.type = "cloud_run_revision"
+        AND resource.labels.service_name = "video-analyzer-worker"
+        AND metric.type = "run.googleapis.com/container/instance_count"
+      thresholdValue: 8
+combiner: OR
+enabled: true

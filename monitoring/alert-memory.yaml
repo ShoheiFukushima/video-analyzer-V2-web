@@ -1,0 +1,33 @@
+displayName: "Cloud Run - High Memory Usage"
+documentation:
+  content: |
+    ## メモリ使用率高騰アラート
+
+    **症状**: メモリ使用率が85%を超えています
+
+    **影響**: OOMキラーによるプロセス強制終了、処理失敗の可能性
+
+    **対応手順**:
+    1. メモリリークの有無を確認
+    2. 動画サイズ制限が適切か確認
+    3. FFmpegプロセスが正しく終了しているか確認
+    4. 必要であればメモリ割り当てを増加（2Gi → 4Gi）
+  mimeType: text/markdown
+conditions:
+  - displayName: "Memory utilization > 85%"
+    conditionThreshold:
+      aggregations:
+        - alignmentPeriod: 300s
+          perSeriesAligner: ALIGN_DELTA
+          crossSeriesReducer: REDUCE_PERCENTILE_95
+          groupByFields:
+            - resource.service_name
+      comparison: COMPARISON_GT
+      duration: 300s
+      filter: |
+        resource.type = "cloud_run_revision"
+        AND resource.labels.service_name = "video-analyzer-worker"
+        AND metric.type = "run.googleapis.com/container/memory/utilizations"
+      thresholdValue: 0.85
+combiner: OR
+enabled: true

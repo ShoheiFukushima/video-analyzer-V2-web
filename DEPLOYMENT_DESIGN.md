@@ -243,20 +243,24 @@ gcloud run services update video-analyzer-worker \
 ```
 
 **セキュリティ:**
-- Secret Managerの使用を推奨:
-```bash
-# Secret Managerに保存
-gcloud secrets create openai-api-key \
-  --data-file=- <<< "${OPENAI_API_KEY}"
-
-# Cloud Runから参照
-gcloud run services update video-analyzer-worker \
-  --update-secrets OPENAI_API_KEY=openai-api-key:latest
-```
+- Secret Managerの使用を推奨（詳細は[Secret Manager移行ガイド](#secret-manager移行ガイド)参照）
 
 ---
 
 ## モニタリング戦略
+
+### 実装済みモニタリング（2025-11-02）
+
+**ディレクトリ:** `monitoring/`
+
+包括的なモニタリングソリューションを実装しました:
+- 6つのアラートポリシー（エラーレート、レイテンシー、リソース使用率など）
+- 3つのログベースメトリクス
+- Cloud Monitoringダッシュボード（8パネル）
+- 自動ヘルスチェックスクリプト
+- 自動セットアップスクリプト
+
+詳細: [monitoring/README.md](./monitoring/README.md)
 
 ### フロントエンド (Vercel)
 
@@ -266,36 +270,34 @@ gcloud run services update video-analyzer-worker \
 - エッジ関数エラー率
 - レスポンスタイム
 
-**ツール:**
+**モニタリング方法:**
 - Vercel Analytics (標準)
 - Vercel Logs
-- Sentry (エラートラッキング - オプション)
+- `/api/health` エンドポイント監視
+- Uptime Check（5分間隔）
+- カスタムヘルスチェックスクリプト
 
-**アラート設定:**
-```javascript
-// vercel.json
-{
-  "functions": {
-    "api/**/*.ts": {
-      "maxDuration": 60
-    }
-  }
-}
+**ヘルスチェックエンドポイント:**
+```
+GET https://video-analyzer-v2-web.vercel.app/api/health
 ```
 
 ### バックエンド (Cloud Run)
 
 **メトリクス:**
 - リクエスト数
-- エラー率
-- レイテンシー (p50, p95, p99)
-- CPU/メモリ使用率
-- インスタンス数
+- エラー率（閾値: 5%）
+- レイテンシー (p50, p95, p99) - 閾値: p95 > 60秒
+- CPU使用率（閾値: 90%）
+- メモリ使用率（閾値: 85%）
+- インスタンス数（閾値: 9/10）
 
-**ツール:**
-- Cloud Monitoring (標準)
+**モニタリング方法:**
+- Cloud Monitoring（標準）
 - Cloud Logging
-- Cloud Trace (オプション)
+- アラートポリシー（自動通知）
+- ダッシュボード（リアルタイム可視化）
+- Uptime Check（5分間隔）
 
 **ログ確認:**
 ```bash
@@ -308,20 +310,34 @@ gcloud run services logs read video-analyzer-worker \
   --region us-central1 \
   --filter "severity>=ERROR" \
   --limit 50
+
+# または monitoring スクリプトを使用
+npx tsx monitoring/health-check.ts
 ```
 
-**アラート設定:**
-```yaml
-# Cloud Monitoring アラートポリシー
-displayName: "Cloud Run Error Rate High"
-conditions:
-  - displayName: "Error rate > 5%"
-    conditionThreshold:
-      filter: 'resource.type="cloud_run_revision" AND metric.type="run.googleapis.com/request_count"'
-      comparison: COMPARISON_GT
-      thresholdValue: 0.05
-      duration: 300s
+**セットアップ:**
+```bash
+# 自動セットアップスクリプトを実行
+./monitoring/setup-monitoring.sh
+
+# ダッシュボード確認
+open "https://console.cloud.google.com/monitoring/dashboards?project=video-analyzer-worker"
 ```
+
+**アラートポリシー（6種類）:**
+1. エラーレート > 5%
+2. レスポンスタイム (p95) > 60秒
+3. メモリ使用率 > 85%
+4. CPU使用率 > 90%
+5. インスタンス数 >= 9
+6. Vercel Blob容量 > 800MB
+
+各アラートには対応手順のドキュメントが含まれています。
+
+**ログベースメトリクス（3種類）:**
+- `error_log_counter` - ERROR以上のログカウント
+- `video_processing_completed` - 処理完了ジョブ数
+- `video_processing_failed` - 処理失敗ジョブ数
 
 ---
 
@@ -585,18 +601,20 @@ gcloud scheduler jobs create http warm-up-worker \
 
 ### 短期 (1-2週間)
 
-1. **GEMINI_API_KEYの追加**
-   - Cloud Runに環境変数追加
-   - Secret Managerへの移行
+1. ~~**GEMINI_API_KEYの追加**~~ ✅ 完了
+   - Cloud Runに環境変数追加済み
+   - Secret Managerへの移行（推奨）
 
 2. **CI/CDパイプライン構築**
    - GitHub Actions追加
    - 自動テスト
    - 自動デプロイ
 
-3. **モニタリング強化**
-   - Sentry導入
-   - アラート設定
+3. ~~**モニタリング強化**~~ ✅ 完了（2025-11-02）
+   - Cloud Monitoringアラート設定済み
+   - ダッシュボード作成済み
+   - ヘルスチェックスクリプト実装済み
+   - 次のステップ: 通知チャネル追加、Sentry導入（オプション）
 
 ### 中期 (1-2ヶ月)
 
@@ -611,7 +629,7 @@ gcloud scheduler jobs create http warm-up-worker \
    - 不要なログ削減
 
 3. **セキュリティ強化**
-   - Secret Manager移行
+   - ~~Secret Manager移行~~ ✅ スクリプト実装完了（2025-11-07）
    - VPC Connector追加
    - ファイアウォールルール
 
@@ -628,6 +646,303 @@ gcloud scheduler jobs create http warm-up-worker \
 3. **高可用性**
    - マルチリージョンデプロイ
    - フェイルオーバー設定
+
+---
+
+## Secret Manager移行ガイド
+
+### 概要
+
+GCP Secret Managerを使用して、平文で保存されているAPIキーとシークレットを安全に管理します。
+
+**移行対象:**
+- `OPENAI_API_KEY` (Whisper API)
+- `GEMINI_API_KEY` (Gemini Vision API)
+- `WORKER_SECRET` (Worker認証)
+- `SUPABASE_SERVICE_ROLE_KEY` (Supabase管理)
+- `BLOB_READ_WRITE_TOKEN` (Vercel Blob)
+- `CLERK_SECRET_KEY` (Clerk認証)
+
+**移行しないもの:**
+- `NEXT_PUBLIC_*` 変数（公開鍵なので問題なし）
+- `NODE_ENV`（機密情報ではない）
+- `CLOUD_RUN_URL`（機密情報ではない）
+
+### 事前準備
+
+1. **Secret Manager API有効化:**
+```bash
+gcloud services enable secretmanager.googleapis.com --project=video-analyzer-worker
+```
+
+2. **環境変数のバックアップ（重要）:**
+```bash
+# Cloud Run環境変数をバックアップ
+gcloud run services describe video-analyzer-worker \
+  --region us-central1 \
+  --format="value(spec.template.spec.containers[0].env)" > backup-env-vars.txt
+
+# Vercel環境変数をバックアップ（手動）
+# Vercel Dashboard → Project → Settings → Environment Variables → Export
+```
+
+3. **必要な環境変数をシェルセッションに設定:**
+```bash
+# 現在のCloud Run環境変数を取得してexport
+export OPENAI_API_KEY="sk-svcacct-..."
+export GEMINI_API_KEY="<your-key>"
+export WORKER_SECRET="4MeGFIt36xoh1GdGLu9jnYLVX90BuzJqGrytHGjeNMw="
+export SUPABASE_SERVICE_ROLE_KEY="eyJhbGci..."
+export BLOB_READ_WRITE_TOKEN="vercel_blob_rw_..."
+export CLERK_SECRET_KEY="sk_test_..."
+```
+
+### 移行手順（本番環境）
+
+#### ステップ1: 移行スクリプト実行
+
+```bash
+cd /path/to/video-analyzer-V2-web
+
+# スクリプトを実行（Secret Manager に作成のみ、Cloud Run は更新しない）
+./scripts/migrate-to-secret-manager.sh
+```
+
+**このスクリプトが実行すること:**
+- Secret Managerに全てのシークレットを作成
+- Cloud Runサービスアカウントに`secretAccessor`権限を付与
+- ロールバック用のバックアップファイル生成（`scripts/rollback-env-vars-YYYYMMDD-HHMMSS.txt`）
+
+**このスクリプトが実行しないこと:**
+- Cloud Runサービスの更新（意図的に分離）
+
+#### ステップ2: 検証スクリプト実行
+
+```bash
+# Secret Managerの状態を確認
+./scripts/verify-secrets.sh
+```
+
+**確認項目:**
+- 全てのシークレットがSecret Managerに存在するか
+- 最新バージョンが存在するか
+- IAM権限が正しく設定されているか
+- Cloud Runサービスが稼働しているか
+
+#### ステップ3: Cloud Run サービス更新（本番適用）
+
+**⚠️ 重要: この操作でCloud Runサービスが再起動します**
+
+```bash
+# 移行スクリプトの出力に表示されたコマンドをコピーして実行:
+gcloud run services update video-analyzer-worker \
+  --region us-central1 \
+  --update-secrets \
+"OPENAI_API_KEY=OPENAI_API_KEY:latest,\
+GEMINI_API_KEY=GEMINI_API_KEY:latest,\
+WORKER_SECRET=WORKER_SECRET:latest,\
+SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SERVICE_ROLE_KEY:latest,\
+BLOB_READ_WRITE_TOKEN=BLOB_READ_WRITE_TOKEN:latest,\
+CLERK_SECRET_KEY=CLERK_SECRET_KEY:latest" \
+  --clear-env-vars \
+  --set-env-vars "NODE_ENV=production"
+```
+
+#### ステップ4: 動作確認
+
+```bash
+# 1. ヘルスチェック
+curl https://video-analyzer-worker-820467345033.us-central1.run.app/health
+
+# 2. ログ確認（エラーがないか）
+gcloud run services logs tail video-analyzer-worker --region us-central1
+
+# 3. E2Eテスト（実際の動画処理）
+# → フロントエンドから動画アップロード → 処理 → ダウンロード
+```
+
+#### ステップ5: Vercel環境変数更新（オプション）
+
+Vercel側もSecret Manager移行を希望する場合は、以下のシークレットを削除:
+- `SUPABASE_SERVICE_ROLE_KEY`（フロントエンドでは不要）
+- `BLOB_READ_WRITE_TOKEN`（フロントエンドでは必要、ただしSecret Manager推奨）
+- `CLERK_SECRET_KEY`（フロントエンドで使用、Secret Manager推奨）
+
+**注意**: VercelはGCP Secret Managerに直接アクセスできないため、以下の選択肢があります:
+1. **Vercel環境変数のまま維持**（現状維持、推奨）
+2. **Vercelエッジ機能を使用**してSecret Managerから取得（複雑）
+
+### ロールバック手順
+
+万が一問題が発生した場合のロールバック手順:
+
+#### 即座のロールバック（リビジョン戻し）
+
+```bash
+# 前のリビジョンにトラフィックを戻す
+gcloud run revisions list --service video-analyzer-worker --region us-central1
+
+# 前のリビジョン（Secret Manager移行前）にトラフィックを切り替え
+gcloud run services update-traffic video-analyzer-worker \
+  --region us-central1 \
+  --to-revisions video-analyzer-worker-00001=100
+```
+
+#### 完全ロールバック（環境変数を平文に戻す）
+
+```bash
+# バックアップファイルから環境変数を読み込み
+source scripts/rollback-env-vars-YYYYMMDD-HHMMSS.txt
+
+# Cloud Runサービスを元の設定に戻す
+gcloud run services update video-analyzer-worker \
+  --region us-central1 \
+  --clear-secrets \
+  --set-env-vars \
+"BLOB_READ_WRITE_TOKEN=${BLOB_READ_WRITE_TOKEN},\
+SUPABASE_URL=${SUPABASE_URL},\
+SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY},\
+OPENAI_API_KEY=${OPENAI_API_KEY},\
+GEMINI_API_KEY=${GEMINI_API_KEY},\
+WORKER_SECRET=${WORKER_SECRET},\
+NODE_ENV=production"
+```
+
+### Secret Manager運用ガイド
+
+#### シークレットのローテーション
+
+定期的にシークレットをローテーションすることを推奨（3-6ヶ月ごと）:
+
+```bash
+# 1. 新しいAPIキーを生成（各サービスのダッシュボードで）
+
+# 2. Secret Managerに新しいバージョンを追加
+echo -n "new-secret-value" | gcloud secrets versions add OPENAI_API_KEY \
+  --project=video-analyzer-worker \
+  --data-file=-
+
+# 3. Cloud Runは自動的に最新バージョンを使用（`latest`参照）
+
+# 4. 古いAPIキーを無効化（各サービスのダッシュボードで）
+```
+
+#### シークレットの確認
+
+```bash
+# Secret一覧
+gcloud secrets list --project=video-analyzer-worker
+
+# 特定のSecretの詳細
+gcloud secrets describe OPENAI_API_KEY --project=video-analyzer-worker
+
+# 最新バージョンの値を取得（注意: 出力されるので慎重に）
+gcloud secrets versions access latest --secret=OPENAI_API_KEY --project=video-analyzer-worker
+```
+
+#### IAM権限の確認・追加
+
+```bash
+# 特定のSecretのIAMポリシー確認
+gcloud secrets get-iam-policy OPENAI_API_KEY --project=video-analyzer-worker
+
+# 追加のサービスアカウントに権限付与
+gcloud secrets add-iam-policy-binding OPENAI_API_KEY \
+  --project=video-analyzer-worker \
+  --member="serviceAccount:new-service-account@project.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+### トラブルシューティング
+
+#### 問題1: Cloud Runがシークレットにアクセスできない
+
+**症状:**
+```
+Error: Secret "OPENAI_API_KEY" not accessible
+```
+
+**原因:**
+- IAM権限が不足している
+- Secret Managerが有効化されていない
+
+**解決策:**
+```bash
+# IAM権限を再付与
+gcloud secrets add-iam-policy-binding OPENAI_API_KEY \
+  --project=video-analyzer-worker \
+  --member="serviceAccount:820467345033-compute@developer.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+
+# Secret Manager API確認
+gcloud services list --enabled --filter="name:secretmanager.googleapis.com"
+```
+
+#### 問題2: 移行後にCloud Runが起動しない
+
+**症状:**
+```
+Revision 'video-analyzer-worker-00002' is not ready
+```
+
+**原因:**
+- シークレット参照が間違っている
+- 環境変数名のタイプミス
+
+**解決策:**
+```bash
+# Cloud Runログ確認
+gcloud run services logs tail video-analyzer-worker --region us-central1
+
+# 環境変数とシークレット参照確認
+gcloud run services describe video-analyzer-worker \
+  --region us-central1 \
+  --format="value(spec.template.spec.containers[0].env)"
+```
+
+#### 問題3: Vercelから処理が開始されない
+
+**症状:**
+- フロントエンドから動画アップロード後、処理が開始されない
+
+**原因:**
+- `WORKER_SECRET`が正しく設定されていない
+
+**解決策:**
+```bash
+# Vercel環境変数とSecret Managerの値が一致しているか確認
+vercel env pull .env.vercel
+cat .env.vercel | grep WORKER_SECRET
+
+# Secret Manager の値を確認
+gcloud secrets versions access latest --secret=WORKER_SECRET --project=video-analyzer-worker
+
+# 値が異なる場合、Vercel環境変数を更新
+vercel env rm WORKER_SECRET production
+vercel env add WORKER_SECRET production
+```
+
+### セキュリティベストプラクティス
+
+1. **最小権限の原則:**
+   - Cloud Runサービスアカウントには`secretAccessor`のみ付与
+   - 不要なサービスアカウントには権限を付与しない
+
+2. **定期的なローテーション:**
+   - APIキーは3-6ヶ月ごとにローテーション
+   - `WORKER_SECRET`は6ヶ月ごとにローテーション
+
+3. **監査ログ:**
+   - Secret Managerのアクセスログを定期的に確認
+   - 不審なアクセスがないかモニタリング
+
+4. **バックアップ:**
+   - ロールバック用のバックアップファイルを安全に保管
+   - `.gitignore`に追加して誤コミットを防止
+
+5. **アクセス制御:**
+   - Secret Managerへのアクセス権限は最小限のメンバーに限定
+   - GCPプロジェクトのIAMポリシーを定期的に見直し
 
 ---
 

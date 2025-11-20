@@ -1,0 +1,101 @@
+# Google Cloud Uptime Checks 定義
+#
+# Uptime Checkを作成するコマンド:
+#   gcloud monitoring uptime-checks create <check-name> [options]
+#
+# この設定は参考用。実際の作成は下記のスクリプトまたはコマンドで実行してください。
+
+# 1. Cloud Run Worker ヘルスチェック
+---
+name: cloud-run-worker-health
+displayName: "Cloud Run Worker Health Check"
+monitored_resource:
+  type: uptime_url
+  labels:
+    project_id: video-analyzer-worker
+    host: video-analyzer-worker-820467345033.us-central1.run.app
+http_check:
+  path: /health
+  port: 443
+  use_ssl: true
+  validate_ssl: true
+  request_method: GET
+  accepted_response_status_codes:
+    - status_class: STATUS_CLASS_2XX
+period: 300s  # 5分ごと
+timeout: 10s
+selected_regions:
+  - USA
+  - EUROPE
+  - ASIA_PACIFIC
+
+# 作成コマンド:
+# gcloud monitoring uptime-checks create cloud-run-worker-health \
+#   --display-name="Cloud Run Worker Health Check" \
+#   --resource-type=uptime-url \
+#   --host=video-analyzer-worker-820467345033.us-central1.run.app \
+#   --path=/health \
+#   --protocol=https \
+#   --check-interval=5m \
+#   --timeout=10s
+
+# 2. Vercel Frontend ヘルスチェック
+---
+name: vercel-frontend-health
+displayName: "Vercel Frontend Health Check"
+monitored_resource:
+  type: uptime_url
+  labels:
+    project_id: video-analyzer-worker
+    host: video-analyzer-v2-web.vercel.app
+http_check:
+  path: /api/health
+  port: 443
+  use_ssl: true
+  validate_ssl: true
+  request_method: GET
+  accepted_response_status_codes:
+    - status_class: STATUS_CLASS_2XX
+period: 300s  # 5分ごと
+timeout: 10s
+selected_regions:
+  - USA
+  - EUROPE
+  - ASIA_PACIFIC
+
+# 作成コマンド:
+# gcloud monitoring uptime-checks create vercel-frontend-health \
+#   --display-name="Vercel Frontend Health Check" \
+#   --resource-type=uptime-url \
+#   --host=video-analyzer-v2-web.vercel.app \
+#   --path=/api/health \
+#   --protocol=https \
+#   --check-interval=5m \
+#   --timeout=10s
+
+# アラートポリシーをUptime Checkに紐付け:
+# Cloud Console から手動で設定、または次のコマンドで作成:
+#
+# gcloud alpha monitoring policies create --policy-from-file=-
+# {
+#   "displayName": "Uptime Check - Cloud Run Worker Down",
+#   "conditions": [
+#     {
+#       "displayName": "Uptime check failed",
+#       "conditionThreshold": {
+#         "filter": "metric.type=\"monitoring.googleapis.com/uptime_check/check_passed\" resource.type=\"uptime_url\" metric.label.check_id=\"cloud-run-worker-health\"",
+#         "comparison": "COMPARISON_LT",
+#         "thresholdValue": 1,
+#         "duration": "300s",
+#         "aggregations": [
+#           {
+#             "alignmentPeriod": "60s",
+#             "perSeriesAligner": "ALIGN_FRACTION_TRUE"
+#           }
+#         ]
+#       }
+#     }
+#   ],
+#   "combiner": "OR",
+#   "enabled": true
+# }

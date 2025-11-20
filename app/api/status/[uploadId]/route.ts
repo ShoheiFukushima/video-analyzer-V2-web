@@ -47,7 +47,22 @@ export async function GET(
     }
 
     console.log(`[${uploadId}] Status retrieved:`, data.status);
-    return NextResponse.json(data);
+
+    // Map snake_case database columns to camelCase for frontend consistency
+    const mappedData = {
+      uploadId: data.upload_id,
+      userId: data.user_id,
+      status: data.status,
+      progress: data.progress,
+      stage: data.stage,
+      startedAt: data.started_at,
+      updatedAt: data.updated_at,
+      resultUrl: data.result_url,  // Critical: Map to camelCase
+      metadata: data.metadata,
+      error: data.error,
+    };
+
+    return NextResponse.json(mappedData);
   } catch (error) {
     console.error("Status check error:", error);
     return NextResponse.json(

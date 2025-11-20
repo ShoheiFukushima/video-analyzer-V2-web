@@ -1,0 +1,68 @@
+# Alert Policy: High Progress Update Failure Rate (Phase 1)
+# Created: 2025-11-09
+# Purpose: Alert when download progress updates are failing frequently
+
+displayName: "High Download Progress Update Failure Rate"
+documentation:
+  content: |
+    ## Alert: High Download Progress Update Failure Rate
+
+    **Severity**: Warning
+    **Impact**: User experience degradation (progress not updating smoothly)
+
+    ### What This Means
+    Download progress updates to Supabase are failing at an elevated rate.
+    Users may see progress stuck at 10% during downloads.
+
+    ### Root Causes
+    1. Supabase connection issues
+    2. Database write throttling
+    3. Invalid uploadId or schema mismatch
+    4. Network connectivity problems
+
+    ### Investigation Steps
+    1. Check Supabase status: https://status.supabase.com/
+    2. Review Cloud Run logs for "Progress update failed" errors:
+       ```
+       gcloud logging read 'textPayload:"Progress update failed"' --limit=50
+       ```
+    3. Check Supabase metrics for write throttling
+    4. Verify SUPABASE_SERVICE_ROLE_KEY is valid
+
+    ### Remediation
+    - If Supabase outage: Wait for service restoration (non-critical)
+    - If config issue: Verify environment variables and redeploy
+    - If persistent: Consider implementing exponential backoff
+
+    ### Note
+    This is a WARNING alert. Progress update failures are non-fatal -
+    downloads continue and complete successfully even if updates fail.
+
+  mimeType: text/markdown
+
+conditions:
+  - displayName: "Progress update failure rate > 10%"
+    conditionThreshold:
+      filter: |
+        resource.type = "cloud_run_revision"
+        resource.labels.service_name = "video-analyzer-worker"
+        metric.type = "logging.googleapis.com/user/progress_update_failure"
+      aggregations:
+        - alignmentPeriod: 300s  # 5 minutes
+          perSeriesAligner: ALIGN_RATE
+      comparison: COMPARISON_GT
+      thresholdValue: 0.1  # 10% failure rate
+      duration: 600s  # Alert if condition persists for 10 minutes
+
+notificationChannels: []  # Add notification channels as needed
+
+alertStrategy:
+  autoClose: 1800s  # Auto-close after 30 minutes if condition clears
+  notificationRateLimit:
+    period: 3600s  # Maximum 1 notification per hour
+
+combiner: OR
+
+enabled: true
+
+severity: WARNING

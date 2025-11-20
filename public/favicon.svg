@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6366f1;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#8b5cf6;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="50" cy="50" r="48" fill="url(#gradient)"/>
+
+  <!-- V letter -->
+  <path d="M 30 25 L 42 55 L 50 38 L 50 25 Z" fill="white" opacity="0.95"/>
+
+  <!-- A letter -->
+  <path d="M 58 55 L 70 25 L 70 25 L 78 25 L 68 55 L 62 55 Z" fill="white" opacity="0.95"/>
+  <path d="M 61 45 L 75 45 L 75 48 L 61 48 Z" fill="white" opacity="0.95"/>
+
+  <!-- Play icon accent (small) -->
+  <path d="M 48 65 L 48 80 L 62 72.5 Z" fill="white" opacity="0.9"/>
+
+  <!-- Waveform accent -->
+  <rect x="68" y="70" width="2" height="8" fill="white" opacity="0.7" rx="1"/>
+  <rect x="72" y="67" width="2" height="14" fill="white" opacity="0.7" rx="1"/>
+  <rect x="76" y="72" width="2" height="6" fill="white" opacity="0.7" rx="1"/>
+</svg>

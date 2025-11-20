@@ -1,0 +1,227 @@
+# Cloud Monitoring アラートポリシー定義
+# コマンド: gcloud alpha monitoring policies create --policy-from-file=alert-policies.yaml
+
+# 1. エラーレート監視
+---
+displayName: "Cloud Run - High Error Rate"
+documentation:
+  content: |
+    ## エラーレート高騰アラート
+
+    **症状**: Cloud Run サービスのエラー率が5%を超えています
+
+    **影響**: ユーザーのリクエストが失敗し、動画処理が完了できない可能性があります
+
+    **対応手順**:
+    1. Cloud Run ログを確認:
+       ```
+       gcloud run services logs tail video-analyzer-worker --region us-central1 --filter "severity>=ERROR" --limit 100
+       ```
+    2. 最新のデプロイに問題がないか確認
+    3. 必要であればロールバック実施
+    4. エラーパターンを特定し、修正
+  mimeType: text/markdown
+conditions:
+  - displayName: "Error rate > 5%"
+    conditionThreshold:
+      aggregations:
+        - alignmentPeriod: 300s
+          perSeriesAligner: ALIGN_RATE
+          crossSeriesReducer: REDUCE_MEAN
+          groupByFields:
+            - resource.service_name
+      comparison: COMPARISON_GT
+      duration: 300s
+      filter: |
+        resource.type = "cloud_run_revision"
+        AND resource.labels.service_name = "video-analyzer-worker"
+        AND metric.type = "run.googleapis.com/request_count"
+        AND metric.labels.response_code_class != "2xx"
+        AND metric.labels.response_code_class != "3xx"
+      thresholdValue: 0.05
+combiner: OR
+enabled: true
+notificationChannels: []
+
+# 2. レスポンスタイム監視
+---
+displayName: "Cloud Run - High Latency (p95)"
+documentation:
+  content: |
+    ## レスポンスタイム高騰アラート
+
+    **症状**: p95レスポンスタイムが60秒を超えています
+
+    **影響**: ユーザー体験の悪化、タイムアウトの可能性
+
+    **対応手順**:
+    1. Cloud Trace で遅いリクエストを特定
+    2. CPU/メモリ使用率を確認
+    3. 同時実行数を確認し、必要であればスケーリング調整
+    4. FFmpeg処理やAI API呼び出しのパフォーマンスを確認
+  mimeType: text/markdown
+conditions:
+  - displayName: "p95 latency > 60s"
+    conditionThreshold:
+      aggregations:
+        - alignmentPeriod: 300s
+          perSeriesAligner: ALIGN_DELTA
+          crossSeriesReducer: REDUCE_PERCENTILE_95
+          groupByFields:
+            - resource.service_name
+      comparison: COMPARISON_GT
+      duration: 300s
+      filter: |
+        resource.type = "cloud_run_revision"
+        AND resource.labels.service_name = "video-analyzer-worker"
+        AND metric.type = "run.googleapis.com/request_latencies"
+      thresholdValue: 60000
+combiner: OR
+enabled: true
+notificationChannels: []
+
+# 3. メモリ使用率監視
+---
+displayName: "Cloud Run - High Memory Usage"
+documentation:
+  content: |
+    ## メモリ使用率高騰アラート
+
+    **症状**: メモリ使用率が85%を超えています
+
+    **影響**: OOMキラーによるプロセス強制終了、処理失敗の可能性
+
+    **対応手順**:
+    1. メモリリークの有無を確認
+    2. 動画サイズ制限が適切か確認
+    3. FFmpegプロセスが正しく終了しているか確認
+    4. 必要であればメモリ割り当てを増加（2Gi → 4Gi）
+  mimeType: text/markdown
+conditions:
+  - displayName: "Memory utilization > 85%"
+    conditionThreshold:
+      aggregations:
+        - alignmentPeriod: 300s
+          perSeriesAligner: ALIGN_MEAN
+          crossSeriesReducer: REDUCE_MEAN
+          groupByFields:
+            - resource.service_name
+      comparison: COMPARISON_GT
+      duration: 300s
+      filter: |
+        resource.type = "cloud_run_revision"
+        AND resource.labels.service_name = "video-analyzer-worker"
+        AND metric.type = "run.googleapis.com/container/memory/utilizations"
+      thresholdValue: 0.85
+combiner: OR
+enabled: true
+notificationChannels: []
+
+# 4. CPU使用率監視
+---
+displayName: "Cloud Run - High CPU Usage"
+documentation:
+  content: |
+    ## CPU使用率高騰アラート
+
+    **症状**: CPU使用率が90%を超えています
+
+    **影響**: 処理速度の低下、タイムアウトの可能性
+
+    **対応手順**:
+    1. 同時実行リクエスト数を確認
+    2. FFmpeg処理の最適化を検討
+    3. CPU割り当てを増加（1 vCPU → 2 vCPU）を検討
+    4. max-instances設定を調整してスケールアウト
+  mimeType: text/markdown
+conditions:
+  - displayName: "CPU utilization > 90%"
+    conditionThreshold:
+      aggregations:
+        - alignmentPeriod: 300s
+          perSeriesAligner: ALIGN_MEAN
+          crossSeriesReducer: REDUCE_MEAN
+          groupByFields:
+            - resource.service_name
+      comparison: COMPARISON_GT
+      duration: 300s
+      filter: |
+        resource.type = "cloud_run_revision"
+        AND resource.labels.service_name = "video-analyzer-worker"
+        AND metric.type = "run.googleapis.com/container/cpu/utilizations"
+      thresholdValue: 0.90
+combiner: OR
+enabled: true
+notificationChannels: []
+
+# 5. コンテナインスタンス数監視
+---
+displayName: "Cloud Run - Max Instances Reached"
+documentation:
+  content: |
+    ## 最大インスタンス数到達アラート
+
+    **症状**: インスタンス数が最大値(10)に達しています
+
+    **影響**: 新規リクエストの待機、処理遅延
+
+    **対応手順**:
+    1. トラフィックスパイクの原因を特定
+    2. 不正なアクセスや攻撃の可能性を確認
+    3. 正当なトラフィックであればmax-instances増加を検討
+    4. キュー導入（Pub/Sub）を検討
+  mimeType: text/markdown
+conditions:
+  - displayName: "Instance count >= 9"
+    conditionThreshold:
+      aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_MAX
+          crossSeriesReducer: REDUCE_MAX
+          groupByFields:
+            - resource.service_name
+      comparison: COMPARISON_GE
+      duration: 60s
+      filter: |
+        resource.type = "cloud_run_revision"
+        AND resource.labels.service_name = "video-analyzer-worker"
+        AND metric.type = "run.googleapis.com/container/instance_count"
+      thresholdValue: 9
+combiner: OR
+enabled: true
+notificationChannels: []
+
+# 6. Vercel Blob容量監視（カスタムメトリクス）
+---
+displayName: "Vercel Blob - Storage Usage Warning"
+documentation:
+  content: |
+    ## Vercel Blob容量警告
+
+    **症状**: Blob Storage使用量が800MB（Hobby上限1GBの80%）を超えています
+
+    **影響**: ストレージ上限到達による新規アップロード失敗
+
+    **対応手順**:
+    1. 古いファイルの削除:
+       ```
+       npx dotenv -e .env.local tsx scripts/cleanup-blob-storage.ts delete-all
+       ```
+    2. 自動削除機能が正常動作しているか確認
+    3. Blobの保持期間を短縮
+    4. Vercel Pro プランへのアップグレードを検討
+  mimeType: text/markdown
+conditions:
+  - displayName: "Storage > 800MB"
+    conditionThreshold:
+      aggregations:
+        - alignmentPeriod: 3600s
+          perSeriesAligner: ALIGN_MAX
+      comparison: COMPARISON_GT
+      duration: 3600s
+      filter: |
+        metric.type = "custom.googleapis.com/vercel_blob/storage_bytes"
+      thresholdValue: 838860800  # 800MB in bytes
+combiner: OR
+enabled: false  # カスタムメトリクスが実装されるまで無効
+notificationChannels: []

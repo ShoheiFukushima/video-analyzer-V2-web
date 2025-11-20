@@ -317,7 +317,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
         onDragOver={(e) => e.preventDefault()}
         className={`border-2 border-dashed rounded-xl p-12 text-center transition-colors ${
           disabled || uploading
-            ? "border-gray-200 bg-gray-50 cursor-not-allowed"
+            ? "border-gray-300 bg-gray-100 dark:bg-gray-700 cursor-not-allowed"
             : "border-indigo-300 hover:border-indigo-500 bg-indigo-50/50 dark:bg-indigo-900/10 cursor-pointer"
         }`}
         onClick={() => !disabled && !uploading && fileInputRef.current?.click()}

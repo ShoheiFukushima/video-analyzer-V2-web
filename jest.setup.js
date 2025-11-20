@@ -13,3 +13,14 @@ if (typeof global.TextDecoder === 'undefined') {
   global.TextDecoder = TextDecoder
   global.TextEncoder = TextEncoder
 }
+
+// Mock DOM methods for jsdom environment
+if (typeof window !== 'undefined') {
+  // Mock URL methods
+  if (!window.URL.createObjectURL) {
+    window.URL.createObjectURL = jest.fn(() => 'blob:mock-url')
+  }
+  if (!window.URL.revokeObjectURL) {
+    window.URL.revokeObjectURL = jest.fn()
+  }
+}

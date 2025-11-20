@@ -65,7 +65,7 @@ export async function generateExcel(options) {
         const rowNumber = excelRow.sceneNumber + 1; // +1 for header row
         // Add row data (without screenshot initially)
         const row = worksheet.addRow({
-            scene: excelRow.sceneNumber,
+            scene: { formula: 'ROW()-1' }, // Auto-renumbering formula (works even if rows are deleted)
             timecode: excelRow.timecode,
             screenshot: '', // Placeholder, will embed image
             ocrText: excelRow.ocrText || '(no text detected)',
@@ -192,6 +192,39 @@ async function addStatisticsSheet(workbook, rows, videoMetadata) {
     statsSheet.addRow({ metric: 'Video Resolution', value: `${videoMetadata.width}x${videoMetadata.height}` });
     statsSheet.addRow({ metric: 'Aspect Ratio', value: `${videoMetadata.aspectRatio.toFixed(2)}:1` });
     statsSheet.addRow({ metric: 'Video Duration', value: `${videoMetadata.duration}s` });
+    statsSheet.addRow({ metric: '', value: '' }); // Separator
+    // Detection parameters (added: 2025-11-14)
+    const detectionParamsHeader = statsSheet.addRow({ metric: 'Detection Parameters', value: '' });
+    detectionParamsHeader.font = { bold: true };
+    detectionParamsHeader.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FFFFE4B5' } // Light orange
+    };
+    statsSheet.addRow({ metric: 'Scene Detection Thresholds', value: '0.025, 0.055, 0.085' });
+    statsSheet.addRow({ metric: 'Min Scene Interval', value: '1.0s' });
+    statsSheet.addRow({ metric: 'Min Scene Duration', value: '0.5s' });
+    statsSheet.addRow({ metric: 'Screenshot Capture Position', value: '50% (mid-point)' });
+    statsSheet.addRow({ metric: 'ROI Detection', value: 'Disabled (default)' });
+    statsSheet.addRow({ metric: '', value: '' }); // Separator
+    // Contact developer section
+    const contactHeader = statsSheet.addRow({ metric: 'Need Adjustment?', value: '' });
+    contactHeader.font = { bold: true };
+    contactHeader.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF87CEEB' } // Sky blue
+    };
+    const emailRow = statsSheet.addRow({
+        metric: 'Contact Developer',
+        value: {
+            text: 'Click here to email developer',
+            hyperlink: 'mailto:developer@example.com?subject=Video%20Analyzer%20Adjustment%20Request&body=Please%20adjust%20the%20following%20parameters%3A%0A%0A-%20Video%20ID%3A%20%0A-%20Issue%3A%20%0A-%20Requested%20changes%3A%20'
+        }
+    });
+    // Style the email link
+    const emailCell = emailRow.getCell('value');
+    emailCell.font = { color: { argb: 'FF0000FF' }, underline: true };
     // Add borders to stats
     statsSheet.eachRow((row) => {
         row.eachCell((cell) => {
@@ -203,7 +236,7 @@ async function addStatisticsSheet(workbook, rows, videoMetadata) {
             };
         });
     });
-    console.log('  ✓ Added statistics sheet');
+    console.log('  ✓ Added statistics sheet with detection parameters and contact button');
 }
 /**
  * Generate filename for Excel export

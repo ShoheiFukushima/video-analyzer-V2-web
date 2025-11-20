@@ -16,6 +16,7 @@ node_modules/
 # Misc
 .DS_Store
 *.pem
+.serena/
 
 # Debug
 npm-debug.log*
@@ -28,6 +29,14 @@ yarn-error.log*
 .env.local.backup
 .env.local.check
 .env.local.vercel
+.env.production
+.env.production.*
+.env.test.*
+.env.vercel
+
+# Secret Manager backup files (NEVER COMMIT)
+scripts/rollback-env-vars-*.txt
+backup-env-vars.txt
 
 # Vercel
 .vercel

@@ -20,8 +20,8 @@ export async function GET(
 
     if (process.env.NODE_ENV === 'development') {
       // Development mode: Download from Worker
-      const cloudRunUrl = process.env.CLOUD_RUN_URL || 'http://localhost:8080';
-      const workerSecret = process.env.WORKER_SECRET;
+      const cloudRunUrl = process.env.CLOUD_RUN_URL?.trim() || 'http://localhost:8080';
+      const workerSecret = process.env.WORKER_SECRET?.trim();
 
       if (!workerSecret) {
         return NextResponse.json(

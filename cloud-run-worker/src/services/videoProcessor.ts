@@ -3,7 +3,7 @@ import { initStatus, updateStatus, completeStatus, failStatus, ProcessingStatus 
 import { executeIdealPipeline } from './pipeline.js';
 import { getVideoMetadata } from './ffmpeg.js';
 import { uploadResultFile } from './blobUploader.js';
-import { extractAudioForWhisper, hasAudioStream } from './audioExtractor.js';
+import { extractAudioForWhisper, hasAudioStream, preprocessAudioForVAD } from './audioExtractor.js';
 import { processAudioWithVADAndWhisper } from './audioWhisperPipeline.js';
 import { deleteBlob } from './blobCleaner.js';
 import { logCriticalError } from './errorTracking.js';
@@ -95,164 +95,39 @@ export const processVideo = async (
 
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'video-analyzer-'));
     const videoPath = path.join(tempDir, 'video.mp4');
+    const audioPath = path.join(tempDir, 'audio.mp3');
 
     try {
-      // Step 1: Download video
-      await safeUpdateStatus(uploadId, { status: 'downloading', progress: 10, stage: 'downloading' });
+      // Ref object to track blob deletion status (passed by reference to helper function)
+      const blobDeletedRef = { value: false };
 
-      await timeStep(uploadId, 'Download Video', async () => {
-        await downloadFile(blobUrl, videoPath, uploadId, { start: 10, end: 20 });
-      });
+      // Step 1: Download video, delete source blob, and compress if needed
+      await downloadAndPrepareVideo(uploadId, blobUrl, videoPath, blobDeletedRef);
+      blobDeleted = blobDeletedRef.value;
 
-      // Delete source video blob after successful download (early cleanup)
-      try {
-        await timeStep(uploadId, 'Delete Source Blob', async () => {
-          await deleteBlob(blobUrl);
-          blobDeleted = true;
-        });
-      } catch (deleteError) {
-        console.warn(`[${uploadId}] ⚠️  Failed to delete blob (will retry in finally):`, deleteError);
-      }
+      // Step 2-3: Extract metadata and audio
+      const { videoMetadata, hasAudio } = await extractMetadataAndAudio(uploadId, videoPath, audioPath);
 
-      // Step 1.5: Compress video if needed
-      await safeUpdateStatus(uploadId, {
-        status: 'processing',
-        progress: 15,
-        stage: 'compressing'
-      });
+      // Step 4: Perform VAD + Whisper transcription (if audio exists)
+      const { transcription, vadStats } = await performTranscription(uploadId, audioPath, hasAudio);
 
-      try {
-        const compressionResult = await timeStep(uploadId, 'Compress Video (if needed)', async () => {
-          return await compressVideoIfNeeded(videoPath, uploadId);
-        });
-        if (compressionResult.compressed) {
-          const originalMB = (compressionResult.originalSize / 1024 / 1024).toFixed(1);
-          const newMB = (compressionResult.newSize / 1024 / 1024).toFixed(1);
-          const reductionPercent = (((compressionResult.originalSize - compressionResult.newSize) / compressionResult.originalSize) * 100).toFixed(1);
-          console.log(`[${uploadId}] ✅ Compressed: ${originalMB}MB → ${newMB}MB (${reductionPercent}% reduction)`);
-        } else {
-          const sizeMB = (compressionResult.originalSize / 1024 / 1024).toFixed(1);
-          console.log(`[${uploadId}] ℹ️  Compression skipped: ${sizeMB}MB (under 200MB threshold)`);
-        }
-      } catch (compressionError) {
-        console.warn(`[${uploadId}] ⚠️  Compression failed, continuing with original file:`, compressionError);
-        // Continue processing with original file (compression failure is not fatal)
-      }
+      // Step 5: Execute scene detection, OCR, and Excel generation
+      const { excelPath, stats } = await executeSceneDetectionAndOCR(
+        uploadId,
+        videoPath,
+        fileName,
+        transcription
+      );
 
-      // Step 2: Extract video metadata
-      await safeUpdateStatus(uploadId, { status: 'processing', progress: 20, stage: 'metadata' });
-
-      const videoMetadata = await timeStep(uploadId, 'Extract Video Metadata', async () => {
-        return await getVideoMetadata(videoPath);
-      });
-
-      // Step 3: Extract audio (Whisper-optimized)
-      await safeUpdateStatus(uploadId, { status: 'processing', progress: 30, stage: 'audio' });
-
-      const audioPath = path.join(tempDir, 'audio.mp3');
-      const hasAudio = await timeStep(uploadId, 'Detect Audio Stream', async () => {
-        return await hasAudioStream(videoPath);
-      });
-
-      let transcription: TranscriptionSegment[] = [];
-      let vadStats: VADStats | null = null;
-
-      if (hasAudio) {
-        await timeStep(uploadId, 'Extract Audio (16kHz mono)', async () => {
-          await extractAudioForWhisper(videoPath, audioPath);
-        });
-
-        // Step 4: VAD + Whisper pipeline (optimized processing)
-        await safeUpdateStatus(uploadId, { status: 'processing', progress: 45, stage: 'vad_whisper' });
-
-        const pipelineResult = await timeStep(uploadId, 'VAD + Whisper Pipeline', async () => {
-          return await processAudioWithVADAndWhisper(audioPath, uploadId);
-        });
-        transcription = pipelineResult.segments;
-        vadStats = pipelineResult.vadStats;
-
-        console.log(`[${uploadId}] VAD + Whisper complete: ${transcription.length} segments`);
-        console.log(`[${uploadId}]   Voice ratio: ${(vadStats.voiceRatio * 100).toFixed(1)}%`);
-        console.log(`[${uploadId}]   Cost savings: ${vadStats.estimatedSavings.toFixed(1)}%`);
-      } else {
-        console.log(`[${uploadId}] ⚠️ No audio stream detected, skipping transcription`);
-        await safeUpdateStatus(uploadId, { status: 'processing', progress: 45, stage: 'audio_skipped' });
-      }
-
-      // Step 5: Execute ideal Excel pipeline (Scene detection + OCR + Excel generation)
-      await safeUpdateStatus(uploadId, { status: 'processing', progress: 60, stage: 'scene_ocr_excel' });
-
-      const pipelineResult = await timeStep(uploadId, 'Scene Detection + OCR + Excel Generation', async () => {
-        return await executeIdealPipeline(
-          videoPath,
-          fileName,
-          transcription,
-          uploadId
-        );
-      });
-
-      const excelPath = pipelineResult.excelPath;
-
-      // Step 9: Upload result file or store locally for development
-      await safeUpdateStatus(uploadId, { status: 'processing', progress: 90, stage: 'upload_result' });
-
-      let resultUrl: string = uploadId; // Initialize with uploadId
-      let resultBlobUrl: string | null = null;
-
-      await timeStep(uploadId, 'Upload Result File', async () => {
-        if (process.env.NODE_ENV === 'development') {
-          // Development mode: Store file path locally
-          const persistentPath = path.join('/tmp', `result_${uploadId}.xlsx`);
-          fs.copyFileSync(excelPath, persistentPath);
-          resultFileMap.set(uploadId, persistentPath);
-
-          console.log(`[${uploadId}] Development mode: File stored at ${persistentPath}`);
-          console.log(`[${uploadId}] Result URL (uploadId): ${resultUrl}`);
-        } else {
-          // Production mode: Upload to Vercel Blob
-          resultBlobUrl = await uploadResultFile(excelPath, uploadId);
-
-          console.log(`[${uploadId}] Production mode: Uploaded to Blob`);
-          console.log(`[${uploadId}] Blob URL: ${resultBlobUrl}`);
-          console.log(`[${uploadId}] Result URL (uploadId): ${resultUrl}`);
-        }
-      });
-
-      // Complete with metadata (including resultBlobUrl for production downloads)
-      console.log(`[${uploadId}] Processing completed!`);
-
-      const completionMetadata: ProcessingMetadata = {
-        duration: videoMetadata.duration,
-        segmentCount: transcription.length,
-        ocrResultCount: pipelineResult.stats.scenesWithOCRText,
-        transcriptionLength: transcription.reduce((sum, seg) => sum + seg.text.length, 0),
-        totalScenes: pipelineResult.stats.totalScenes,
-        scenesWithOCR: pipelineResult.stats.scenesWithOCRText,
-        scenesWithNarration: pipelineResult.stats.scenesWithNarration,
-      };
-
-      // Store resultBlobUrl in metadata for production downloads
-      if (resultBlobUrl) {
-        completionMetadata.blobUrl = resultBlobUrl;
-      }
-
-      // Try to update Supabase status, but don't fail if it errors (dev mode resilience)
-      try {
-        await completeStatus(uploadId, resultUrl, completionMetadata);
-      } catch (statusError) {
-        console.error(`[${uploadId}] Failed to update Supabase status (non-fatal in dev):`, statusError);
-        if (process.env.NODE_ENV === 'production') {
-          throw statusError; // Re-throw in production
-        }
-        // In development, continue - file is already saved locally
-        console.log(`[${uploadId}] Continuing despite status update failure (dev mode)`);
-      }
-
-      // Log overall processing time
-      const overallDuration = ((Date.now() - overallStartTime) / 1000).toFixed(2);
-      console.log(`[${uploadId}] ═══════════════════════════════════════════════`);
-      console.log(`[${uploadId}] 🎉 TOTAL PROCESSING TIME: ${overallDuration}s`);
-      console.log(`[${uploadId}] ═══════════════════════════════════════════════`);
+      // Step 6: Upload result and complete processing
+      await uploadResultAndComplete(
+        uploadId,
+        excelPath,
+        videoMetadata,
+        transcription,
+        stats,
+        overallStartTime
+      );
 
     } finally {
       // Cleanup temporary directory
@@ -293,6 +168,269 @@ export const processVideo = async (
     }
   }
 };
+
+/**
+ * Download video, delete source blob, and compress if needed
+ *
+ * @param uploadId - Upload ID for logging
+ * @param blobUrl - Source video Blob URL
+ * @param videoPath - Destination path for video
+ * @param blobDeleted - Ref object to track blob deletion status
+ * @returns void
+ */
+async function downloadAndPrepareVideo(
+  uploadId: string,
+  blobUrl: string,
+  videoPath: string,
+  blobDeleted: { value: boolean }
+): Promise<void> {
+  // Step 1: Download video
+  await safeUpdateStatus(uploadId, { status: 'downloading', progress: 10, stage: 'downloading' });
+
+  await timeStep(uploadId, 'Download Video', async () => {
+    await downloadFile(blobUrl, videoPath, uploadId, { start: 10, end: 20 });
+  });
+
+  // Delete source video blob after successful download (early cleanup)
+  try {
+    await timeStep(uploadId, 'Delete Source Blob', async () => {
+      await deleteBlob(blobUrl);
+      blobDeleted.value = true;
+    });
+  } catch (deleteError) {
+    console.warn(`[${uploadId}] ⚠️  Failed to delete blob (will retry in finally):`, deleteError);
+  }
+
+  // Step 1.5: Compress video if needed
+  await safeUpdateStatus(uploadId, {
+    status: 'processing',
+    progress: 15,
+    stage: 'compressing'
+  });
+
+  try {
+    const compressionResult = await timeStep(uploadId, 'Compress Video (if needed)', async () => {
+      return await compressVideoIfNeeded(videoPath, uploadId);
+    });
+    if (compressionResult.compressed) {
+      const originalMB = (compressionResult.originalSize / 1024 / 1024).toFixed(1);
+      const newMB = (compressionResult.newSize / 1024 / 1024).toFixed(1);
+      const reductionPercent = (((compressionResult.originalSize - compressionResult.newSize) / compressionResult.originalSize) * 100).toFixed(1);
+      console.log(`[${uploadId}] ✅ Compressed: ${originalMB}MB → ${newMB}MB (${reductionPercent}% reduction)`);
+    } else {
+      const sizeMB = (compressionResult.originalSize / 1024 / 1024).toFixed(1);
+      console.log(`[${uploadId}] ℹ️  Compression skipped: ${sizeMB}MB (under 200MB threshold)`);
+    }
+  } catch (compressionError) {
+    console.warn(`[${uploadId}] ⚠️  Compression failed, continuing with original file:`, compressionError);
+    // Continue processing with original file (compression failure is not fatal)
+  }
+}
+
+/**
+ * Extract video metadata and audio (if available)
+ *
+ * @param uploadId - Upload ID for logging
+ * @param videoPath - Path to video file
+ * @param audioPath - Destination path for audio
+ * @returns Object containing video metadata and hasAudio flag
+ */
+async function extractMetadataAndAudio(
+  uploadId: string,
+  videoPath: string,
+  audioPath: string
+): Promise<{ videoMetadata: any; hasAudio: boolean }> {
+  // Step 2: Extract video metadata
+  await safeUpdateStatus(uploadId, { status: 'processing', progress: 20, stage: 'metadata' });
+
+  const videoMetadata = await timeStep(uploadId, 'Extract Video Metadata', async () => {
+    return await getVideoMetadata(videoPath);
+  });
+
+  // Step 3: Extract audio (Whisper-optimized)
+  await safeUpdateStatus(uploadId, { status: 'processing', progress: 30, stage: 'audio' });
+
+  const hasAudio = await timeStep(uploadId, 'Detect Audio Stream', async () => {
+    return await hasAudioStream(videoPath);
+  });
+
+  if (hasAudio) {
+    await timeStep(uploadId, 'Extract Audio (16kHz mono)', async () => {
+      await extractAudioForWhisper(videoPath, audioPath);
+    });
+
+    // Audio preprocessing for improved VAD detection (BGM suppression + voice enhancement)
+    // Re-enabled after baseline test completion (2025-11-12)
+    await timeStep(uploadId, 'Preprocess Audio (BGM suppression)', async () => {
+      try {
+        await preprocessAudioForVAD(audioPath, uploadId);
+        console.log(`[${uploadId}] ✓ Audio preprocessing successful - VAD detection should improve`);
+      } catch (preprocessError) {
+        // Non-fatal error: Continue with original audio (fallback)
+        console.warn(`[${uploadId}] ⚠️ Audio preprocessing failed, using original audio:`, preprocessError);
+        console.warn(`[${uploadId}]    VAD detection may be less accurate without preprocessing`);
+        // Do not throw - processing continues with original audio
+      }
+    });
+  } else {
+    console.log(`[${uploadId}] ⚠️ No audio stream detected, skipping audio extraction`);
+  }
+
+  return { videoMetadata, hasAudio };
+}
+
+/**
+ * Perform VAD + Whisper transcription (if audio exists)
+ *
+ * @param uploadId - Upload ID for logging
+ * @param audioPath - Path to audio file
+ * @param hasAudio - Whether audio stream exists
+ * @returns Object containing transcription segments and VAD statistics
+ */
+async function performTranscription(
+  uploadId: string,
+  audioPath: string,
+  hasAudio: boolean
+): Promise<{ transcription: TranscriptionSegment[]; vadStats: VADStats | null }> {
+  let transcription: TranscriptionSegment[] = [];
+  let vadStats: VADStats | null = null;
+
+  if (hasAudio) {
+    // Step 4: VAD + Whisper pipeline (optimized processing)
+    await safeUpdateStatus(uploadId, { status: 'processing', progress: 45, stage: 'vad_whisper' });
+
+    const pipelineResult = await timeStep(uploadId, 'VAD + Whisper Pipeline', async () => {
+      return await processAudioWithVADAndWhisper(audioPath, uploadId);
+    });
+    transcription = pipelineResult.segments;
+    vadStats = pipelineResult.vadStats;
+
+    console.log(`[${uploadId}] VAD + Whisper complete: ${transcription.length} segments`);
+    console.log(`[${uploadId}]   Voice ratio: ${(vadStats.voiceRatio * 100).toFixed(1)}%`);
+    console.log(`[${uploadId}]   Cost savings: ${vadStats.estimatedSavings.toFixed(1)}%`);
+  } else {
+    console.log(`[${uploadId}] ⚠️ No audio stream detected, skipping transcription`);
+    await safeUpdateStatus(uploadId, { status: 'processing', progress: 45, stage: 'audio_skipped' });
+  }
+
+  return { transcription, vadStats };
+}
+
+/**
+ * Execute scene detection, OCR, and Excel generation pipeline
+ *
+ * @param uploadId - Upload ID for logging
+ * @param videoPath - Path to video file
+ * @param fileName - Original file name
+ * @param transcription - Transcription segments
+ * @returns Object containing Excel path and pipeline statistics
+ */
+async function executeSceneDetectionAndOCR(
+  uploadId: string,
+  videoPath: string,
+  fileName: string,
+  transcription: TranscriptionSegment[]
+): Promise<{ excelPath: string; stats: any }> {
+  // Step 5: Execute ideal Excel pipeline (Scene detection + OCR + Excel generation)
+  await safeUpdateStatus(uploadId, { status: 'processing', progress: 60, stage: 'scene_ocr_excel' });
+
+  const pipelineResult = await timeStep(uploadId, 'Scene Detection + OCR + Excel Generation', async () => {
+    return await executeIdealPipeline(
+      videoPath,
+      fileName,
+      transcription,
+      uploadId
+    );
+  });
+
+  return {
+    excelPath: pipelineResult.excelPath,
+    stats: pipelineResult.stats
+  };
+}
+
+/**
+ * Upload result file and complete processing status
+ *
+ * @param uploadId - Upload ID for logging
+ * @param excelPath - Path to Excel file
+ * @param videoMetadata - Video metadata
+ * @param transcription - Transcription segments
+ * @param stats - Pipeline statistics
+ * @param overallStartTime - Overall processing start time
+ * @returns Result URL and Blob URL (if in production)
+ */
+async function uploadResultAndComplete(
+  uploadId: string,
+  excelPath: string,
+  videoMetadata: any,
+  transcription: TranscriptionSegment[],
+  stats: any,
+  overallStartTime: number
+): Promise<{ resultUrl: string; resultBlobUrl: string | null }> {
+  // Step 9: Upload result file or store locally for development
+  await safeUpdateStatus(uploadId, { status: 'processing', progress: 90, stage: 'upload_result' });
+
+  let resultUrl: string = uploadId; // Initialize with uploadId
+  let resultBlobUrl: string | null = null;
+
+  await timeStep(uploadId, 'Upload Result File', async () => {
+    if (process.env.NODE_ENV === 'development') {
+      // Development mode: Store file path locally
+      const persistentPath = path.join('/tmp', `result_${uploadId}.xlsx`);
+      fs.copyFileSync(excelPath, persistentPath);
+      resultFileMap.set(uploadId, persistentPath);
+
+      console.log(`[${uploadId}] Development mode: File stored at ${persistentPath}`);
+      console.log(`[${uploadId}] Result URL (uploadId): ${resultUrl}`);
+    } else {
+      // Production mode: Upload to Vercel Blob
+      resultBlobUrl = await uploadResultFile(excelPath, uploadId);
+
+      console.log(`[${uploadId}] Production mode: Uploaded to Blob`);
+      console.log(`[${uploadId}] Blob URL: ${resultBlobUrl}`);
+      console.log(`[${uploadId}] Result URL (uploadId): ${resultUrl}`);
+    }
+  });
+
+  // Complete with metadata (including resultBlobUrl for production downloads)
+  console.log(`[${uploadId}] Processing completed!`);
+
+  const completionMetadata: ProcessingMetadata = {
+    duration: videoMetadata.duration,
+    segmentCount: transcription.length,
+    ocrResultCount: stats.scenesWithOCRText,
+    transcriptionLength: transcription.reduce((sum, seg) => sum + seg.text.length, 0),
+    totalScenes: stats.totalScenes,
+    scenesWithOCR: stats.scenesWithOCRText,
+    scenesWithNarration: stats.scenesWithNarration,
+  };
+
+  // Store resultBlobUrl in metadata for production downloads
+  if (resultBlobUrl) {
+    completionMetadata.blobUrl = resultBlobUrl;
+  }
+
+  // Try to update Supabase status, but don't fail if it errors (dev mode resilience)
+  try {
+    await completeStatus(uploadId, resultUrl, completionMetadata);
+  } catch (statusError) {
+    console.error(`[${uploadId}] Failed to update Supabase status (non-fatal in dev):`, statusError);
+    if (process.env.NODE_ENV === 'production') {
+      throw statusError; // Re-throw in production
+    }
+    // In development, continue - file is already saved locally
+    console.log(`[${uploadId}] Continuing despite status update failure (dev mode)`);
+  }
+
+  // Log overall processing time
+  const overallDuration = ((Date.now() - overallStartTime) / 1000).toFixed(2);
+  console.log(`[${uploadId}] ═══════════════════════════════════════════════`);
+  console.log(`[${uploadId}] 🎉 TOTAL PROCESSING TIME: ${overallDuration}s`);
+  console.log(`[${uploadId}] ═══════════════════════════════════════════════`);
+
+  return { resultUrl, resultBlobUrl };
+}
 
 /**
  * Compress video if file size exceeds 200MB

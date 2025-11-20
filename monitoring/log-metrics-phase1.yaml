@@ -1,0 +1,102 @@
+# Log-based Metrics for Phase 1: Download Progress Updates
+# Created: 2025-11-09
+# Purpose: Track download progress update success/failure rates
+
+# Metric 1: Progress Update Success Counter
+---
+name: projects/video-analyzer-prod-1756704391/metrics/progress_update_success
+description: "Count of successful download progress updates to Supabase"
+filter: |
+  resource.type="cloud_run_revision"
+  resource.labels.service_name="video-analyzer-worker"
+  textPayload=~"Progress update.*downloading"
+  -textPayload:"Progress update failed"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  displayName: "Download Progress Update Success"
+  labels:
+    - key: upload_id
+      valueType: STRING
+      description: "Upload ID being processed"
+
+labelExtractors:
+  upload_id: "REGEXP_EXTRACT(textPayload, \"\\[([^\\]]+)\\]\")"
+
+---
+# Metric 2: Progress Update Failure Counter
+name: projects/video-analyzer-prod-1756704391/metrics/progress_update_failure
+description: "Count of failed download progress updates (non-fatal)"
+filter: |
+  resource.type="cloud_run_revision"
+  resource.labels.service_name="video-analyzer-worker"
+  textPayload:"Progress update failed (non-fatal)"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  displayName: "Download Progress Update Failure"
+  labels:
+    - key: upload_id
+      valueType: STRING
+      description: "Upload ID being processed"
+    - key: error_type
+      valueType: STRING
+      description: "Type of error"
+
+labelExtractors:
+  upload_id: "REGEXP_EXTRACT(textPayload, \"\\[([^\\]]+)\\]\")"
+  error_type: "REGEXP_EXTRACT(textPayload, \"Progress update failed \\(non-fatal\\): (.+)\")"
+
+---
+# Metric 3: Download Duration Distribution
+name: projects/video-analyzer-prod-1756704391/metrics/download_duration
+description: "Time taken for video downloads to complete"
+filter: |
+  resource.type="cloud_run_revision"
+  resource.labels.service_name="video-analyzer-worker"
+  textPayload=~"\\[Download Video\\] Completed in ([0-9.]+)s"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: DISTRIBUTION
+  unit: "s"
+  displayName: "Video Download Duration"
+  labels:
+    - key: upload_id
+      valueType: STRING
+      description: "Upload ID being processed"
+
+valueExtractor: "REGEXP_EXTRACT(textPayload, \"Completed in ([0-9.]+)s\")"
+labelExtractors:
+  upload_id: "REGEXP_EXTRACT(textPayload, \"\\[([^\\]]+)\\]\")"
+
+---
+# Metric 4: Progress Update Frequency
+name: projects/video-analyzer-prod-1756704391/metrics/progress_update_frequency
+description: "Number of progress updates per download session"
+filter: |
+  resource.type="cloud_run_revision"
+  resource.labels.service_name="video-analyzer-worker"
+  (textPayload:"Downloading... 10%" OR
+   textPayload:"Downloading... 12%" OR
+   textPayload:"Downloading... 14%" OR
+   textPayload:"Downloading... 16%" OR
+   textPayload:"Downloading... 18%" OR
+   textPayload:"Downloading... 20%")
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  displayName: "Progress Update Events"
+  labels:
+    - key: upload_id
+      valueType: STRING
+      description: "Upload ID being processed"
+    - key: progress_percent
+      valueType: STRING
+      description: "Progress percentage"
+
+labelExtractors:
+  upload_id: "REGEXP_EXTRACT(textPayload, \"\\[([^\\]]+)\\]\")"
+  progress_percent: "REGEXP_EXTRACT(textPayload, \"Downloading... ([0-9]+)%\")"

@@ -58,6 +58,37 @@ export declare function getAudioMetadata(videoPath: string): Promise<{
  */
 export declare function hasAudioStream(videoPath: string): Promise<boolean>;
 /**
+ * Preprocess audio for improved VAD detection
+ *
+ * Applies FFmpeg filters to suppress background music (BGM) and enhance human voice.
+ * This improves Voice Activity Detection (VAD) accuracy in videos with loud BGM.
+ *
+ * Filter chain:
+ * 1. highpass=f=80: Remove sub-bass (<80Hz) - kick drums, rumble
+ * 2. lowpass=f=8000: Remove high-frequency noise (>8kHz) - cymbals, hiss
+ * 3. equalizer (60Hz, -15dB): Suppress BGM bass (40-80Hz)
+ * 4. equalizer (160Hz, +10dB): Enhance voice fundamentals (80-240Hz)
+ * 5. equalizer (3000Hz, +6dB): Enhance voice harmonics (2-4kHz)
+ * 6. afftdn: FFT-based noise reduction
+ * 7. dynaudnorm: Volume normalization
+ *
+ * @param audioPath - Path to input audio file (16kHz mono MP3)
+ * @param uploadId - Upload ID for logging
+ * @returns Promise<void> - Replaces original file with preprocessed audio
+ * @throws Error - On preprocessing failure (caller should use original audio as fallback)
+ *
+ * @example
+ * ```typescript
+ * try {
+ *   await preprocessAudioForVAD('/tmp/audio.mp3', 'upload_123');
+ * } catch (error) {
+ *   console.warn('Preprocessing failed, using original audio:', error);
+ *   // Continue with original audio
+ * }
+ * ```
+ */
+export declare function preprocessAudioForVAD(audioPath: string, uploadId: string): Promise<void>;
+/**
  * Extract a specific time range from audio file
  *
  * Used by VAD service to extract voice segments

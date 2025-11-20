@@ -1,0 +1,90 @@
+/**
+ * VAD (Voice Activity Detection) Configuration
+ *
+ * Centralized configuration for VAD parameters used across the application.
+ * Optimized for Whisper API cost savings while maintaining accuracy.
+ *
+ * Key Metrics:
+ * - Cost reduction: 40-60% (vs processing full audio)
+ * - Whisper API cost: $0.006/minute
+ *
+ * Last updated: 2025-11-12
+ */
+/**
+ * Default VAD configuration
+ *
+ * IMPORTANT: These values have been optimized through testing.
+ * DO NOT modify without consulting the performance report.
+ *
+ * Reference: .serena/memories/narration_detection_issue_root_cause_2025-11-12.md
+ */
+export const DEFAULT_VAD_CONFIG = {
+    /**
+     * Maximum chunk duration (10 seconds)
+     *
+     * Why 10 seconds:
+     * - Whisper API optimal chunk size
+     * - Balances accuracy and processing time
+     * - Prevents context loss in long segments
+     */
+    maxChunkDuration: 10,
+    /**
+     * Minimum speech duration (0.10 seconds)
+     *
+     * Why 0.10 seconds (Updated 2025-11-12):
+     * - Allows VAD to capture very brief speech segments
+     * - Prevents pathological "everything filtered out" scenario
+     * - Still discards ultra-short spikes (<0.10s = VAD sampling window)
+     * - Trade-off: More segments processed, but prevents zero-detection failures
+     *
+     * History:
+     * - 0.25s: Original conservative setting
+     * - 0.15s: More aggressive (but still filtered out BGM-only videos)
+     * - 0.10s: Current (matches VAD minimum detection unit)
+     */
+    minSpeechDuration: 0.10,
+    /**
+     * VAD sensitivity (0.3 = moderate detection)
+     *
+     * Why 0.3 (Updated 2025-11-12):
+     * - Moderate detection reduces BGM false positives
+     * - Previous 0.2 (very aggressive) detected 31k+ micro-segments in BGM-only video
+     * - Higher threshold = fewer false positives from music beats/transients
+     * - Trade-off: May miss very quiet speech, but fallback mechanism compensates
+     *
+     * Range:
+     * - 0.2: Very aggressive (picks up BGM beats) ← PREVIOUS (too sensitive)
+     * - 0.3: Moderate (current) ← CURRENT (balanced)
+     * - 0.5: Balanced (default)
+     * - 0.7-0.9: Conservative (may miss quiet speech)
+     */
+    sensitivity: 0.3,
+};
+/**
+ * Whisper API cost constants
+ *
+ * Reference: https://platform.openai.com/docs/api-reference/audio
+ */
+export const WHISPER_COST = {
+    /** Cost per minute of audio (USD) */
+    PER_MINUTE: 0.006,
+};
+/**
+ * Merge user config with defaults
+ *
+ * @param config - User-provided partial configuration
+ * @returns Complete VAD configuration
+ *
+ * @example
+ * ```typescript
+ * const config = getVADConfig({ sensitivity: 0.7 });
+ * // Returns: { maxChunkDuration: 10, minSpeechDuration: 0.25, sensitivity: 0.7 }
+ * ```
+ */
+export function getVADConfig(config = {}) {
+    return {
+        ...DEFAULT_VAD_CONFIG,
+        ...config,
+    };
+}
+//# sourceMappingURL=vad.js.map

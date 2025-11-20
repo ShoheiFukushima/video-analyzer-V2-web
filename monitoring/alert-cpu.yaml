@@ -1,0 +1,33 @@
+displayName: "Cloud Run - High CPU Usage"
+documentation:
+  content: |
+    ## CPU使用率高騰アラート
+
+    **症状**: CPU使用率が90%を超えています
+
+    **影響**: 処理速度の低下、タイムアウトの可能性
+
+    **対応手順**:
+    1. 同時実行リクエスト数を確認
+    2. FFmpeg処理の最適化を検討
+    3. CPU割り当てを増加（1 vCPU → 2 vCPU）を検討
+    4. max-instances設定を調整してスケールアウト
+  mimeType: text/markdown
+conditions:
+  - displayName: "CPU utilization > 90%"
+    conditionThreshold:
+      aggregations:
+        - alignmentPeriod: 300s
+          perSeriesAligner: ALIGN_DELTA
+          crossSeriesReducer: REDUCE_PERCENTILE_95
+          groupByFields:
+            - resource.service_name
+      comparison: COMPARISON_GT
+      duration: 300s
+      filter: |
+        resource.type = "cloud_run_revision"
+        AND resource.labels.service_name = "video-analyzer-worker"
+        AND metric.type = "run.googleapis.com/container/cpu/utilizations"
+      thresholdValue: 0.90
+combiner: OR
+enabled: true

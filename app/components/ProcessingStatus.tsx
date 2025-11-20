@@ -73,38 +73,34 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
   // Poll for processing status
   useEffect(() => {
     let pollInterval: NodeJS.Timeout;
-    let currentStage = 0;
 
-    const stages: ProcessingStage[] = [
-      "downloading",
-      "metadata",
-      "vad",
-      "frames",
-      "whisper",
-      "ocr",
-      "excel",
-      "upload_result",
-      "completed",
-    ];
-
-    // Simulate progress (since we don't have real-time updates from worker)
-    const simulateProgress = () => {
-      if (currentStage < stages.length) {
-        setStatus(stages[currentStage]);
-        setProgress(((currentStage + 1) / stages.length) * 100);
-        currentStage++;
-      }
-    };
-
-    // Poll for status
+    // Poll for status (API progress only - no simulation)
     const pollStatus = async () => {
       try {
         const response = await fetch(`/api/status/${uploadId}`);
         const data = await response.json();
 
-        // Update progress from API
+        // Update progress from API only (no simulation to prevent 100% → 10% rollback)
         if (data.progress !== undefined) {
           setProgress(data.progress);
+        }
+
+        // Update stage from API if available
+        if (data.stage) {
+          // Map backend stage to frontend stage
+          const stageMap: Record<string, ProcessingStage> = {
+            'downloading': 'downloading',
+            'compressing': 'downloading',
+            'metadata': 'metadata',
+            'audio': 'audio',
+            'audio_skipped': 'audio',
+            'vad_whisper': 'whisper',
+            'scene_ocr_excel': 'ocr',
+            'upload_result': 'upload_result',
+            'completed': 'completed'
+          };
+          const mappedStage = stageMap[data.stage] || 'frames';
+          setStatus(mappedStage);
         }
 
         if (data.status === "completed" && data.resultUrl) {
@@ -113,33 +109,24 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
           setMetadata(data.metadata);
           setProgress(100);
           clearInterval(pollInterval);
-          clearInterval(progressInterval);
           onComplete?.();
         } else if (data.status === "error") {
           setStatus("error");
-          setError(data.message || "Processing failed");
+          setError(data.error || data.message || "Processing failed");
           clearInterval(pollInterval);
-          clearInterval(progressInterval);
           onComplete?.();
-        } else if (data.status === "processing") {
-          // Map "processing" to a stage
-          setStatus("frames");
         }
       } catch (err) {
         console.error("Error polling status:", err);
       }
     };
 
-    // Start progress simulation (slower, as backup)
-    const progressInterval = setInterval(simulateProgress, 5000);
-
-    // Start polling every 10 seconds (reduced from 3s to minimize Supabase load)
-    pollInterval = setInterval(pollStatus, 10000);
+    // Start polling every 5 seconds (increased from 10s for faster updates)
+    pollInterval = setInterval(pollStatus, 5000);
     pollStatus(); // Initial poll immediately
 
     return () => {
       clearInterval(pollInterval);
-      clearInterval(progressInterval);
     };
   }, [uploadId, onComplete]);
 

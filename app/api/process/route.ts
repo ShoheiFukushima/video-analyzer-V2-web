@@ -53,11 +53,11 @@ export async function POST(request: NextRequest) {
 
     // Use localhost for development, production URL for deployment
     const cloudRunUrl = process.env.NODE_ENV === 'development'
-      ? process.env.CLOUD_RUN_URL || 'http://localhost:8080'
-      : process.env.CLOUD_RUN_URL;
+      ? process.env.CLOUD_RUN_URL?.trim() || 'http://localhost:8080'
+      : process.env.CLOUD_RUN_URL?.trim();
 
     // Always require WORKER_SECRET from environment (no defaults for security)
-    const workerSecret = process.env.WORKER_SECRET;
+    const workerSecret = process.env.WORKER_SECRET?.trim();
 
     if (!cloudRunUrl || !workerSecret) {
       console.error("Missing environment variables: CLOUD_RUN_URL or WORKER_SECRET");

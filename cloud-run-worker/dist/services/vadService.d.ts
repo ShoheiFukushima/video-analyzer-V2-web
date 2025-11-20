@@ -1,5 +1,6 @@
+import { type VADConfig } from '../config/vad.js';
 /**
- * Voice Activity Detection (VAD) Service using Silero VAD v5
+ * Voice Activity Detection (VAD) Service using Silero VAD
  *
  * Detects voice segments in audio files and splits them into chunks
  * for efficient Whisper API processing.
@@ -8,6 +9,8 @@
  * - 40-60% cost reduction by skipping silent portions
  * - Prevents hallucination on silent audio
  * - Enables optimal 10-second chunking for Whisper
+ *
+ * Note: Uses legacy model (NonRealTimeVAD only supports legacy model)
  */
 export interface VoiceSegment {
     /** Start time in seconds */
@@ -32,14 +35,6 @@ export interface AudioChunk {
     filePath: string;
     /** Voice segments within this chunk */
     voiceSegments: VoiceSegment[];
-}
-export interface VADConfig {
-    /** Maximum chunk duration in seconds (default: 10) */
-    maxChunkDuration?: number;
-    /** Minimum speech duration to keep in seconds (default: 0.25) */
-    minSpeechDuration?: number;
-    /** VAD sensitivity (0-1, higher = more sensitive, default: 0.5) */
-    sensitivity?: number;
 }
 export interface VADResult {
     /** Total audio duration in seconds */

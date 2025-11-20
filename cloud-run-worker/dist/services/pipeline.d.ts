@@ -15,9 +15,10 @@ import type { TranscriptionSegment } from '../types/shared.js';
  * @param videoPath - Path to video file
  * @param projectTitle - Project/video title
  * @param transcription - Transcription from whisperService
+ * @param uploadId - Optional upload ID for progress tracking
  * @returns Path to generated Excel file
  */
-export declare function executeIdealPipeline(videoPath: string, projectTitle: string, transcription: TranscriptionSegment[]): Promise<{
+export declare function executeIdealPipeline(videoPath: string, projectTitle: string, transcription: TranscriptionSegment[], uploadId?: string): Promise<{
     excelPath: string;
     stats: ProcessingStats;
 }>;

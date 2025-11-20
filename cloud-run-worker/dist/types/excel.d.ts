@@ -56,6 +56,45 @@ export interface SceneCut {
     timestamp: number;
     /** Detection confidence (FFmpeg threshold: 0.03-0.10) */
     confidence: number;
+    /** Detection source: full frame, ROI, or both (NEW: ROI detection) */
+    source?: 'full_frame' | 'roi_bottom' | 'roi_center' | 'roi_top_left' | 'roi_top_right' | 'both';
+    /** Inferred detection reason based on source (NEW: ROI detection) */
+    detectionReason?: 'scene_change' | 'subtitle_change' | 'text_overlay_change' | 'both';
+}
+/**
+ * ROI (Region of Interest) configuration for targeted scene detection
+ * Enables detection of subtitle/text changes in specific screen regions
+ * Added: 2025-11-14 - MVP implementation (bottom subtitle area)
+ */
+export interface ROIRegion {
+    /** Region identifier (e.g., 'bottom_subtitle', 'center_text', 'top_left_logo') */
+    name: string;
+    /** FFmpeg crop filter syntax: 'width:height:x:y'
+     * Examples:
+     * - Bottom 15%: 'iw:ih*0.15:0:ih*0.85'
+     * - Center 15%: 'iw:ih*0.15:0:ih*0.425'
+     * - Top-left 10%: 'iw*0.25:ih*0.1:0:0'
+     */
+    crop: string;
+    /** Scene detection thresholds for this region (0.0-1.0)
+     * Lower values = more sensitive (e.g., [0.01, 0.015] for subtitle changes)
+     */
+    thresholds: number[];
+    /** Description of what this region detects (optional) */
+    description?: string;
+}
+/**
+ * ROI detection configuration
+ */
+export interface ROIConfig {
+    /** Enable/disable ROI detection (default: false for backward compatibility) */
+    enabled: boolean;
+    /** Array of ROI regions to detect */
+    regions: ROIRegion[];
+    /** Deduplication interval in seconds (default: 0.1s)
+     * Cuts closer than this interval are considered duplicates
+     */
+    deduplicationInterval?: number;
 }
 /**
  * Excel generation options

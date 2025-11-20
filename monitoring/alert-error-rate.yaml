@@ -1,0 +1,38 @@
+displayName: "Cloud Run - High Error Rate"
+documentation:
+  content: |
+    ## エラーレート高騰アラート
+
+    **症状**: Cloud Run サービスのエラー率が5%を超えています
+
+    **影響**: ユーザーのリクエストが失敗し、動画処理が完了できない可能性があります
+
+    **対応手順**:
+    1. Cloud Run ログを確認:
+       ```
+       gcloud run services logs tail video-analyzer-worker --region us-central1 --filter "severity>=ERROR" --limit 100
+       ```
+    2. 最新のデプロイに問題がないか確認
+    3. 必要であればロールバック実施
+    4. エラーパターンを特定し、修正
+  mimeType: text/markdown
+conditions:
+  - displayName: "Error rate > 5%"
+    conditionThreshold:
+      aggregations:
+        - alignmentPeriod: 300s
+          perSeriesAligner: ALIGN_RATE
+          crossSeriesReducer: REDUCE_MEAN
+          groupByFields:
+            - resource.service_name
+      comparison: COMPARISON_GT
+      duration: 300s
+      filter: |
+        resource.type = "cloud_run_revision"
+        AND resource.labels.service_name = "video-analyzer-worker"
+        AND metric.type = "run.googleapis.com/request_count"
+        AND metric.labels.response_code_class != "2xx"
+        AND metric.labels.response_code_class != "3xx"
+      thresholdValue: 0.05
+combiner: OR
+enabled: true

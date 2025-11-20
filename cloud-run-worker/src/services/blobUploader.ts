@@ -1,9 +1,8 @@
-import axios from 'axios';
+import { put } from '@vercel/blob';
 import fs from 'fs';
 import path from 'path';
 
 const blobToken = process.env.BLOB_READ_WRITE_TOKEN;
-const blobApiUrl = 'https://blob.vercelusercontent.com';
 
 export const uploadResultFile = async (
   filePath: string,
@@ -16,41 +15,45 @@ export const uploadResultFile = async (
       throw new Error(`File not found: ${filePath}`);
     }
 
+    if (!blobToken) {
+      throw new Error('BLOB_READ_WRITE_TOKEN is not set');
+    }
+
     const fileName = `${uploadId}_analysis.xlsx`;
     const fileContent = fs.readFileSync(filePath);
 
-    // Upload to Vercel Blob
-    const response = await axios.post(
-      `${blobApiUrl}/upload?filename=${encodeURIComponent(fileName)}`,
-      fileContent,
-      {
-        headers: {
-          Authorization: `Bearer ${blobToken}`,
-          'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        },
-        timeout: 30000,
-      }
-    );
+    // Upload to Vercel Blob using official SDK
+    const blob = await put(fileName, fileContent, {
+      access: 'public',
+      token: blobToken,
+      contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    });
 
-    if (!response.data.url) {
-      throw new Error('No URL returned from blob upload');
-    }
+    console.log(`[${uploadId}] File uploaded successfully: ${blob.url}`);
 
-    const resultUrl = response.data.url;
-    console.log(`[${uploadId}] File uploaded: ${resultUrl}`);
-
-    return resultUrl;
+    return blob.url;
 
   } catch (error) {
-    console.error(`[${uploadId}] Upload error:`, error);
+    console.error(`[${uploadId}] Upload error:`, {
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      type: error instanceof Error ? error.constructor.name : typeof error,
+    });
 
-    // Fallback: Create a data URL (for testing/development)
+    // Production: Throw error (do not use fallback)
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        `Failed to upload result file to Vercel Blob: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+
+    // Development only: Fallback to data URL
+    console.warn(`[${uploadId}] DEVELOPMENT MODE: Using fallback data URL`);
     const fileName = path.basename(filePath);
     const fileContent = fs.readFileSync(filePath);
     const base64 = fileContent.toString('base64');
     const dataUrl = `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${base64}`;
 
-    console.log(`[${uploadId}] Using fallback data URL (development only)`);
     return dataUrl;
   }
 };

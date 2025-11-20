@@ -1,32 +1,15 @@
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import { fileURLToPath } from 'url';
 import { NonRealTimeVAD } from 'avr-vad';
 import { extractAudioChunk as extractChunkWithFFmpeg } from './audioExtractor.js';
 import ffmpeg from 'fluent-ffmpeg';
+import { DEFAULT_VAD_CONFIG, WHISPER_COST } from '../config/vad.js';
+import { validateFilePath } from '../utils/security.js';
+import { TIMEOUTS } from '../config/timeouts.js';
 // Get __dirname equivalent in ES modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DEFAULT_CONFIG = {
-    maxChunkDuration: 10, // 10-second chunks for Whisper
-    minSpeechDuration: 0.25, // Filter out very short segments
-    sensitivity: 0.5, // Balanced sensitivity
-};
-/**
- * Validate file path to prevent path traversal attacks
- *
- * @param filePath - Path to validate
- * @throws Error if path is outside allowed directory
- */
-function validateFilePath(filePath) {
-    const normalizedPath = path.resolve(filePath);
-    const allowedDir = path.resolve(os.tmpdir());
-    if (!normalizedPath.startsWith(allowedDir)) {
-        throw new Error(`Invalid file path: must be within ${allowedDir}. ` +
-            `Attempted path: ${normalizedPath}`);
-    }
-}
 /**
  * Process audio file with VAD and split into chunks
  *
@@ -49,7 +32,8 @@ export async function processAudioWithVAD(audioPath, outputDir, config = {}) {
     // Validate file paths (security)
     validateFilePath(audioPath);
     validateFilePath(outputDir);
-    const finalConfig = { ...DEFAULT_CONFIG, ...config };
+    // Use centralized VAD configuration
+    const finalConfig = { ...DEFAULT_VAD_CONFIG, ...config };
     console.log(`[VAD] Starting voice activity detection: ${path.basename(audioPath)}`);
     console.log(`[VAD] Config:`, finalConfig);
     // Create output directory
@@ -59,7 +43,33 @@ export async function processAudioWithVAD(audioPath, outputDir, config = {}) {
     console.log(`[VAD] Detected ${voiceSegments.length} voice segments`);
     // Filter out very short segments
     const filteredSegments = voiceSegments.filter(seg => seg.duration >= finalConfig.minSpeechDuration);
+    // Log excluded segments for analysis
+    const excludedCount = voiceSegments.length - filteredSegments.length;
     console.log(`[VAD] After filtering: ${filteredSegments.length} segments (min ${finalConfig.minSpeechDuration}s)`);
+    if (excludedCount > 0) {
+        console.log(`[VAD] ⚠️ Excluded ${excludedCount} short segments (<${finalConfig.minSpeechDuration}s):`);
+        const excludedSegments = voiceSegments.filter(seg => seg.duration < finalConfig.minSpeechDuration);
+        // Show first 5 excluded segments for debugging
+        const samplesToShow = Math.min(5, excludedSegments.length);
+        for (let i = 0; i < samplesToShow; i++) {
+            const seg = excludedSegments[i];
+            console.log(`[VAD]   - ${seg.startTime.toFixed(2)}s~${seg.endTime.toFixed(2)}s (${seg.duration.toFixed(2)}s)`);
+        }
+        if (excludedSegments.length > samplesToShow) {
+            console.log(`[VAD]   ... and ${excludedSegments.length - samplesToShow} more`);
+        }
+        // Calculate statistics
+        const totalExcludedDuration = excludedSegments.reduce((sum, seg) => sum + seg.duration, 0);
+        const avgExcludedDuration = totalExcludedDuration / excludedSegments.length;
+        console.log(`[VAD] 📊 Excluded segments statistics:`);
+        console.log(`[VAD]   - Total excluded duration: ${totalExcludedDuration.toFixed(2)}s`);
+        console.log(`[VAD]   - Average excluded duration: ${avgExcludedDuration.toFixed(2)}s`);
+        console.log(`[VAD]   - Shortest excluded: ${Math.min(...excludedSegments.map(s => s.duration)).toFixed(2)}s`);
+        console.log(`[VAD]   - Longest excluded: ${Math.max(...excludedSegments.map(s => s.duration)).toFixed(2)}s`);
+    }
+    else {
+        console.log(`[VAD] ✓ No segments excluded (all segments >= ${finalConfig.minSpeechDuration}s)`);
+    }
     // Split into chunks
     const audioChunks = await splitIntoChunks(audioPath, filteredSegments, outputDir, finalConfig.maxChunkDuration);
     // Calculate statistics
@@ -68,9 +78,9 @@ export async function processAudioWithVAD(audioPath, outputDir, config = {}) {
         : 0;
     const totalVoiceDuration = filteredSegments.reduce((sum, seg) => sum + seg.duration, 0);
     const voiceRatio = totalDuration > 0 ? totalVoiceDuration / totalDuration : 0;
-    // Estimated cost savings (Whisper API pricing: ~$0.006/min)
-    const fullAudioCost = (totalDuration / 60) * 0.006;
-    const vadAudioCost = (totalVoiceDuration / 60) * 0.006;
+    // Estimated cost savings (Whisper API pricing)
+    const fullAudioCost = (totalDuration / 60) * WHISPER_COST.PER_MINUTE;
+    const vadAudioCost = (totalVoiceDuration / 60) * WHISPER_COST.PER_MINUTE;
     const estimatedSavings = ((fullAudioCost - vadAudioCost) / fullAudioCost) * 100;
     const result = {
         totalDuration,
@@ -95,10 +105,12 @@ export async function processAudioWithVAD(audioPath, outputDir, config = {}) {
  * @returns Float32Array of audio samples at 16kHz mono
  */
 async function loadAudioAsFloat32Array(audioPath) {
+    console.log(`[VAD] [PCM] Starting PCM conversion: ${path.basename(audioPath)}`);
     return new Promise((resolve, reject) => {
         const pcmPath = audioPath.replace(/\.[^/.]+$/, '.pcm');
-        // Timeout configuration (2 minutes)
-        const TIMEOUT_MS = 120000;
+        console.log(`[VAD] [PCM] Output path: ${path.basename(pcmPath)}`);
+        const TIMEOUT_MS = TIMEOUTS.PCM_CONVERSION;
+        console.log(`[VAD] [PCM] Timeout: ${TIMEOUT_MS}ms (${TIMEOUT_MS / 1000}s)`);
         // Convert audio to raw PCM (16kHz mono, 16-bit signed integer)
         const command = ffmpeg(audioPath)
             .audioCodec('pcm_s16le')
@@ -120,37 +132,45 @@ async function loadAudioAsFloat32Array(audioPath) {
             reject(new Error(`PCM conversion timed out after ${TIMEOUT_MS}ms`));
         }, TIMEOUT_MS);
         command
+            .on('start', (commandLine) => {
+            console.log(`[VAD] [PCM] FFmpeg command: ${commandLine}`);
+        })
             .on('end', async () => {
             if (isTimedOut)
                 return;
             try {
+                console.log(`[VAD] [PCM] ✓ FFmpeg conversion complete`);
                 // Read PCM file as buffer
                 const buffer = await fs.promises.readFile(pcmPath);
+                console.log(`[VAD] [PCM] ✓ Read PCM buffer: ${buffer.length} bytes`);
                 // Convert 16-bit PCM to Float32Array (-1.0 to 1.0)
                 const samples = new Float32Array(buffer.length / 2);
                 for (let i = 0; i < samples.length; i++) {
                     const sample = buffer.readInt16LE(i * 2);
                     samples[i] = sample / 32768.0; // Normalize to -1.0 ~ 1.0
                 }
+                console.log(`[VAD] [PCM] ✓ Converted to Float32Array: ${samples.length} samples`);
                 // Cleanup PCM file
                 clearTimeout(timeoutId);
                 try {
                     await fs.promises.unlink(pcmPath);
-                    console.log(`[VAD] PCM file cleaned up: ${path.basename(pcmPath)}`);
+                    console.log(`[VAD] [PCM] ✓ Cleanup complete: ${path.basename(pcmPath)}`);
                 }
                 catch (cleanupError) {
-                    console.warn(`[VAD] Failed to cleanup PCM file (${path.basename(pcmPath)}):`, cleanupError instanceof Error ? cleanupError.message : cleanupError);
+                    console.warn(`[VAD] [PCM] ⚠️ Failed to cleanup PCM file (${path.basename(pcmPath)}):`, cleanupError instanceof Error ? cleanupError.message : cleanupError);
                 }
                 resolve(samples);
             }
             catch (error) {
                 clearTimeout(timeoutId);
+                console.error(`[VAD] [PCM] ✗ Post-processing failed:`, error);
                 reject(error);
             }
         })
             .on('error', (error) => {
             clearTimeout(timeoutId);
             if (!isTimedOut) {
+                console.error(`[VAD] [PCM] ✗ FFmpeg error:`, error.message);
                 reject(new Error(`Failed to convert audio to PCM: ${error.message}`));
             }
         });
@@ -165,41 +185,86 @@ async function loadAudioAsFloat32Array(audioPath) {
  * @returns Detected voice segments
  */
 async function detectVoiceSegments(audioPath, config) {
-    console.log(`[VAD] Loading audio for VAD processing...`);
+    console.log(`[VAD] ═══════ STARTING VAD DETECTION ═══════`);
+    console.log(`[VAD] Audio file: ${path.basename(audioPath)}`);
+    console.log(`[VAD] Config: sensitivity=${config.sensitivity}, minSpeechDuration=${config.minSpeechDuration}s`);
     // Load audio as Float32Array
-    const audioData = await loadAudioAsFloat32Array(audioPath);
-    console.log(`[VAD] Audio loaded: ${audioData.length} samples (${(audioData.length / 16000).toFixed(2)}s)`);
-    // Initialize VAD with custom model fetcher for Node.js environment
-    console.log(`[VAD] Initializing VAD with Silero model...`);
-    // Resolve model path relative to this compiled file
-    // In development: cloud-run-worker/dist/services/vadService.js
-    // Model location: cloud-run-worker/node_modules/avr-vad/silero_vad_legacy.onnx
-    const modelPath = path.resolve(__dirname, '../../node_modules/avr-vad/silero_vad_legacy.onnx');
-    console.log(`[VAD] Model path: ${modelPath}`);
-    // Verify model file exists
-    if (!fs.existsSync(modelPath)) {
-        throw new Error(`VAD model file not found: ${modelPath}. ` +
-            `Please ensure avr-vad is installed correctly.`);
+    let audioData;
+    try {
+        console.log(`[VAD] Step 1/3: Loading audio for VAD processing...`);
+        audioData = await loadAudioAsFloat32Array(audioPath);
+        console.log(`[VAD] ✓ Step 1/3: Audio loaded: ${audioData.length} samples (${(audioData.length / 16000).toFixed(2)}s)`);
     }
-    const vad = await NonRealTimeVAD.new({
-        positiveSpeechThreshold: config.sensitivity,
-        negativeSpeechThreshold: config.sensitivity * 0.7, // Lower threshold for end
-        modelFetcher: async () => {
-            console.log(`[VAD] Loading model from filesystem: ${path.basename(modelPath)}`);
-            const buffer = await fs.promises.readFile(modelPath);
-            // Return ArrayBuffer (avr-vad expects ArrayBuffer)
-            return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
-        },
-    });
-    console.log(`[VAD] VAD initialized successfully`);
-    const segments = [];
+    catch (loadError) {
+        console.error(`[VAD] ✗ Step 1/3: Failed to load audio:`, loadError);
+        throw loadError;
+    }
+    // Initialize VAD with Silero VAD legacy model (NonRealTimeVAD requires legacy model)
+    let vad;
+    try {
+        console.log(`[VAD] Step 2/3: Initializing VAD with Silero legacy model...`);
+        // Resolve model path - use legacy model (NonRealTimeVAD only supports legacy)
+        const modelPath = path.resolve(__dirname, '../../node_modules/avr-vad/silero_vad_legacy.onnx');
+        console.log(`[VAD] Model path: ${modelPath}`);
+        // Verify model file exists
+        if (!fs.existsSync(modelPath)) {
+            throw new Error(`VAD legacy model file not found: ${modelPath}. ` +
+                `Please ensure avr-vad is installed correctly with legacy model.`);
+        }
+        vad = await NonRealTimeVAD.new({
+            positiveSpeechThreshold: config.sensitivity,
+            negativeSpeechThreshold: config.sensitivity * 0.7, // Lower threshold for end
+            modelFetcher: async () => {
+                console.log(`[VAD] Loading legacy model from filesystem: ${path.basename(modelPath)}`);
+                const buffer = await fs.promises.readFile(modelPath);
+                // Return ArrayBuffer (avr-vad expects ArrayBuffer)
+                return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+            },
+        });
+        console.log(`[VAD] ✓ Step 2/3: VAD initialized successfully`);
+    }
+    catch (vadInitError) {
+        console.error(`[VAD] ✗ Step 2/3: Failed to initialize VAD:`, vadInitError);
+        throw vadInitError;
+    }
     // Process audio and collect speech segments
-    for await (const speechData of vad.run(audioData, 16000)) {
-        segments.push({
-            startTime: speechData.start / 1000, // Convert ms to seconds
-            endTime: speechData.end / 1000,
-            duration: (speechData.end - speechData.start) / 1000,
-            confidence: 0.9, // VAD doesn't provide probability per segment
+    const segments = [];
+    try {
+        console.log(`[VAD] Step 3/3: Running VAD inference on ${audioData.length} samples...`);
+        let segmentCount = 0;
+        for await (const speechData of vad.run(audioData, 16000)) {
+            segments.push({
+                startTime: speechData.start / 1000, // Convert ms to seconds
+                endTime: speechData.end / 1000,
+                duration: (speechData.end - speechData.start) / 1000,
+                confidence: 0.9, // VAD doesn't provide probability per segment
+            });
+            segmentCount++;
+            // Log progress every 10 segments
+            if (segmentCount % 10 === 0) {
+                console.log(`[VAD] ... detected ${segmentCount} segments so far`);
+            }
+        }
+        console.log(`[VAD] ✓ Step 3/3: VAD inference complete - detected ${segments.length} segments`);
+    }
+    catch (vadRunError) {
+        console.error(`[VAD] ✗ Step 3/3: Failed during VAD inference:`, vadRunError);
+        throw vadRunError;
+    }
+    // VAD detection statistics (added 2025-11-12 for diagnosis)
+    console.log(`[VAD] 🔍 Raw segments detected (before filtering): ${segments.length}`);
+    if (segments.length > 0) {
+        const durationsHistogram = [
+            { range: '0.00-0.10s', count: segments.filter(s => s.duration < 0.1).length },
+            { range: '0.10-0.25s', count: segments.filter(s => s.duration >= 0.1 && s.duration < 0.25).length },
+            { range: '0.25-0.50s', count: segments.filter(s => s.duration >= 0.25 && s.duration < 0.5).length },
+            { range: '0.50-1.00s', count: segments.filter(s => s.duration >= 0.5 && s.duration < 1.0).length },
+            { range: '1.00s+', count: segments.filter(s => s.duration >= 1.0).length },
+        ];
+        console.log(`[VAD] 📊 Duration distribution (before filtering):`);
+        durationsHistogram.forEach(h => {
+            const percentage = segments.length > 0 ? ((h.count / segments.length) * 100).toFixed(1) : '0.0';
+            console.log(`[VAD]   ${h.range}: ${h.count} (${percentage}%)`);
         });
     }
     return segments;
