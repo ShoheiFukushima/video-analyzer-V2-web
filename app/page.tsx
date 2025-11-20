@@ -4,7 +4,7 @@ import { useState } from "react";
 import { SignInButton, SignedIn, SignedOut, UserButton } from "@clerk/nextjs";
 import { VideoUploader } from "./components/VideoUploader";
 import { ProcessingStatus } from "./components/ProcessingStatus";
-import { Upload, Video } from "lucide-react";
+import { Upload, Video, FileText, Zap, Clock } from "lucide-react";
 
 export default function Home() {
   const [uploadId, setUploadId] = useState<string | null>(null);
@@ -20,20 +20,20 @@ export default function Home() {
   };
 
   return (
-    <main className="min-h-screen p-8">
+    <main className="min-h-screen bg-white dark:bg-gray-900">
       {/* Header */}
-      <header className="max-w-6xl mx-auto mb-12">
+      <header className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="bg-indigo-600 p-3 rounded-lg">
-              <Video className="w-8 h-8 text-white" />
+            <div className="bg-indigo-600 p-2 rounded-lg">
+              <FileText className="w-6 h-6 text-white" />
             </div>
             <div>
-              <h1 className="text-3xl font-bold text-gray-900 dark:text-white">
-                Video Analyzer V2
+              <h1 className="text-2xl font-bold text-gray-900 dark:text-white">
+                Video to Sheet
               </h1>
-              <p className="text-sm text-gray-600 dark:text-gray-400">
-                AI-Powered Video Transcription & OCR
+              <p className="text-sm text-gray-500 dark:text-gray-400">
+                動画内容を瞬時にエクセル化
               </p>
             </div>
           </div>
@@ -41,9 +41,14 @@ export default function Home() {
           <div className="flex items-center gap-4">
             <SignedOut>
               <SignInButton mode="modal">
-                <button className="px-6 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors">
-                  Sign In
+                <button className="px-5 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors">
+                  ログイン
                 </button>
+              </SignInButton>
+              <SignInButton mode="modal">
+                <button className="px-5 py-2 bg-indigo-600 text-sm font-medium text-white rounded-lg hover:bg-indigo-700 transition-colors">
+                  無料で始める
+                button>
               </SignInButton>
             </SignedOut>
             <SignedIn>
@@ -54,31 +59,121 @@ export default function Home() {
       </header>
 
       {/* Main Content */}
-      <div className="max-w-6xl mx-auto">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <SignedOut>
-          <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-xl p-12 text-center">
-            <Upload className="w-16 h-16 mx-auto mb-6 text-gray-400" />
-            <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-4">
-              Welcome to Video Analyzer V2
+          {/* Hero Section */}
+          <section className="text-center py-20 sm:py-28">
+            <h2 className="text-4xl sm:text-6xl font-extrabold text-gray-900 dark:text-white leading-tight">
+              面倒な動画の文字起こし、
+              <br />
+              <span className="text-indigo-600">一瞬で完了。</span>
             </h2>
-            <p className="text-gray-600 dark:text-gray-400 mb-8 max-w-2xl mx-auto">
-              Upload your videos and get AI-powered transcription using Whisper and OCR using Gemini Vision.
-              Results are exported to Excel with timestamps, screenshots, and text.
+            <p className="mt-6 max-w-2xl mx-auto text-lg text-gray-600 dark:text-gray-300">
+              動画をアップロードするだけで、含まれるテキスト情報をAIが自動でExcelシートに出力。
+              クライアントへの面倒な資料作成から、あなたを解放します。
             </p>
-            <SignInButton mode="modal">
-              <button className="px-8 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors text-lg font-semibold">
-                Get Started - Sign In
-              </button>
-            </SignInButton>
-          </div>
+            <div className="mt-10">
+              <SignInButton mode="modal">
+                <button className="px-8 py-4 bg-indigo-600 text-lg font-bold text-white rounded-lg hover:bg-indigo-700 transition-transform hover:scale-105">
+                  今すぐ時間を取り戻す
+                </button>
+              </SignInButton>
+              <p className="mt-3 text-sm text-gray-500">アカウント登録は不要です</p>
+            </div>
+          </section>
+
+          {/* Problem Section */}
+          <section className="py-20">
+            <div className="text-center">
+                <p className="font-semibold text-indigo-600">こんなお悩みありませんか？</p>
+                <h3 className="mt-2 text-3xl font-bold text-gray-900 dark:text-white">
+                    その30分、もっと価値のある仕事に
+                </h3>
+            </div>
+            <div className="mt-12 max-w-4xl mx-auto p-8 bg-gray-50 dark:bg-gray-800/50 rounded-2xl border border-gray-200 dark:border-gray-700">
+                <div className="flex flex-col md:flex-row items-center gap-8">
+                    <div className="flex-shrink-0">
+                        <Clock className="w-24 h-24 text-gray-400 dark:text-gray-500"/>
+                    </div>
+                    <div>
+                        <p className="text-lg text-gray-700 dark:text-gray-200">
+                            「納品する動画に使われているテキスト、全部リストアップしてほしい」
+                            <br/><br/>
+                            クライアントや上司からのそんな一言で、再生と一時停止を繰り返し、手作業で文字を打ち込む...。
+                            そんな単純ですが時間のかかる作業に、毎度 <strong className="font-bold text-red-500">30分以上</strong> を奪われていませんか？
+                        </p>
+                        <p className="mt-4 text-gray-600 dark:text-gray-400">
+                            その時間は、本来あなたが集中すべきクリエイティブな作業や、次の企画を考えるための貴重な時間のはずです。
+                        </p>
+                    </div>
+                </div>
+            </div>
+          </section>
+
+          {/* Solution Section */}
+          <section className="py-20">
+            <div className="text-center">
+                <p className="font-semibold text-indigo-600">解決策はシンプル</p>
+                <h3 className="mt-2 text-3xl font-bold text-gray-900 dark:text-white">
+                    たった3ステップで、資料作成が完了
+                </h3>
+            </div>
+            <div className="mt-12 grid grid-cols-1 md:grid-cols-3 gap-8 max-w-5xl mx-auto">
+                {/* Step 1 */}
+                <div className="text-center p-6 border border-gray-200 dark:border-gray-700 rounded-lg">
+                    <div className="flex items-center justify-center w-16 h-16 bg-indigo-100 dark:bg-indigo-900/50 rounded-full mx-auto mb-4">
+                        <Upload className="w-8 h-8 text-indigo-600 dark:text-indigo-400"/>
+                    </div>
+                    <h4 className="text-xl font-semibold text-gray-900 dark:text-white">1. 動画をアップロード</h4>
+                    <p className="mt-2 text-gray-600 dark:text-gray-400">ドラッグ＆ドロップで動画ファイルを選択するだけ。</p>
+                </div>
+                {/* Step 2 */}
+                <div className="text-center p-6 border border-gray-200 dark:border-gray-700 rounded-lg">
+                    <div className="flex items-center justify-center w-16 h-16 bg-indigo-100 dark:bg-indigo-900/50 rounded-full mx-auto mb-4">
+                        <Zap className="w-8 h-8 text-indigo-600 dark:text-indigo-400"/>
+                    </div>
+                    <h4 className="text-xl font-semibold text-gray-900 dark:text-white">2. AIが自動処理</h4>
+                    <p className="mt-2 text-gray-600 dark:text-gray-400">AIが動画を解析し、テキスト情報を正確に抽出します。</p>
+                </div>
+                {/* Step 3 */}
+                <div className="text-center p-6 border border-gray-200 dark:border-gray-700 rounded-lg">
+                    <div className="flex items-center justify-center w-16 h-16 bg-indigo-100 dark:bg-indigo-900/50 rounded-full mx-auto mb-4">
+                        <FileText className="w-8 h-8 text-indigo-600 dark:text-indigo-400"/>
+                    </div>
+                    <h4 className="text-xl font-semibold text-gray-900 dark:text-white">3. Excelをダウンロード</h4>
+                    <p className="mt-2 text-gray-600 dark:text-gray-400">処理が終われば、いつでもExcelファイルをダウンロードできます。</p>
+                </div>
+            </div>
+          </section>
+
+           {/* Final CTA Section */}
+           <section className="py-20 bg-gray-50 dark:bg-gray-800/50 rounded-2xl">
+            <div className="text-center max-w-3xl mx-auto">
+              <h3 className="text-3xl font-bold text-gray-900 dark:text-white">
+                もう面倒な手作業に時間を奪われない
+              </h3>
+              <p className="mt-4 text-lg text-gray-600 dark:text-gray-300">
+                Video to Sheet があれば、動画のレビューと情報共有が劇的にスムーズになります。
+                今すぐその時短効果を体験してください。
+              </p>
+              <div className="mt-8">
+                <SignInButton mode="modal">
+                  <button className="px-8 py-4 bg-indigo-600 text-lg font-bold text-white rounded-lg hover:bg-indigo-700 transition-transform hover:scale-105">
+                    無料で試してみる
+                  </button>
+                </SignInButton>
+              </div>
+            </div>
+          </section>
+
         </SignedOut>
 
         <SignedIn>
-          <div className="grid gap-8">
+          <div className="py-10 grid gap-8">
             {/* Upload Section */}
             <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-xl p-8">
               <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-6">
-                Upload Video
+                動画をアップロード
               </h2>
               <VideoUploader
                 onUploadSuccess={handleUploadSuccess}
@@ -90,7 +185,7 @@ export default function Home() {
             {uploadId && (
               <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-xl p-8">
                 <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-6">
-                  Processing Status
+                  処理ステータス
                 </h2>
                 <ProcessingStatus
                   uploadId={uploadId}
@@ -98,59 +193,13 @@ export default function Home() {
                 />
               </div>
             )}
-
-            {/* Features */}
-            <div className="grid md:grid-cols-3 gap-6 mt-8">
-              <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6">
-                <div className="bg-blue-100 dark:bg-blue-900 w-12 h-12 rounded-lg flex items-center justify-center mb-4">
-                  <svg className="w-6 h-6 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-                  </svg>
-                </div>
-                <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">
-                  Whisper AI
-                </h3>
-                <p className="text-gray-600 dark:text-gray-400 text-sm">
-                  Accurate speech-to-text transcription with timestamps
-                </p>
-              </div>
-
-              <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6">
-                <div className="bg-green-100 dark:bg-green-900 w-12 h-12 rounded-lg flex items-center justify-center mb-4">
-                  <svg className="w-6 h-6 text-green-600 dark:text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                  </svg>
-                </div>
-                <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">
-                  Gemini Vision OCR
-                </h3>
-                <p className="text-gray-600 dark:text-gray-400 text-sm">
-                  Extract text from video frames with AI-powered OCR
-                </p>
-              </div>
-
-              <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6">
-                <div className="bg-purple-100 dark:bg-purple-900 w-12 h-12 rounded-lg flex items-center justify-center mb-4">
-                  <svg className="w-6 h-6 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                  </svg>
-                </div>
-                <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">
-                  Excel Export
-                </h3>
-                <p className="text-gray-600 dark:text-gray-400 text-sm">
-                  Get results in Excel with screenshots and synchronized text
-                </p>
-              </div>
-            </div>
           </div>
         </SignedIn>
       </div>
 
       {/* Footer */}
-      <footer className="max-w-6xl mx-auto mt-16 text-center text-gray-600 dark:text-gray-400 text-sm">
-        <p>© 2025 Video Analyzer V2. Powered by OpenAI Whisper & Google Gemini Vision.</p>
+      <footer className="max-w-7xl mx-auto mt-16 px-4 sm:px-6 lg:px-8 py-8 text-center text-gray-500 text-sm">
+        <p>© 2025 Video to Sheet. All rights reserved.</p>
       </footer>
     </main>
   );
