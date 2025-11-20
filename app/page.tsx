@@ -4,7 +4,8 @@ import { useState } from "react";
 import { SignInButton, SignedIn, SignedOut, UserButton } from "@clerk/nextjs";
 import { VideoUploader } from "./components/VideoUploader";
 import { ProcessingStatus } from "./components/ProcessingStatus";
-import { Upload, Video, FileText, Zap, Clock } from "lucide-react";
+import { FileText, Clock } from "lucide-react";
+import { InteractiveDemo } from "./components/InteractiveDemo";
 
 export default function Home() {
   const [uploadId, setUploadId] = useState<string | null>(null);
@@ -110,41 +111,8 @@ export default function Home() {
             </div>
           </section>
 
-          {/* Solution Section */}
-          <section className="py-20">
-            <div className="text-center">
-                <p className="font-semibold text-indigo-600">解決策はシンプル</p>
-                <h3 className="mt-2 text-3xl font-bold text-gray-900 dark:text-white">
-                    たった3ステップで、資料作成が完了
-                </h3>
-            </div>
-            <div className="mt-12 grid grid-cols-1 md:grid-cols-3 gap-8 max-w-5xl mx-auto">
-                {/* Step 1 */}
-                <div className="text-center p-6 border border-gray-200 dark:border-gray-700 rounded-lg">
-                    <div className="flex items-center justify-center w-16 h-16 bg-indigo-100 dark:bg-indigo-900/50 rounded-full mx-auto mb-4">
-                        <Upload className="w-8 h-8 text-indigo-600 dark:text-indigo-400"/>
-                    </div>
-                    <h4 className="text-xl font-semibold text-gray-900 dark:text-white">1. 動画をアップロード</h4>
-                    <p className="mt-2 text-gray-600 dark:text-gray-400">ドラッグ＆ドロップで動画ファイルを選択するだけ。</p>
-                </div>
-                {/* Step 2 */}
-                <div className="text-center p-6 border border-gray-200 dark:border-gray-700 rounded-lg">
-                    <div className="flex items-center justify-center w-16 h-16 bg-indigo-100 dark:bg-indigo-900/50 rounded-full mx-auto mb-4">
-                        <Zap className="w-8 h-8 text-indigo-600 dark:text-indigo-400"/>
-                    </div>
-                    <h4 className="text-xl font-semibold text-gray-900 dark:text-white">2. AIが自動処理</h4>
-                    <p className="mt-2 text-gray-600 dark:text-gray-400">AIが動画を解析し、テキスト情報を正確に抽出します。</p>
-                </div>
-                {/* Step 3 */}
-                <div className="text-center p-6 border border-gray-200 dark:border-gray-700 rounded-lg">
-                    <div className="flex items-center justify-center w-16 h-16 bg-indigo-100 dark:bg-indigo-900/50 rounded-full mx-auto mb-4">
-                        <FileText className="w-8 h-8 text-indigo-600 dark:text-indigo-400"/>
-                    </div>
-                    <h4 className="text-xl font-semibold text-gray-900 dark:text-white">3. Excelをダウンロード</h4>
-                    <p className="mt-2 text-gray-600 dark:text-gray-400">処理が終われば、いつでもExcelファイルをダウンロードできます。</p>
-                </div>
-            </div>
-          </section>
+          {/* Interactive Demo Section */}
+          <InteractiveDemo />
 
            {/* Final CTA Section */}
            <section className="py-20 bg-gray-50 dark:bg-gray-800/50 rounded-2xl">
