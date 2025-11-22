@@ -1,143 +1,170 @@
 "use client";
 
-import { useState, useRef, DragEvent } from 'react';
-import { FileVideo, FileSpreadsheet, UploadCloud, Loader2 } from 'lucide-react';
+import { useState, useRef, DragEvent, useEffect } from 'react';
+import { FileVideo, FileSpreadsheet, UploadCloud, Loader2, CheckCircle, ArrowRight, RefreshCw } from 'lucide-react';
+import { ImageModal } from './ImageModal';
+import { cn } from '@/lib/utils';
 
 export function InteractiveDemo() {
   const [isDragging, setIsDragging] = useState(false);
   const [isDropped, setIsDropped] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isComplete, setIsComplete] = useState(false);
-  const dragItemRef = useRef<HTMLDivElement | null>(null);
-
-  const handleDragStart = (e: DragEvent<HTMLDivElement>) => {
-    setIsDragging(true);
-    if (dragItemRef.current) {
-      e.dataTransfer.setData('text/plain', dragItemRef.current.id);
-      e.dataTransfer.effectAllowed = 'move';
-    }
-  };
-
-  const handleDragEnd = () => {
-    setIsDragging(false);
-  };
+  const [isModalOpen, setIsModalOpen] = useState(false);
 
   const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault(); 
-  };
-
-  const handleDragEnter = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
-    if (!isDropped) {
-      e.currentTarget.classList.add('bg-indigo-50', 'dark:bg-indigo-900/50', 'border-indigo-500');
-    }
+    setIsDragging(true);
   };
 
   const handleDragLeave = (e: DragEvent<HTMLDivElement>) => {
-    if (!isDropped) {
-        e.currentTarget.classList.remove('bg-indigo-50', 'dark:bg-indigo-900/50', 'border-indigo-500');
-    }
+    e.preventDefault();
+    setIsDragging(false);
   };
 
   const handleDrop = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
+    setIsDragging(false);
     if (isDropped) return;
 
-    e.currentTarget.classList.remove('bg-indigo-50', 'dark:bg-indigo-900/50', 'border-indigo-500');
     setIsDropped(true);
     setIsProcessing(true);
 
     setTimeout(() => {
       setIsProcessing(false);
       setIsComplete(true);
-    }, 3000);
+    }, 2500);
   };
 
   const handleReset = () => {
     setIsDropped(false);
     setIsProcessing(false);
     setIsComplete(false);
-  }
+    setIsModalOpen(false);
+  };
+
+  const handleDownloadClick = (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    setIsModalOpen(true);
+  };
 
   return (
-    <section className="py-20">
-      <div className="text-center">
-          <p className="font-semibold text-indigo-600">サービスを体験</p>
-          <h3 className="mt-2 text-3xl font-bold text-gray-900 dark:text-white">
-              実際の流れをデモで体験
-          </h3>
-          <p className="mt-4 max-w-2xl mx-auto text-gray-600 dark:text-gray-400">
-            下の動画ファイルをドラッグして、アップロードエリアにドロップしてみてください。
-          </p>
-      </div>
-      
-      <div className="mt-12 max-w-4xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-8 items-center">
-        {/* 1. Draggable File */}
-        <div className="flex flex-col items-center justify-center h-full">
-            <p className="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-4">1. 動画ファイル</p>
-            <div
-                id="video-file"
-                ref={dragItemRef}
-                draggable={!isDropped}
-                onDragStart={handleDragStart}
-                onDragEnd={handleDragEnd}
-                className={`flex flex-col items-center justify-center p-6 border-2 border-dashed rounded-lg transition-all ${
-                    isDropped ? 'cursor-not-allowed opacity-30' : 'cursor-grab hover:border-indigo-500 hover:bg-gray-50 dark:hover:bg-gray-800'
-                }`}
-            >
-                <FileVideo className="w-16 h-16 text-blue-500" />
-                <span className="mt-2 text-sm font-medium text-gray-700 dark:text-gray-300">my-video.mp4</span>
+    <>
+      <section className="py-20 md:py-28 bg-background">
+        <div className="container">
+          <div className="max-w-3xl mx-auto text-center">
+            <p className="font-semibold text-primary">サービスを体験</p>
+            <h2 className="mt-2 text-3xl md:text-4xl font-bold tracking-tight">
+              わずか3ステップで完了
+            </h2>
+            <p className="mt-4 text-lg text-muted-foreground">
+              実際の操作をシミュレートして、本サービスのシンプルなプロセスを体験してください。
+            </p>
+          </div>
+
+          <div className="mt-12 relative">
+            {/* Background Lines */}
+            <div className="hidden lg:block absolute top-1/2 left-0 w-full h-px bg-border -translate-y-1/2"></div>
+            
+            <div className="relative grid lg:grid-cols-3 gap-8">
+              {/* Step 1: Upload */}
+              <div className="flex flex-col items-center text-center">
+                <div className="relative">
+                  <div className="w-20 h-20 rounded-full bg-secondary flex items-center justify-center border-4 border-background">
+                    <UploadCloud className="w-10 h-10 text-primary" />
+                  </div>
+                  <div className="absolute top-1/2 left-full ml-4 hidden lg:block">
+                     <ArrowRight className="w-8 h-8 text-muted-foreground" />
+                  </div>
+                </div>
+                <h3 className="mt-4 text-xl font-semibold">1. アップロード</h3>
+                <p className="mt-2 text-muted-foreground">お手元の動画ファイルを<br />ドラッグ＆ドロップ</p>
+              </div>
+
+              {/* Step 2: Process */}
+              <div className="flex flex-col items-center text-center">
+                <div className="relative">
+                  <div className="w-20 h-20 rounded-full bg-secondary flex items-center justify-center border-4 border-background">
+                    <Loader2 className={cn("w-10 h-10 text-primary", isProcessing && "animate-spin")} />
+                  </div>
+                   <div className="absolute top-1/2 left-full ml-4 hidden lg:block">
+                     <ArrowRight className="w-8 h-8 text-muted-foreground" />
+                  </div>
+                </div>
+                <h3 className="mt-4 text-xl font-semibold">2. AIによる解析</h3>
+                <p className="mt-2 text-muted-foreground">AIが動画をシーン分割し、<br />テキストを自動抽出</p>
+              </div>
+
+              {/* Step 3: Download */}
+              <div className="flex flex-col items-center text-center">
+                 <div className="w-20 h-20 rounded-full bg-secondary flex items-center justify-center border-4 border-background">
+                    <FileSpreadsheet className={cn("w-10 h-10 transition-colors", isComplete ? "text-green-500" : "text-primary")} />
+                  </div>
+                <h3 className="mt-4 text-xl font-semibold">3. Excel出力</h3>
+                <p className="mt-2 text-muted-foreground">抽出結果をExcel形式で<br />瞬時にダウンロード</p>
+              </div>
             </div>
-        </div>
-
-        <div className="text-5xl text-center text-gray-400 dark:text-gray-600 hidden md:block">
-            →
-        </div>
-
-        {/* 2. Drop Zone & Result */}
-        <div className="flex flex-col items-center justify-center h-full">
-          <p className="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-4">
-            {isComplete ? '3. Excel出力' : '2. アップロード'}
-          </p>
-          <div
-            onDragOver={handleDragOver}
+          </div>
+          
+          <div 
             onDrop={handleDrop}
-            onDragEnter={handleDragEnter}
+            onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
-            className="w-full h-48 border-2 border-dashed rounded-lg flex items-center justify-center text-center p-4 transition-colors relative"
+            className={cn(
+              "mt-12 w-full max-w-3xl mx-auto h-72 rounded-xl border-2 border-dashed flex flex-col items-center justify-center text-center p-8 transition-all duration-300",
+              isDragging && !isDropped ? "border-primary bg-primary/10" : "border-border",
+              isComplete && "border-green-500/50 bg-green-500/5"
+            )}
           >
             {!isDropped && (
-              <div className="text-gray-500 dark:text-gray-400">
-                <UploadCloud className="w-12 h-12 mx-auto mb-2"/>
-                <p className="font-semibold">ここにドラッグ＆ドロップ</p>
-              </div>
+              <>
+                <div className="w-16 h-16 rounded-full bg-secondary flex items-center justify-center mb-4">
+                  <FileVideo className="w-8 h-8 text-primary" />
+                </div>
+                <h3 className="text-xl font-semibold text-foreground">ここに動画ファイルをドラッグ＆ドロップ</h3>
+                <p className="text-muted-foreground mt-1">シミュレーションを開始します</p>
+              </>
             )}
             
             {isProcessing && (
-              <div className="flex flex-col items-center">
-                <Loader2 className="w-12 h-12 text-indigo-600 animate-spin" />
-                <p className="mt-4 text-gray-600 dark:text-gray-300">AIがテキストを抽出中...</p>
-              </div>
+               <>
+                <Loader2 className="w-16 h-16 text-primary animate-spin" />
+                <p className="mt-4 text-lg font-semibold text-primary">AIがテキストを抽出中...</p>
+                <p className="text-muted-foreground">通常は数分で完了します</p>
+              </>
             )}
 
             {isComplete && (
-              <div className="flex flex-col items-center text-center">
-                  <FileSpreadsheet className="w-16 h-16 text-green-500" />
-                  <span className="my-2 text-sm font-medium text-gray-700 dark:text-gray-300">video-text.xlsx</span>
-                  <button className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700">
+              <>
+                <CheckCircle className="w-16 h-16 text-green-500" />
+                <p className="mt-4 text-lg font-semibold text-green-600 dark:text-green-400">解析が完了しました！</p>
+                <div className="mt-4 flex items-center gap-4">
+                  <button 
+                    onClick={handleDownloadClick}
+                    className="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-green-600 text-white hover:bg-green-600/90 h-10 px-4 py-2"
+                  >
+                    <FileSpreadsheet className="w-4 h-4" />
                     ダウンロード
                   </button>
-              </div>
-            )}
-
-            {(isDropped && !isProcessing) && (
-              <button onClick={handleReset} className="absolute top-2 right-2 text-xs text-gray-500 hover:text-gray-800 dark:hover:text-gray-200">
-                リセット
-              </button>
+                   <button 
+                    onClick={handleReset}
+                    className="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-input bg-background hover:bg-accent hover:text-accent-foreground h-10 px-4 py-2"
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                    リセット
+                  </button>
+                </div>
+              </>
             )}
           </div>
         </div>
-      </div>
-    </section>
+      </section>
+      <ImageModal 
+        isOpen={isModalOpen}
+        onClose={() => setIsModalOpen(false)}
+        imageUrl="/excel-sample.png"
+      />
+    </>
   );
 }
+
