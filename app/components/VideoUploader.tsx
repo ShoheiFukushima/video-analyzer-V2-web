@@ -1,9 +1,11 @@
 "use client";
 
 import { useState, useRef } from "react";
+import { useAuth } from "@clerk/nextjs";
 import { UploadCloud, X, Film, AlertTriangle } from "lucide-react";
 import { upload } from "@vercel/blob/client";
 import { cn } from "@/lib/utils";
+import { checkVideoUploadQuota } from "@/lib/quota";
 
 interface VideoUploaderProps {
   onUploadSuccess: (uploadId: string) => void;
@@ -11,6 +13,7 @@ interface VideoUploaderProps {
 }
 
 export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps) {
+  const { getToken } = useAuth();
   const [file, setFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -56,7 +59,6 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
     const droppedFile = e.dataTransfer.files[0];
     if (!droppedFile) return;
     
-    // Simulating the same validation logic as handleFileSelect
     if (!droppedFile.type.startsWith("video/")) {
       setError("Please select a valid video file.");
       return;
@@ -73,7 +75,6 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
   };
   
   const getErrorMessage = (error: unknown): { message: string; retryable: boolean } => {
-    // ... (error message logic remains the same)
     if (error instanceof Error) {
         const msg = error.message.toLowerCase();
         if (msg.includes('network') || msg.includes('fetch')) return { message: 'Network error. Check connection and retry.', retryable: true };
@@ -96,7 +97,28 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
 
     try {
       const uploadId = `upload_${Date.now()}`;
-      
+
+      // クォータチェック (JWTトークン取得してクロスオリジン認証)
+      try {
+        const token = await getToken();
+        const quotaResult = await checkVideoUploadQuota(token);
+
+        if (!quotaResult.allowed) {
+          setError(
+            `月間クォータを超過しています。\n` +
+            `残り: ${quotaResult.remaining}/${quotaResult.quota}動画\n` +
+            `プラン: ${quotaResult.plan_type}\n\n` +
+            `プランをアップグレードしてください。`
+          );
+          setUploading(false);
+          return;
+        }
+      } catch (quotaError) {
+        console.error('Quota check error:', quotaError);
+        // クォータチェック失敗時は警告を表示して続行
+        console.warn('Proceeding with upload despite quota check failure');
+      }
+
       setProgress(25);
       const newBlob = await upload(fileToUpload.name, fileToUpload, {
         access: 'public',
@@ -104,12 +126,14 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
       });
       setProgress(50);
       
-      await fetch("/api/process", {
+      const res = await fetch("/api/process", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ uploadId, blobUrl: newBlob.url, fileName: fileToUpload.name, dataConsent: true }),
         signal: controller.signal,
       });
+
+      if (!res.ok) throw new Error('Failed to start processing.');
 
       setProgress(100);
       onUploadSuccess(uploadId);
@@ -118,7 +142,6 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
 
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {
-        console.log('Upload cancelled by user');
         setError(null);
       } else {
         const { message } = getErrorMessage(err);
@@ -146,30 +169,30 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
   };
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       <div
         onDrop={handleDrop}
         onDragOver={(e) => handleDragEvent(e, true)}
         onDragEnter={(e) => handleDragEvent(e, true)}
         onDragLeave={(e) => handleDragEvent(e, false)}
         className={cn(
-            "border-2 border-dashed rounded-lg p-8 text-center transition-colors duration-200",
-            disabled || uploading ? "cursor-not-allowed bg-secondary/50 border-border" : "cursor-pointer hover:border-primary hover:bg-primary/5 border-border",
-            isDragging && "border-primary bg-primary/10"
+            "border-2 border-dashed rounded-2xl p-8 text-center transition-all duration-300",
+            disabled || uploading ? "cursor-not-allowed bg-secondary/30 border-border" : "cursor-pointer hover:border-primary/80 hover:bg-primary/10 border-border",
+            isDragging && "border-primary/80 bg-primary/10 scale-105"
         )}
         onClick={() => !disabled && !uploading && fileInputRef.current?.click()}
       >
         <input ref={fileInputRef} type="file" accept="video/*" onChange={handleFileSelect} className="hidden" disabled={disabled || uploading} />
 
         <div className="flex flex-col items-center justify-center gap-4">
-            <div className={cn("w-16 h-16 rounded-full flex items-center justify-center", disabled || uploading ? "bg-muted" : "bg-primary/10")}>
-                <UploadCloud className={cn("w-8 h-8", disabled || uploading ? "text-muted-foreground" : "text-primary")} />
+            <div className={cn("w-20 h-20 rounded-full flex items-center justify-center bg-secondary/50", disabled || uploading ? "bg-muted" : "bg-primary/10")}>
+                <UploadCloud className={cn("w-9 h-9", disabled || uploading ? "text-muted-foreground" : "text-primary")} />
             </div>
             <div>
-                <p className="text-lg font-semibold text-foreground">
+                <p className="text-lg font-medium text-foreground font-serif">
                     Drop your video here or click to browse
                 </p>
-                <p className="text-sm text-muted-foreground">
+                <p className="text-sm text-muted-foreground mt-1">
                     Supports MP4, MOV, AVI (max 500MB)
                 </p>
             </div>
@@ -177,7 +200,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
       </div>
 
       {file && (
-        <div className="bg-card border rounded-lg p-4 flex items-center justify-between gap-4">
+        <div className="bg-secondary/50 border rounded-lg p-4 flex items-center justify-between gap-4">
             <div className="flex items-center gap-3 min-w-0">
                 <Film className="w-6 h-6 text-primary flex-shrink-0" />
                 <div className="text-sm min-w-0">
@@ -187,7 +210,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
             </div>
             <button
                 onClick={uploading ? handleCancel : removeFile}
-                className="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 hover:bg-destructive/10 h-9 w-9"
+                className="inline-flex items-center justify-center whitespace-nowrap rounded-full text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 hover:bg-destructive/10 h-9 w-9"
             >
                 <X className="w-4 h-4 text-destructive" />
             </button>
