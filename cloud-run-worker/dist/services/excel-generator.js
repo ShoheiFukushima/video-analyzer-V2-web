@@ -215,11 +215,41 @@ async function addStatisticsSheet(workbook, rows, videoMetadata) {
         pattern: 'solid',
         fgColor: { argb: 'FF87CEEB' } // Sky blue
     };
+    // Build email body with all statistics
+    const emailBody = [
+        'Video Analyzer V2 - Statistics Report',
+        '',
+        '=== SCENE STATISTICS ===',
+        `Total Scenes: ${totalScenes}`,
+        `Scenes with OCR Text: ${scenesWithOCR}`,
+        `Scenes with Narration: ${scenesWithNarration}`,
+        `OCR Detection Rate: ${ocrRate}%`,
+        `Narration Coverage Rate: ${narrationRate}%`,
+        '',
+        '=== VIDEO METADATA ===',
+        `Video Resolution: ${videoMetadata.width}x${videoMetadata.height}`,
+        `Aspect Ratio: ${videoMetadata.aspectRatio.toFixed(2)}:1`,
+        `Video Duration: ${videoMetadata.duration}s`,
+        '',
+        '=== DETECTION PARAMETERS ===',
+        `Scene Detection Thresholds: 0.025, 0.055, 0.085`,
+        `Min Scene Interval: 1.0s`,
+        `Min Scene Duration: 0.5s`,
+        `Screenshot Capture Position: 50% (mid-point)`,
+        `ROI Detection: Disabled (default)`,
+        '',
+        '=== ADJUSTMENT REQUEST ===',
+        'Please describe your issue or requested changes below:',
+        '',
+        '- Issue: ',
+        '- Requested changes: ',
+        ''
+    ].join('%0A');
     const emailRow = statsSheet.addRow({
         metric: 'Contact Developer',
         value: {
             text: 'Click here to email developer',
-            hyperlink: 'mailto:developer@example.com?subject=Video%20Analyzer%20Adjustment%20Request&body=Please%20adjust%20the%20following%20parameters%3A%0A%0A-%20Video%20ID%3A%20%0A-%20Issue%3A%20%0A-%20Requested%20changes%3A%20'
+            hyperlink: `mailto:syou430@gmail.com?subject=Video%20Analyzer%20Adjustment%20Request&body=${emailBody}`
         }
     });
     // Style the email link

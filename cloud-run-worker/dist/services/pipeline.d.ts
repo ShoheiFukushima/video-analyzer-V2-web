@@ -9,16 +9,17 @@
  * 4. Generate Excel with ideal format (Scene # | Timecode | Screenshot | OCR | NA Text)
  */
 import { ProcessingStats } from '../types/excel.js';
-import type { TranscriptionSegment } from '../types/shared.js';
+import type { TranscriptionSegment, DetectionMode } from '../types/shared.js';
 /**
  * Main pipeline execution
  * @param videoPath - Path to video file
  * @param projectTitle - Project/video title
  * @param transcription - Transcription from whisperService
  * @param uploadId - Optional upload ID for progress tracking
+ * @param detectionMode - Detection mode ('standard' or 'enhanced')
  * @returns Path to generated Excel file
  */
-export declare function executeIdealPipeline(videoPath: string, projectTitle: string, transcription: TranscriptionSegment[], uploadId?: string): Promise<{
+export declare function executeIdealPipeline(videoPath: string, projectTitle: string, transcription: TranscriptionSegment[], uploadId?: string, detectionMode?: DetectionMode): Promise<{
     excelPath: string;
     stats: ProcessingStats;
 }>;

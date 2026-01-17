@@ -29,18 +29,26 @@ app.get('/health', (req, res) => {
 // Process video endpoint
 app.post('/process', validateAuth, async (req, res) => {
     try {
-        const { uploadId, blobUrl, fileName, userId, dataConsent } = req.body;
+        const { uploadId, r2Key, fileName, userId, dataConsent, detectionMode } = req.body;
         // Security: Validate required fields including userId for IDOR protection
-        if (!uploadId || !blobUrl || !userId) {
+        if (!uploadId || !r2Key || !userId) {
             res.status(400).json({
                 error: 'Invalid request',
-                message: 'Missing uploadId, blobUrl, or userId'
+                message: 'Missing uploadId, r2Key, or userId'
             });
             return;
         }
-        console.log(`[${uploadId}] Starting video processing`, { fileName, userId });
+        // Validate detectionMode (default to 'standard' if not provided or invalid)
+        const validModes = ['standard', 'enhanced'];
+        const mode = validModes.includes(detectionMode) ? detectionMode : 'standard';
+        console.log(`[${uploadId}] Starting video processing`, {
+            fileName,
+            userId,
+            r2Key,
+            detectionMode: mode
+        });
         // Start processing asynchronously with userId for access control
-        processVideo(uploadId, blobUrl, fileName, userId, dataConsent)
+        processVideo(uploadId, r2Key, fileName, userId, dataConsent, mode)
             .catch(err => {
             console.error(`[${uploadId}] Processing error:`, err);
         });
@@ -49,7 +57,8 @@ app.post('/process', validateAuth, async (req, res) => {
             success: true,
             uploadId,
             message: 'Video processing started',
-            status: 'processing'
+            status: 'processing',
+            detectionMode: mode
         });
     }
     catch (error) {
@@ -131,7 +140,15 @@ app.get('/result/:uploadId', validateAuth, async (req, res) => {
     }
 });
 // Environment validation
-const requiredEnvVars = ['WORKER_SECRET', 'GEMINI_API_KEY', 'OPENAI_API_KEY'];
+const requiredEnvVars = [
+    'WORKER_SECRET',
+    'GEMINI_API_KEY',
+    'OPENAI_API_KEY',
+    'R2_ACCOUNT_ID',
+    'R2_ACCESS_KEY_ID',
+    'R2_SECRET_ACCESS_KEY',
+    'R2_BUCKET_NAME',
+];
 const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]);
 if (missingEnvVars.length > 0) {
     console.warn('[Cloud Run Worker] Missing environment variables:', missingEnvVars.join(', '));

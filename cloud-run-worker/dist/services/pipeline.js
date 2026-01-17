@@ -10,32 +10,97 @@
  */
 import { extractScenesWithFrames, getVideoMetadata, cleanupFrames } from './ffmpeg.js';
 import { generateExcel, generateExcelFilename } from './excel-generator.js';
+import { formatTimecode } from '../utils/timecode.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import fs from 'fs';
 import { promises as fsPromises } from 'fs';
 import path from 'path';
+import os from 'os';
 import pLimit from 'p-limit';
 import { RateLimiter } from './rateLimiter.js';
 import { ProgressReporter } from './progressReporter.js';
+import { runLuminanceDetection } from './luminanceDetector.js';
+import { processStabilizationPoints } from './textStabilityDetector.js';
+import { updateStatus } from './statusManager.js';
 /**
  * Main pipeline execution
  * @param videoPath - Path to video file
  * @param projectTitle - Project/video title
  * @param transcription - Transcription from whisperService
  * @param uploadId - Optional upload ID for progress tracking
+ * @param detectionMode - Detection mode ('standard' or 'enhanced')
  * @returns Path to generated Excel file
  */
-export async function executeIdealPipeline(videoPath, projectTitle, transcription, uploadId) {
+export async function executeIdealPipeline(videoPath, projectTitle, transcription, uploadId, detectionMode = 'standard') {
     console.log('🎬 Starting Ideal Pipeline Execution');
     console.log(`  📹 Video: ${videoPath}`);
     console.log(`  🎙️ Transcription: ${transcription.length} segments`);
+    console.log(`  🎯 Detection Mode: ${detectionMode}`);
     // Step 1: Extract video metadata
     console.log('\n📐 Step 1: Extracting video metadata...');
     const videoMetadata = await getVideoMetadata(videoPath);
     // Step 2: Scene detection and frame extraction
     console.log('\n🎞️ Step 2: Scene detection and frame extraction...');
-    const scenes = await extractScenesWithFrames(videoPath);
+    let scenes = await extractScenesWithFrames(videoPath);
     console.log(`  ✓ Detected ${scenes.length} scenes`);
+    // Enhanced mode statistics
+    let luminanceTransitionsDetected = 0;
+    let textStabilizationPoints = 0;
+    // Enhanced mode: Additional detection for fade/dissolve transitions
+    if (detectionMode === 'enhanced') {
+        console.log('\n🔦 Step 2.5: Enhanced Mode - Luminance-based detection...');
+        if (uploadId) {
+            await updateStatus(uploadId, {
+                status: 'processing',
+                progress: 55,
+                stage: 'luminance_detection'
+            }).catch(err => console.warn('Failed to update status:', err));
+        }
+        try {
+            // Step 2.5a: Run luminance detection
+            const luminanceResults = await runLuminanceDetection(videoPath);
+            luminanceTransitionsDetected = luminanceResults.stabilizationPoints.length;
+            console.log(`  ✓ Found ${luminanceResults.whiteIntervals.length} white screen intervals`);
+            console.log(`  ✓ Found ${luminanceResults.blackIntervals.length} black screen intervals`);
+            console.log(`  ✓ Found ${luminanceTransitionsDetected} stabilization points`);
+            // Step 2.5b: Process text stabilization if stabilization points were found
+            if (luminanceResults.stabilizationPoints.length > 0) {
+                if (uploadId) {
+                    await updateStatus(uploadId, {
+                        status: 'processing',
+                        progress: 58,
+                        stage: 'text_stabilization'
+                    }).catch(err => console.warn('Failed to update status:', err));
+                }
+                // Create temporary directory for stabilization frames
+                const stabTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'stab-frames-'));
+                try {
+                    const textResults = await processStabilizationPoints(videoPath, luminanceResults.stabilizationPoints, stabTempDir);
+                    textStabilizationPoints = textResults.length;
+                    console.log(`  ✓ Found ${textStabilizationPoints} text stabilization points`);
+                    // Step 2.5c: Merge text stabilization results with existing scenes
+                    if (textResults.length > 0) {
+                        scenes = mergeEnhancedDetectionResults(scenes, textResults);
+                        console.log(`  ✓ Merged enhanced detection: ${scenes.length} total scenes`);
+                    }
+                }
+                finally {
+                    // Cleanup temporary frames
+                    try {
+                        fs.rmSync(stabTempDir, { recursive: true, force: true });
+                    }
+                    catch (e) {
+                        console.warn('  ⚠️ Failed to cleanup stabilization frames:', e);
+                    }
+                }
+            }
+        }
+        catch (enhancedError) {
+            // Enhanced mode errors are non-fatal - continue with standard detection
+            console.warn('\n⚠️ Enhanced mode detection failed, continuing with standard results:');
+            console.warn(`  Error: ${enhancedError instanceof Error ? enhancedError.message : String(enhancedError)}`);
+        }
+    }
     // Step 3: Perform OCR on each scene frame
     console.log('\n🔍 Step 3: Performing OCR on scene frames...');
     const scenesWithRawOCR = await performSceneBasedOCR(scenes, uploadId);
@@ -69,7 +134,10 @@ export async function executeIdealPipeline(videoPath, projectTitle, transcriptio
         scenesWithOCRText: excelRows.filter(r => r.ocrText && r.ocrText.trim().length > 0).length,
         scenesWithNarration: excelRows.filter(r => r.narrationText && r.narrationText.trim().length > 0).length,
         processingTimeMs: 0, // Set by caller
-        videoMetadata
+        videoMetadata,
+        // Enhanced mode statistics (only populated if detectionMode === 'enhanced')
+        luminanceTransitionsDetected: detectionMode === 'enhanced' ? luminanceTransitionsDetected : undefined,
+        textStabilizationPoints: detectionMode === 'enhanced' ? textStabilizationPoints : undefined
     };
     console.log('\n✅ Ideal Pipeline Execution Complete');
     console.log(`  📊 Excel file: ${excelPath}`);
@@ -591,5 +659,67 @@ function convertScenesToExcelRows(scenes) {
         ocrText: scene.ocrText || '',
         narrationText: scene.narrationText || ''
     }));
+}
+/**
+ * Merge Enhanced mode detection results with standard scene detection
+ *
+ * This function:
+ * 1. Creates new scenes from text stabilization results
+ * 2. Filters out overlapping scenes (within 1 second of existing scenes)
+ * 3. Merges and sorts by timestamp
+ * 4. Re-numbers all scenes
+ *
+ * @param existingScenes - Scenes from standard detection
+ * @param textResults - Text stabilization results from Enhanced mode
+ * @returns Merged and sorted scenes
+ */
+function mergeEnhancedDetectionResults(existingScenes, textResults) {
+    const OVERLAP_THRESHOLD = 1.0; // 1 second overlap threshold
+    console.log(`  🔀 Merging ${existingScenes.length} standard scenes with ${textResults.length} enhanced results`);
+    // Create new scenes from text stabilization results
+    const enhancedScenes = textResults.map((result, index) => {
+        // Find a reasonable end time (next scene start or +2 seconds)
+        const nextResult = textResults[index + 1];
+        const endTime = nextResult
+            ? Math.min(nextResult.timestamp, result.timestamp + 2)
+            : result.timestamp + 2;
+        const startTime = result.timestamp;
+        const midTime = (startTime + endTime) / 2;
+        return {
+            sceneNumber: 0, // Will be renumbered
+            startTime,
+            endTime,
+            midTime,
+            timecode: formatTimecode(startTime),
+            screenshotPath: result.framePath, // Use the stabilized frame
+        };
+    });
+    // Filter out enhanced scenes that overlap with existing scenes
+    const nonOverlappingEnhancedScenes = enhancedScenes.filter(enhancedScene => {
+        const overlaps = existingScenes.some(existingScene => {
+            const timeDiff = Math.abs(enhancedScene.startTime - existingScene.startTime);
+            return timeDiff < OVERLAP_THRESHOLD;
+        });
+        if (overlaps) {
+            console.log(`    Skipping enhanced scene at ${enhancedScene.startTime.toFixed(2)}s (overlaps with existing)`);
+        }
+        return !overlaps;
+    });
+    console.log(`    Non-overlapping enhanced scenes: ${nonOverlappingEnhancedScenes.length}`);
+    // Merge all scenes
+    const mergedScenes = [...existingScenes, ...nonOverlappingEnhancedScenes];
+    // Sort by start time
+    mergedScenes.sort((a, b) => a.startTime - b.startTime);
+    // Re-number scenes
+    mergedScenes.forEach((scene, index) => {
+        scene.sceneNumber = index + 1;
+    });
+    // Update end times and midTimes to be consistent (end = next scene start)
+    for (let i = 0; i < mergedScenes.length - 1; i++) {
+        mergedScenes[i].endTime = mergedScenes[i + 1].startTime;
+        mergedScenes[i].midTime = (mergedScenes[i].startTime + mergedScenes[i].endTime) / 2;
+    }
+    console.log(`  ✓ Merged result: ${mergedScenes.length} total scenes`);
+    return mergedScenes;
 }
 //# sourceMappingURL=pipeline.js.map

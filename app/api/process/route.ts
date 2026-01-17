@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
-import { isValidVercelBlobUrl } from "@/lib/blob-url-validator";
+import { isValidR2Key } from "@/lib/r2-client";
 
 export const runtime = "nodejs";
 export const maxDuration = 30; // 30 second timeout for processing request
@@ -27,27 +27,43 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const { uploadId, blobUrl, fileName, dataConsent } = body;
+    const { uploadId, r2Key, fileName, dataConsent, detectionMode } = body;
 
     // Validate required fields
-    if (!uploadId || !blobUrl) {
+    if (!uploadId || !r2Key) {
       return NextResponse.json(
         {
           error: "Invalid request",
-          message: "Missing required fields: uploadId, blobUrl",
+          message: "Missing required fields: uploadId, r2Key",
         },
         { status: 400 }
       );
     }
 
-    // Security: Validate blob URL format with strict hostname checking (SSRF protection)
-    if (!isValidVercelBlobUrl(blobUrl)) {
+    // Validate detectionMode (default to 'standard' if not provided or invalid)
+    const validModes = ['standard', 'enhanced'];
+    const mode = validModes.includes(detectionMode) ? detectionMode : 'standard';
+
+    // Security: Validate R2 key format (SSRF protection)
+    if (!isValidR2Key(r2Key)) {
       return NextResponse.json(
         {
           error: "Invalid request",
-          message: "Invalid Vercel Blob Storage URL. Must be HTTPS from vercel-storage.com domain"
+          message: "Invalid R2 key format"
         },
         { status: 400 }
+      );
+    }
+
+    // Security: Verify that the R2 key belongs to this user
+    if (!r2Key.includes(`/${userId}/`)) {
+      console.warn(`[${uploadId}] User ${userId} attempted to use r2Key: ${r2Key}`);
+      return NextResponse.json(
+        {
+          error: "Forbidden",
+          message: "You do not have permission to process this file"
+        },
+        { status: 403 }
       );
     }
 
@@ -74,6 +90,7 @@ export async function POST(request: NextRequest) {
     // Works for both local development (localhost:8080) and production (Cloud Run)
 
     console.log(`[${uploadId}] Sending processing request to worker: ${cloudRunUrl}`);
+    console.log(`[${uploadId}] Detection mode: ${mode}`);
 
     // Call worker (local or production) - MUST await to ensure request is sent
     const workerResponse = await fetch(`${cloudRunUrl}/process`, {
@@ -84,10 +101,11 @@ export async function POST(request: NextRequest) {
       },
       body: JSON.stringify({
         uploadId,
-        blobUrl,
+        r2Key,
         fileName,
         userId, // Security: Pass userId to Worker for IDOR protection
         dataConsent: dataConsent || false,
+        detectionMode: mode, // Detection mode: 'standard' or 'enhanced'
       }),
       signal: AbortSignal.timeout(25000),
     });
@@ -115,6 +133,7 @@ export async function POST(request: NextRequest) {
       uploadId,
       message: "Video processing started successfully",
       status: "processing",
+      detectionMode: mode,
     });
   } catch (error) {
     console.error("Process endpoint error:", error);

@@ -14,7 +14,10 @@
     "test:coverage": "NODE_OPTIONS=--experimental-vm-modules jest --coverage"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.971.0",
+    "@aws-sdk/s3-request-presigner": "^3.971.0",
     "@google/generative-ai": "^0.24.1",
+    "@libsql/client": "^0.17.0",
     "@supabase/supabase-js": "^2.38.0",
     "@vercel/blob": "^2.0.0",
     "avr-vad": "^1.0.9",

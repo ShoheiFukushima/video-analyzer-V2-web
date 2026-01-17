@@ -5,6 +5,31 @@
  */
 
 // ========================================
+// Detection Mode Types
+// ========================================
+
+/**
+ * Video detection mode
+ * - standard: Fast processing, detects hard cuts only
+ * - enhanced: Better for fades, dissolves, text animations (slower)
+ */
+export type DetectionMode = 'standard' | 'enhanced';
+
+/**
+ * Detection mode descriptions for UI
+ */
+export const DETECTION_MODE_INFO: Record<DetectionMode, { label: string; description: string }> = {
+  standard: {
+    label: 'Standard',
+    description: 'Fast processing, works well for most videos with hard cuts'
+  },
+  enhanced: {
+    label: 'Enhanced',
+    description: 'Better for fades, dissolves, text animations (2-3x processing time)'
+  }
+};
+
+// ========================================
 // Processing Status Types
 // ========================================
 
@@ -17,7 +42,10 @@ export type ProcessingStage =
   | 'audio'
   | 'audio_skipped'
   | 'vad_whisper'
+  | 'luminance_detection'
+  | 'text_stabilization'
   | 'scene_ocr_excel'
+  | 'multi_frame_ocr'
   | 'upload_result'
   | 'completed';
 
@@ -29,7 +57,11 @@ export interface ProcessingMetadata {
   totalScenes?: number;
   scenesWithOCR?: number;
   scenesWithNarration?: number;
-  blobUrl?: string; // Production only - used by /api/download
+  resultR2Key?: string; // Production only - R2 key for result file download
+  blobUrl?: string; // @deprecated - Use resultR2Key instead
+  detectionMode?: DetectionMode;
+  luminanceTransitionsDetected?: number;
+  textStabilizationPoints?: number;
 }
 
 export interface ProcessingStatus {
@@ -189,9 +221,10 @@ export interface PipelineResult {
 
 export interface ProcessVideoRequest {
   uploadId: string;
-  blobUrl: string;
+  r2Key: string;
   fileName: string;
   dataConsent: boolean;
+  detectionMode?: DetectionMode;
 }
 
 export interface ProcessVideoResponse {
@@ -219,7 +252,8 @@ export interface StatusResponse {
 
 export interface ErrorContext {
   uploadId?: string;
-  blobUrl?: string;
+  r2Key?: string;
+  blobUrl?: string; // @deprecated - Use r2Key instead
   operation?: string;
   stage?: string;
   [key: string]: unknown;

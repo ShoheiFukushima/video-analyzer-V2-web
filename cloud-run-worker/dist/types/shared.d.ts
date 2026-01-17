@@ -3,8 +3,21 @@
  *
  * Common types used across frontend and backend to ensure type consistency.
  */
-export type ProcessingStatusType = 'pending' | 'downloading' | 'processing' | 'completed' | 'error';
-export type ProcessingStage = 'downloading' | 'compressing' | 'metadata' | 'audio' | 'audio_skipped' | 'vad_whisper' | 'scene_ocr_excel' | 'ocr_processing' | 'ocr_completed' | 'upload_result' | 'completed';
+/**
+ * Video detection mode
+ * - standard: Fast processing, detects hard cuts only
+ * - enhanced: Better for fades, dissolves, text animations (slower)
+ */
+export type DetectionMode = 'standard' | 'enhanced';
+/**
+ * Detection mode descriptions for UI
+ */
+export declare const DETECTION_MODE_INFO: Record<DetectionMode, {
+    label: string;
+    description: string;
+}>;
+export type ProcessingStatusType = 'pending' | 'processing' | 'completed' | 'error';
+export type ProcessingStage = 'downloading' | 'compressing' | 'metadata' | 'audio' | 'audio_skipped' | 'vad_whisper' | 'luminance_detection' | 'text_stabilization' | 'scene_ocr_excel' | 'multi_frame_ocr' | 'ocr_processing' | 'ocr_completed' | 'upload_result' | 'completed';
 export interface ProcessingMetadata {
     duration: number;
     segmentCount: number;
@@ -13,7 +26,11 @@ export interface ProcessingMetadata {
     totalScenes?: number;
     scenesWithOCR?: number;
     scenesWithNarration?: number;
+    resultR2Key?: string;
     blobUrl?: string;
+    detectionMode?: DetectionMode;
+    luminanceTransitionsDetected?: number;
+    textStabilizationPoints?: number;
 }
 export interface ProcessingStatus {
     uploadId: string;
@@ -137,9 +154,10 @@ export interface PipelineResult {
 }
 export interface ProcessVideoRequest {
     uploadId: string;
-    blobUrl: string;
+    r2Key: string;
     fileName: string;
     dataConsent: boolean;
+    detectionMode?: DetectionMode;
 }
 export interface ProcessVideoResponse {
     success: boolean;
@@ -160,6 +178,7 @@ export interface StatusResponse {
 }
 export interface ErrorContext {
     uploadId?: string;
+    r2Key?: string;
     blobUrl?: string;
     operation?: string;
     stage?: string;

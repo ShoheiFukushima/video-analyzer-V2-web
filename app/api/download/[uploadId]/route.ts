@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
-import { createClient } from "@supabase/supabase-js";
-import { del } from "@vercel/blob";
+import { createClient } from "@libsql/client";
+import { generateDownloadUrl, deleteObject } from "@/lib/r2-client";
 
 export const runtime = "nodejs";
 
@@ -65,56 +65,73 @@ export async function GET(
       });
 
     } else {
-      // Production mode: Download from Vercel Blob via metadata
-      const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-      const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+      // Production mode: Download from R2 via metadata
+      const tursoUrl = process.env.TURSO_DATABASE_URL;
+      const tursoToken = process.env.TURSO_AUTH_TOKEN;
 
-      if (!supabaseUrl || !supabaseServiceKey) {
+      if (!tursoUrl || !tursoToken) {
         return NextResponse.json(
-          { error: "Server configuration error: Missing Supabase credentials" },
+          { error: "Server configuration error: Missing Turso credentials" },
           { status: 500 }
         );
       }
 
-      console.log(`[${uploadId}] [PROD] Fetching metadata from Supabase...`);
+      console.log(`[${uploadId}] [PROD] Fetching metadata from Turso...`);
 
-      const supabase = createClient(supabaseUrl, supabaseServiceKey);
+      const client = createClient({
+        url: tursoUrl,
+        authToken: tursoToken,
+      });
 
       // Security: Get status with user_id verification to prevent IDOR attacks
-      const { data, error } = await supabase
-        .from('processing_status')
-        .select('metadata')
-        .eq('upload_id', uploadId)
-        .eq('user_id', userId) // Critical: Verify ownership
-        .single();
+      const result = await client.execute({
+        sql: 'SELECT metadata FROM processing_status WHERE upload_id = ? AND user_id = ?',
+        args: [uploadId, userId],
+      });
 
-      if (error || !data) {
-        console.error(`[${uploadId}] Failed to fetch metadata:`, error);
+      if (result.rows.length === 0) {
+        console.error(`[${uploadId}] Failed to fetch metadata: No rows found`);
         return NextResponse.json(
           { error: "Upload not found or access denied" },
           { status: 404 }
         );
       }
 
-      const blobUrl = data.metadata?.blobUrl;
+      const metadataStr = result.rows[0].metadata as string | null;
+      const metadata = metadataStr ? JSON.parse(metadataStr) : null;
+      const resultR2Key = metadata?.resultR2Key;
 
-      if (!blobUrl) {
-        console.error(`[${uploadId}] No blobUrl found in metadata`);
+      if (!resultR2Key) {
+        console.error(`[${uploadId}] No resultR2Key found in metadata`);
         return NextResponse.json(
           { error: "Result file not available" },
           { status: 404 }
         );
       }
 
-      console.log(`[${uploadId}] [PROD] Downloading from Vercel Blob...`);
+      // Security: Verify that the R2 key belongs to this user
+      if (!resultR2Key.includes(`/${userId}/`)) {
+        console.warn(`[${uploadId}] User ${userId} attempted to access R2 key: ${resultR2Key}`);
+        return NextResponse.json(
+          { error: "Forbidden" },
+          { status: 403 }
+        );
+      }
 
-      // Download from Vercel Blob
-      const response = await fetch(blobUrl, {
-        signal: AbortSignal.timeout(30000),
+      console.log(`[${uploadId}] [PROD] Generating R2 download URL...`);
+
+      // Generate presigned download URL from R2
+      const downloadUrl = await generateDownloadUrl(resultR2Key, 3600, `result_${uploadId}.xlsx`);
+
+      console.log(`[${uploadId}] [PROD] Downloading from R2...`);
+
+      // Download from R2
+      const response = await fetch(downloadUrl, {
+        signal: AbortSignal.timeout(60000), // 1 minute timeout
       });
 
       if (!response.ok) {
-        console.error(`[${uploadId}] Blob download failed: ${response.status}`);
+        console.error(`[${uploadId}] R2 download failed: ${response.status}`);
         return NextResponse.json(
           { error: "Failed to download result from storage" },
           { status: response.status }
@@ -125,15 +142,17 @@ export async function GET(
       const blob = await response.blob();
       const arrayBuffer = await blob.arrayBuffer();
 
-      // Delete result blob after downloading
-      console.log(`[${uploadId}] [PROD] Deleting result blob...`);
-      try {
-        await del(blobUrl);
-        console.log(`[${uploadId}] [PROD] Result blob deleted successfully`);
-      } catch (error) {
-        console.error(`[${uploadId}] Failed to delete result blob:`, error);
-        // Don't fail the download if cleanup fails
-      }
+      // Delete result from R2 after downloading (async, don't block response)
+      console.log(`[${uploadId}] [PROD] Scheduling R2 object deletion...`);
+      setTimeout(async () => {
+        try {
+          await deleteObject(resultR2Key);
+          console.log(`[${uploadId}] [PROD] R2 object deleted successfully`);
+        } catch (error) {
+          console.error(`[${uploadId}] Failed to delete R2 object:`, error);
+          // Don't fail the download if cleanup fails
+        }
+      }, 5000); // Delete after 5 seconds
 
       console.log(`[${uploadId}] [PROD] Download complete (${blob.size} bytes)`);
 

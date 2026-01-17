@@ -58,6 +58,22 @@ export const TIMEOUTS = {
      * Buffer: 10x typical duration for safety
      */
     AUDIO_PREPROCESSING: 300000, // 5 minutes
+    /**
+     * Luminance detection timeout (2 minutes)
+     *
+     * Used for: FFmpeg signalstats luminance analysis (Enhanced mode)
+     * Typical duration: 20-60 seconds for 10-minute video
+     * Buffer: 2x typical duration for safety
+     */
+    LUMINANCE_DETECTION: 120000, // 2 minutes
+    /**
+     * Text stabilization detection timeout (3 minutes)
+     *
+     * Used for: Frame extraction and OCR for text stability detection (Enhanced mode)
+     * Typical duration: 30-90 seconds depending on stabilization points
+     * Buffer: 2x typical duration for safety
+     */
+    TEXT_STABILIZATION: 180000, // 3 minutes
 };
 /**
  * Get timeout value in seconds (for logging)

@@ -1,56 +1,30 @@
 import dotenv from 'dotenv';
-import { createClient } from '@supabase/supabase-js';
+import { createClient } from '@libsql/client';
 // Load environment variables
 dotenv.config();
-// Determine if Supabase should be used
-// Use Supabase in production, or when explicitly enabled
-const USE_SUPABASE = process.env.NODE_ENV === 'production' || process.env.USE_SUPABASE === 'true';
+// Determine if Turso should be used
+// Use Turso in production, or when explicitly enabled
+const USE_TURSO = process.env.NODE_ENV === 'production' || process.env.USE_TURSO === 'true';
 // In-memory status storage (development mode only)
 const inMemoryStatusMap = new Map();
-// Supabase client (production mode only)
-let supabase = null;
-// Initialize Supabase client if enabled
-if (USE_SUPABASE) {
-    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
-        throw new Error('Missing required Supabase environment variables: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY');
+// Turso client (production mode only)
+let turso = null;
+// Initialize Turso client if enabled
+if (USE_TURSO) {
+    if (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN) {
+        throw new Error('Missing required Turso environment variables: TURSO_DATABASE_URL, TURSO_AUTH_TOKEN');
     }
-    supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
-    console.log('[StatusManager] Supabase mode enabled');
+    turso = createClient({
+        url: process.env.TURSO_DATABASE_URL,
+        authToken: process.env.TURSO_AUTH_TOKEN,
+    });
+    console.log('[StatusManager] Turso mode enabled');
 }
 else {
     console.log('[StatusManager] In-memory mode enabled (development)');
 }
 /**
- * Enhanced error handler with detailed diagnostics
- */
-function handleSupabaseError(uploadId, operation, error) {
-    console.error(`[${uploadId}] Supabase ${operation} failed:`, {
-        code: error.code,
-        message: error.message,
-        details: error.details,
-        hint: error.hint,
-    });
-    // PGRST205: Schema cache issue
-    if (error.code === 'PGRST205') {
-        throw new Error(`Supabase schema cache error: Table 'processing_status' not found in cache. ` +
-            `Please reload schema in Supabase Dashboard (Settings → API → Reload Schema) ` +
-            `or run: NOTIFY pgrst, 'reload schema'; in SQL Editor`);
-    }
-    // PGRST116: No rows returned
-    if (error.code === 'PGRST116') {
-        throw new Error(`No rows returned for upload_id: ${uploadId}. ` +
-            `Ensure the record exists before calling ${operation}.`);
-    }
-    // RLS violation
-    if (error.code === '42501') {
-        throw new Error(`Permission denied: Row-level security policy violation. ` +
-            `Ensure service_role key is used and RLS policies are configured correctly.`);
-    }
-    // Generic error
-    throw new Error(`Supabase ${operation} failed: ${error.message}`);
-}
-/**
- * Initialize processing status (Dual mode: Supabase or In-memory)
+ * Initialize processing status (Dual mode: Turso or In-memory)
  * @param uploadId - Unique upload identifier
  * @param userId - Clerk user ID for IDOR protection
  */
@@ -58,31 +32,28 @@ export const initStatus = async (uploadId, userId) => {
     const now = new Date().toISOString();
     const status = {
         uploadId,
-        userId, // Security: Store userId for access control
+        userId,
         status: 'pending',
         progress: 0,
         stage: 'downloading',
         startedAt: now,
         updatedAt: now,
     };
-    if (USE_SUPABASE && supabase) {
-        // Supabase mode - store userId for RLS
-        const { data, error } = await supabase
-            .from('processing_status')
-            .upsert({
-            upload_id: uploadId,
-            user_id: userId, // Security: Critical for IDOR protection
-            status: status.status,
-            progress: status.progress,
-            stage: status.stage,
-            started_at: status.startedAt,
-            updated_at: status.updatedAt,
-        })
-            .select()
-            .single();
-        if (error) {
-            handleSupabaseError(uploadId, 'initStatus', error);
-        }
+    if (USE_TURSO && turso) {
+        // Turso mode - INSERT OR REPLACE
+        await turso.execute({
+            sql: `INSERT INTO processing_status
+            (upload_id, user_id, status, progress, current_step, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(upload_id) DO UPDATE SET
+              user_id = excluded.user_id,
+              status = excluded.status,
+              progress = excluded.progress,
+              current_step = excluded.current_step,
+              updated_at = excluded.updated_at`,
+            args: [uploadId, userId, status.status, status.progress, status.stage ?? 'downloading', now, now],
+        });
+        console.log(`[${uploadId}] [Turso] Status initialized for user ${userId}`);
         return status;
     }
     else {
@@ -93,37 +64,58 @@ export const initStatus = async (uploadId, userId) => {
     }
 };
 /**
- * Update processing status (Dual mode: Supabase or In-memory)
+ * Update processing status (Dual mode: Turso or In-memory)
  */
 export const updateStatus = async (uploadId, updates) => {
-    if (USE_SUPABASE && supabase) {
-        // Supabase mode
-        const updatePayload = {
-            updated_at: new Date().toISOString(),
-        };
-        // Map camelCase to snake_case for Supabase
-        if (updates.status)
-            updatePayload.status = updates.status;
-        if (updates.progress !== undefined)
-            updatePayload.progress = updates.progress;
-        if (updates.stage)
-            updatePayload.stage = updates.stage;
-        if (updates.resultUrl)
-            updatePayload.result_url = updates.resultUrl;
-        if (updates.error)
-            updatePayload.error = updates.error;
-        if (updates.metadata)
-            updatePayload.metadata = updates.metadata;
-        const { data, error } = await supabase
-            .from('processing_status')
-            .update(updatePayload)
-            .eq('upload_id', uploadId)
-            .select()
-            .single();
-        if (error) {
-            handleSupabaseError(uploadId, 'updateStatus', error);
+    const now = new Date().toISOString();
+    if (USE_TURSO && turso) {
+        // Build dynamic SET clause
+        const setClauses = ['updated_at = ?'];
+        const args = [now];
+        if (updates.status) {
+            setClauses.push('status = ?');
+            args.push(updates.status);
         }
-        return mapDbRowToStatus(data);
+        if (updates.progress !== undefined) {
+            setClauses.push('progress = ?');
+            args.push(updates.progress);
+        }
+        if (updates.stage) {
+            setClauses.push('current_step = ?'); // Map stage → current_step
+            args.push(updates.stage);
+        }
+        if (updates.resultUrl) {
+            setClauses.push('result_url = ?');
+            args.push(updates.resultUrl);
+        }
+        if (updates.error) {
+            setClauses.push('error_message = ?'); // Map error → error_message
+            args.push(updates.error);
+        }
+        if (updates.metadata) {
+            setClauses.push('metadata = ?');
+            args.push(JSON.stringify(updates.metadata));
+        }
+        // Add upload_id for WHERE clause
+        args.push(uploadId);
+        await turso.execute({
+            sql: `UPDATE processing_status SET ${setClauses.join(', ')} WHERE upload_id = ?`,
+            args,
+        });
+        // Fetch updated record
+        const result = await turso.execute({
+            sql: 'SELECT * FROM processing_status WHERE upload_id = ?',
+            args: [uploadId],
+        });
+        if (result.rows.length === 0) {
+            throw new Error(`[${uploadId}] Status not found in Turso`);
+        }
+        console.log(`[${uploadId}] [Turso] Status updated:`, {
+            status: updates.status,
+            progress: updates.progress,
+            stage: updates.stage,
+        });
+        return mapDbRowToStatus(result.rows[0]);
     }
     else {
         // In-memory mode
@@ -134,7 +126,7 @@ export const updateStatus = async (uploadId, updates) => {
         const updatedStatus = {
             ...currentStatus,
             ...updates,
-            updatedAt: new Date().toISOString(),
+            updatedAt: now,
         };
         inMemoryStatusMap.set(uploadId, updatedStatus);
         console.log(`[${uploadId}] [InMemory] Status updated:`, {
@@ -146,24 +138,18 @@ export const updateStatus = async (uploadId, updates) => {
     }
 };
 /**
- * Get processing status (Dual mode: Supabase or In-memory)
+ * Get processing status (Dual mode: Turso or In-memory)
  */
 export const getStatus = async (uploadId) => {
-    if (USE_SUPABASE && supabase) {
-        // Supabase mode
-        const { data, error } = await supabase
-            .from('processing_status')
-            .select()
-            .eq('upload_id', uploadId)
-            .single();
-        if (error) {
-            if (error.code === 'PGRST116') {
-                // Not found (this is expected)
-                return null;
-            }
-            handleSupabaseError(uploadId, 'getStatus', error);
+    if (USE_TURSO && turso) {
+        const result = await turso.execute({
+            sql: 'SELECT * FROM processing_status WHERE upload_id = ?',
+            args: [uploadId],
+        });
+        if (result.rows.length === 0) {
+            return null;
         }
-        return mapDbRowToStatus(data);
+        return mapDbRowToStatus(result.rows[0]);
     }
     else {
         // In-memory mode
@@ -182,7 +168,7 @@ export const getStatus = async (uploadId) => {
     }
 };
 /**
- * Mark processing as complete (Dual mode: Supabase or In-memory)
+ * Mark processing as complete (Dual mode: Turso or In-memory)
  */
 export const completeStatus = async (uploadId, resultUrl, metadata) => {
     return updateStatus(uploadId, {
@@ -194,7 +180,7 @@ export const completeStatus = async (uploadId, resultUrl, metadata) => {
     });
 };
 /**
- * Mark processing as failed (Dual mode: Supabase or In-memory)
+ * Mark processing as failed (Dual mode: Turso or In-memory)
  */
 export const failStatus = async (uploadId, error) => {
     return updateStatus(uploadId, {
@@ -204,20 +190,24 @@ export const failStatus = async (uploadId, error) => {
     });
 };
 /**
- * Map database row to ProcessingStatus type
+ * Map Turso database row to ProcessingStatus type
+ * Column mapping:
+ * - current_step → stage
+ * - error_message → error
+ * - created_at → startedAt
  */
 function mapDbRowToStatus(row) {
     return {
         uploadId: row.upload_id,
-        userId: row.user_id, // Security: Include userId for access control
+        userId: row.user_id,
         status: row.status,
         progress: row.progress,
-        stage: row.stage,
-        startedAt: row.started_at,
+        stage: row.current_step, // Map current_step → stage
+        startedAt: row.created_at, // Map created_at → startedAt
         updatedAt: row.updated_at,
         resultUrl: row.result_url,
-        metadata: row.metadata,
-        error: row.error,
+        metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
+        error: row.error_message, // Map error_message → error
     };
 }
 //# sourceMappingURL=statusManager.js.map

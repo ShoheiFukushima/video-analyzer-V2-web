@@ -5,7 +5,7 @@ import { getVideoMetadata } from './ffmpeg.js';
 import { uploadResultFile } from './blobUploader.js';
 import { extractAudioForWhisper, hasAudioStream, preprocessAudioForVAD } from './audioExtractor.js';
 import { processAudioWithVADAndWhisper } from './audioWhisperPipeline.js';
-import { deleteBlob } from './blobCleaner.js';
+import { getDownloadUrl, deleteFromR2 } from './r2Client.js';
 import { logCriticalError } from './errorTracking.js';
 import { resultFileMap } from '../index.js';
 import path from 'path';
@@ -50,14 +50,17 @@ async function safeUpdateStatus(uploadId, updates) {
         }
     }
 }
-export const processVideo = async (uploadId, blobUrl, fileName, userId, // Security: User ID for IDOR protection
-dataConsent) => {
+export const processVideo = async (uploadId, r2Key, fileName, userId, // Security: User ID for IDOR protection
+dataConsent, detectionMode = 'standard' // Enhanced mode for fade/dissolve detection
+) => {
     const overallStartTime = Date.now();
-    let blobDeleted = false; // Track if blob has been deleted
+    let r2Deleted = false; // Track if R2 object has been deleted
     let tempDir = null;
     try {
         console.log(`[${uploadId}] ═══════════════════════════════════════════════`);
         console.log(`[${uploadId}] Starting video processing for user ${userId}`);
+        console.log(`[${uploadId}] R2 Key: ${r2Key}`);
+        console.log(`[${uploadId}] Detection mode: ${detectionMode}`);
         // Security: Initialize status with userId for access control
         try {
             await initStatus(uploadId, userId);
@@ -72,19 +75,19 @@ dataConsent) => {
         const videoPath = path.join(tempDir, 'video.mp4');
         const audioPath = path.join(tempDir, 'audio.mp3');
         try {
-            // Ref object to track blob deletion status (passed by reference to helper function)
-            const blobDeletedRef = { value: false };
-            // Step 1: Download video, delete source blob, and compress if needed
-            await downloadAndPrepareVideo(uploadId, blobUrl, videoPath, blobDeletedRef);
-            blobDeleted = blobDeletedRef.value;
+            // Ref object to track R2 deletion status (passed by reference to helper function)
+            const r2DeletedRef = { value: false };
+            // Step 1: Download video from R2, delete source, and compress if needed
+            await downloadAndPrepareVideo(uploadId, r2Key, videoPath, r2DeletedRef, userId);
+            r2Deleted = r2DeletedRef.value;
             // Step 2-3: Extract metadata and audio
             const { videoMetadata, hasAudio } = await extractMetadataAndAudio(uploadId, videoPath, audioPath);
             // Step 4: Perform VAD + Whisper transcription (if audio exists)
             const { transcription, vadStats } = await performTranscription(uploadId, audioPath, hasAudio);
             // Step 5: Execute scene detection, OCR, and Excel generation
-            const { excelPath, stats } = await executeSceneDetectionAndOCR(uploadId, videoPath, fileName, transcription);
+            const { excelPath, stats } = await executeSceneDetectionAndOCR(uploadId, videoPath, fileName, transcription, detectionMode);
             // Step 6: Upload result and complete processing
-            await uploadResultAndComplete(uploadId, excelPath, videoMetadata, transcription, stats, overallStartTime);
+            await uploadResultAndComplete(uploadId, excelPath, videoMetadata, transcription, stats, overallStartTime, detectionMode, userId);
         }
         finally {
             // Cleanup temporary directory
@@ -99,27 +102,27 @@ dataConsent) => {
         await failStatus(uploadId, errorMessage);
     }
     finally {
-        // CRITICAL: Always delete the source blob, even on error
+        // CRITICAL: Always delete the source R2 object, even on error
         // This prevents storage quota exhaustion
-        if (!blobDeleted) {
-            console.log(`[${uploadId}] Attempting final blob cleanup...`);
+        if (!r2Deleted) {
+            console.log(`[${uploadId}] Attempting final R2 cleanup...`);
             try {
-                await deleteBlob(blobUrl);
-                console.log(`[${uploadId}] ✅ Blob deleted in final cleanup`);
+                await deleteFromR2(r2Key);
+                console.log(`[${uploadId}] ✅ R2 object deleted in final cleanup`);
             }
             catch (deleteError) {
-                // Ignore 404 errors (blob already deleted)
+                // Ignore 404 errors (object already deleted)
                 const errorMessage = deleteError instanceof Error ? deleteError.message : String(deleteError);
-                if (errorMessage.includes('404') || errorMessage.includes('not found')) {
-                    console.log(`[${uploadId}] ℹ️  Blob already deleted (404), skipping`);
+                if (errorMessage.includes('404') || errorMessage.includes('not found') || errorMessage.includes('NoSuchKey')) {
+                    console.log(`[${uploadId}] ℹ️  R2 object already deleted (404), skipping`);
                 }
                 else {
-                    console.error(`[${uploadId}] ❌ CRITICAL: Failed to delete blob in final cleanup:`, deleteError);
+                    console.error(`[${uploadId}] ❌ CRITICAL: Failed to delete R2 object in final cleanup:`, deleteError);
                     // Log to error tracking service (Cloud Monitoring)
                     logCriticalError(deleteError instanceof Error ? deleteError : new Error(String(deleteError)), {
                         uploadId,
-                        blobUrl,
-                        operation: 'blob_cleanup',
+                        r2Key,
+                        operation: 'r2_cleanup',
                         stage: 'final_cleanup',
                     });
                 }
@@ -128,29 +131,33 @@ dataConsent) => {
     }
 };
 /**
- * Download video, delete source blob, and compress if needed
+ * Download video from R2, delete source, and compress if needed
  *
  * @param uploadId - Upload ID for logging
- * @param blobUrl - Source video Blob URL
+ * @param r2Key - Source video R2 key
  * @param videoPath - Destination path for video
- * @param blobDeleted - Ref object to track blob deletion status
+ * @param r2Deleted - Ref object to track R2 deletion status
+ * @param userId - User ID for logging
  * @returns void
  */
-async function downloadAndPrepareVideo(uploadId, blobUrl, videoPath, blobDeleted) {
-    // Step 1: Download video
-    await safeUpdateStatus(uploadId, { status: 'downloading', progress: 10, stage: 'downloading' });
-    await timeStep(uploadId, 'Download Video', async () => {
-        await downloadFile(blobUrl, videoPath, uploadId, { start: 10, end: 20 });
+async function downloadAndPrepareVideo(uploadId, r2Key, videoPath, r2Deleted, userId) {
+    // Step 1: Get presigned URL and download video from R2
+    await safeUpdateStatus(uploadId, { status: 'processing', progress: 10, stage: 'downloading' });
+    await timeStep(uploadId, 'Download Video from R2', async () => {
+        // Get presigned download URL from R2
+        const downloadUrl = await getDownloadUrl(r2Key);
+        console.log(`[${uploadId}] Generated R2 presigned URL for download`);
+        await downloadFile(downloadUrl, videoPath, uploadId, { start: 10, end: 20 });
     });
-    // Delete source video blob after successful download (early cleanup)
+    // Delete source video from R2 after successful download (early cleanup)
     try {
-        await timeStep(uploadId, 'Delete Source Blob', async () => {
-            await deleteBlob(blobUrl);
-            blobDeleted.value = true;
+        await timeStep(uploadId, 'Delete Source from R2', async () => {
+            await deleteFromR2(r2Key);
+            r2Deleted.value = true;
         });
     }
     catch (deleteError) {
-        console.warn(`[${uploadId}] ⚠️  Failed to delete blob (will retry in finally):`, deleteError);
+        console.warn(`[${uploadId}] ⚠️  Failed to delete R2 object (will retry in finally):`, deleteError);
     }
     // Step 1.5: Compress video if needed
     await safeUpdateStatus(uploadId, {
@@ -257,13 +264,14 @@ async function performTranscription(uploadId, audioPath, hasAudio) {
  * @param videoPath - Path to video file
  * @param fileName - Original file name
  * @param transcription - Transcription segments
+ * @param detectionMode - Detection mode ('standard' or 'enhanced')
  * @returns Object containing Excel path and pipeline statistics
  */
-async function executeSceneDetectionAndOCR(uploadId, videoPath, fileName, transcription) {
+async function executeSceneDetectionAndOCR(uploadId, videoPath, fileName, transcription, detectionMode = 'standard') {
     // Step 5: Execute ideal Excel pipeline (Scene detection + OCR + Excel generation)
     await safeUpdateStatus(uploadId, { status: 'processing', progress: 60, stage: 'scene_ocr_excel' });
     const pipelineResult = await timeStep(uploadId, 'Scene Detection + OCR + Excel Generation', async () => {
-        return await executeIdealPipeline(videoPath, fileName, transcription, uploadId);
+        return await executeIdealPipeline(videoPath, fileName, transcription, uploadId, detectionMode);
     });
     return {
         excelPath: pipelineResult.excelPath,
@@ -279,13 +287,15 @@ async function executeSceneDetectionAndOCR(uploadId, videoPath, fileName, transc
  * @param transcription - Transcription segments
  * @param stats - Pipeline statistics
  * @param overallStartTime - Overall processing start time
- * @returns Result URL and Blob URL (if in production)
+ * @param detectionMode - Detection mode used for processing
+ * @param userId - User ID for R2 key generation
+ * @returns Result URL and R2 key (if in production)
  */
-async function uploadResultAndComplete(uploadId, excelPath, videoMetadata, transcription, stats, overallStartTime) {
+async function uploadResultAndComplete(uploadId, excelPath, videoMetadata, transcription, stats, overallStartTime, detectionMode = 'standard', userId = 'system') {
     // Step 9: Upload result file or store locally for development
     await safeUpdateStatus(uploadId, { status: 'processing', progress: 90, stage: 'upload_result' });
     let resultUrl = uploadId; // Initialize with uploadId
-    let resultBlobUrl = null;
+    let resultR2Key = null;
     await timeStep(uploadId, 'Upload Result File', async () => {
         if (process.env.NODE_ENV === 'development') {
             // Development mode: Store file path locally
@@ -296,14 +306,14 @@ async function uploadResultAndComplete(uploadId, excelPath, videoMetadata, trans
             console.log(`[${uploadId}] Result URL (uploadId): ${resultUrl}`);
         }
         else {
-            // Production mode: Upload to Vercel Blob
-            resultBlobUrl = await uploadResultFile(excelPath, uploadId);
-            console.log(`[${uploadId}] Production mode: Uploaded to Blob`);
-            console.log(`[${uploadId}] Blob URL: ${resultBlobUrl}`);
+            // Production mode: Upload to R2
+            resultR2Key = await uploadResultFile(excelPath, uploadId, userId);
+            console.log(`[${uploadId}] Production mode: Uploaded to R2`);
+            console.log(`[${uploadId}] R2 Key: ${resultR2Key}`);
             console.log(`[${uploadId}] Result URL (uploadId): ${resultUrl}`);
         }
     });
-    // Complete with metadata (including resultBlobUrl for production downloads)
+    // Complete with metadata (including resultR2Key for production downloads)
     console.log(`[${uploadId}] Processing completed!`);
     const completionMetadata = {
         duration: videoMetadata.duration,
@@ -313,10 +323,14 @@ async function uploadResultAndComplete(uploadId, excelPath, videoMetadata, trans
         totalScenes: stats.totalScenes,
         scenesWithOCR: stats.scenesWithOCRText,
         scenesWithNarration: stats.scenesWithNarration,
+        detectionMode,
+        // Enhanced mode metadata (populated by pipeline if enhanced mode was used)
+        luminanceTransitionsDetected: stats.luminanceTransitionsDetected,
+        textStabilizationPoints: stats.textStabilizationPoints,
     };
-    // Store resultBlobUrl in metadata for production downloads
-    if (resultBlobUrl) {
-        completionMetadata.blobUrl = resultBlobUrl;
+    // Store resultR2Key in metadata for production downloads
+    if (resultR2Key) {
+        completionMetadata.resultR2Key = resultR2Key;
     }
     // Try to update Supabase status, but don't fail if it errors (dev mode resilience)
     try {
@@ -335,7 +349,7 @@ async function uploadResultAndComplete(uploadId, excelPath, videoMetadata, trans
     console.log(`[${uploadId}] ═══════════════════════════════════════════════`);
     console.log(`[${uploadId}] 🎉 TOTAL PROCESSING TIME: ${overallDuration}s`);
     console.log(`[${uploadId}] ═══════════════════════════════════════════════`);
-    return { resultUrl, resultBlobUrl };
+    return { resultUrl, resultR2Key };
 }
 /**
  * Compress video if file size exceeds 200MB
