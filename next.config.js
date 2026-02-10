@@ -8,6 +8,9 @@ const nextConfig = {
   images: {
     domains: [],
   },
+  env: {
+    NEXT_PUBLIC_BUILD_TIME: new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }),
+  },
 }
 
 module.exports = nextConfig

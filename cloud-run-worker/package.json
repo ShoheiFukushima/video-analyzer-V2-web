@@ -1,12 +1,13 @@
 {
-  "name": "video-analyzer-worker",
+  "name": "video-handoff-worker",
   "version": "1.0.0",
-  "description": "Cloud Run worker for video processing, transcription, and OCR",
+  "description": "Cloud Run worker for Video Handoff - video processing, transcription, and OCR",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc",
+    "prebuild": "node -e \"const fs=require('fs');const d=new Date();fs.writeFileSync('build-info.json',JSON.stringify({buildTime:d.toISOString(),buildTimeJST:d.toLocaleString('ja-JP',{timeZone:'Asia/Tokyo'}),commit:process.env.COMMIT_SHA||'local'},null,2))\"",
+    "build": "./node_modules/.bin/tsc && cp build-info.json dist/",
     "start": "node dist/index.js",
     "local": "npm run build && npm start",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest",
@@ -16,8 +17,10 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.971.0",
     "@aws-sdk/s3-request-presigner": "^3.971.0",
+    "@google-cloud/tasks": "^6.2.1",
     "@google/generative-ai": "^0.24.1",
     "@libsql/client": "^0.17.0",
+    "@smithy/node-http-handler": "^3.0.0",
     "@supabase/supabase-js": "^2.38.0",
     "@vercel/blob": "^2.0.0",
     "avr-vad": "^1.0.9",

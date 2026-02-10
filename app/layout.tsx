@@ -1,15 +1,25 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
+import { Inter, Lora } from "next/font/google";
 import { ClerkProvider } from "@clerk/nextjs";
 import { Providers } from "./providers/QueryProvider";
+import { SessionRecoveryProvider } from "./components/SessionRecoveryProvider";
+import { BuildInfo } from "./components/BuildInfo";
 import "./globals.css";
 import { cn } from "@/lib/utils";
 
-const inter = Inter({ subsets: ["latin"], variable: "--font-sans" });
+const fontSans = Inter({ 
+  subsets: ["latin"], 
+  variable: "--font-sans" 
+});
+
+const fontSerif = Lora({
+  subsets: ["latin"],
+  variable: "--font-serif",
+});
 
 export const metadata: Metadata = {
-  title: "Video Analyzer V2 - AI-Powered Video Transcription & OCR",
-  description: "Upload videos and get AI-powered transcription (Whisper) and OCR (Gemini Vision) in Excel format",
+  title: "Video Handoff - Transform Video into Structured Data",
+  description: "AI-powered video transcription and OCR tool using Whisper and Gemini Vision.",
   icons: {
     icon: [
       { url: '/favicon.svg', type: 'image/svg+xml' },
@@ -33,13 +43,17 @@ export default function RootLayout({
       <body
         className={cn(
           "min-h-screen bg-background font-sans antialiased",
-          inter.variable
+          fontSans.variable,
+          fontSerif.variable
         )}
       >
         <ClerkProvider>
-          <Providers>
-            {children}
-          </Providers>
+          <SessionRecoveryProvider>
+            <Providers>
+              <BuildInfo />
+              {children}
+            </Providers>
+          </SessionRecoveryProvider>
         </ClerkProvider>
       </body>
     </html>
