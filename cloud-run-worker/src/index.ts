@@ -317,8 +317,12 @@ try {
   console.log('[BuildInfo] No build-info.json found, using startup time');
 }
 
-// Health check endpoint with build info
+// Health check endpoint with build info (CORS enabled for frontend)
 app.get('/health', (req: Request, res: Response) => {
+  // Allow cross-origin requests from frontend
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET');
+
   const revision = process.env.K_REVISION || 'local';
   res.json({
     status: 'ok',
