@@ -8,20 +8,24 @@
  * 3. Map narration to scenes based on timestamps
  * 4. Generate Excel with ideal format (Scene # | Timecode | Screenshot | OCR | NA Text)
  */
-import { extractScenesWithFrames, getVideoMetadata, cleanupFrames } from './ffmpeg.js';
+import { extractScenesWithFrames, getVideoMetadata, cleanupFrames, transcodeToProcessingResolution, splitVideoWithOverlap, cleanupChunks, extractFrameAtTime, 
+// Batch processing functions (memory optimization)
+detectScenesOnly, extractFramesForBatch, cleanupBatchFrames, logMemoryUsage, DEFAULT_BATCH_SIZE, } from './ffmpeg.js';
 import { generateExcel, generateExcelFilename } from './excel-generator.js';
 import { formatTimecode } from '../utils/timecode.js';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import fs from 'fs';
 import { promises as fsPromises } from 'fs';
 import path from 'path';
 import os from 'os';
-import pLimit from 'p-limit';
-import { RateLimiter } from './rateLimiter.js';
-import { ProgressReporter } from './progressReporter.js';
+import { getOCRRouter } from './ocrRouter.js';
 import { runLuminanceDetection } from './luminanceDetector.js';
 import { processStabilizationPoints } from './textStabilityDetector.js';
-import { updateStatus } from './statusManager.js';
+import { updatePhaseProgress, completePhase } from './statusManager.js';
+import { detectWithTransNetAndFallback, isTransNetEnabled, validateTransNetInstallation, } from './transnetDetector.js';
+import { detectSupplementarySections, mergeWithTransNetCuts, } from './supplementaryDetector.js';
+import { sendTransNetFailureAlert } from './alertService.js';
+import { setSceneCuts, addCompletedOcrScenes, OCR_CHECKPOINT_INTERVAL, } from './checkpointService.js';
+import { registerOcrProgress, clearOcrProgress } from './emergencyCheckpoint.js';
 /**
  * Main pipeline execution
  * @param videoPath - Path to video file
@@ -29,97 +33,301 @@ import { updateStatus } from './statusManager.js';
  * @param transcription - Transcription from whisperService
  * @param uploadId - Optional upload ID for progress tracking
  * @param detectionMode - Detection mode ('standard' or 'enhanced')
+ * @param checkpoint - Optional checkpoint for resumable processing
  * @returns Path to generated Excel file
  */
-export async function executeIdealPipeline(videoPath, projectTitle, transcription, uploadId, detectionMode = 'standard') {
+export async function executeIdealPipeline(videoPath, projectTitle, transcription, uploadId, detectionMode = 'standard', checkpoint) {
     console.log('🎬 Starting Ideal Pipeline Execution');
     console.log(`  📹 Video: ${videoPath}`);
     console.log(`  🎙️ Transcription: ${transcription.length} segments`);
     console.log(`  🎯 Detection Mode: ${detectionMode}`);
-    // Step 1: Extract video metadata
+    // Helper function for safe phase progress updates
+    const safePhaseProgress = async (phase, phaseProgress, subTask, stage, estimatedTime) => {
+        if (!uploadId)
+            return;
+        try {
+            await updatePhaseProgress(uploadId, phase, phaseProgress, {
+                subTask,
+                stage: stage,
+                estimatedTimeRemaining: estimatedTime,
+            });
+        }
+        catch (err) {
+            console.warn(`Failed to update phase progress: ${err}`);
+        }
+    };
+    // Phase 2 Step 1: Extract video metadata
+    // Phase 2 progress: 0-5%
+    await safePhaseProgress(2, 0, 'Reading video metadata...', 'scene_detection');
     console.log('\n📐 Step 1: Extracting video metadata...');
     const videoMetadata = await getVideoMetadata(videoPath);
-    // Step 2: Scene detection and frame extraction
-    console.log('\n🎞️ Step 2: Scene detection and frame extraction...');
-    let scenes = await extractScenesWithFrames(videoPath);
-    console.log(`  ✓ Detected ${scenes.length} scenes`);
+    await safePhaseProgress(2, 5, 'Starting scene detection...', 'scene_detection', 'About 2-5 min (estimate)');
+    // Phase 2 Step 2: Scene detection
+    // Phase 2 progress: 5-25%
+    // Check if scenes are already cached in checkpoint
+    let scenes = [];
+    const cachedSceneCuts = checkpoint?.sceneCuts || [];
+    const isSceneDetectionComplete = checkpoint?.currentStep === 'ocr' && cachedSceneCuts.length > 0;
+    if (isSceneDetectionComplete) {
+        console.log('\n🎞️ Step 2: Scene detection (CACHED)...');
+        console.log(`  ▶️ Using ${cachedSceneCuts.length} cached scene cuts from checkpoint`);
+        // Convert cached scene cuts to Scene objects
+        scenes = cachedSceneCuts.map((cut, index) => {
+            const nextCut = cachedSceneCuts[index + 1];
+            const startTime = cut.timestamp;
+            const endTime = nextCut ? nextCut.timestamp : videoMetadata.duration;
+            const midTime = (startTime + endTime) / 2;
+            return {
+                sceneNumber: index + 1,
+                startTime,
+                endTime,
+                midTime,
+                timecode: formatTimecode(startTime),
+                screenshotPath: undefined, // Will be extracted later
+            };
+        });
+        await safePhaseProgress(2, 25, `${scenes.length} scenes loaded from checkpoint`, 'frame_extraction');
+    }
+    else {
+        // First, detect scenes only (no frame extraction) for memory optimization
+        console.log('\n🎞️ Step 2: Scene detection...');
+        await safePhaseProgress(2, 10, 'Detecting scenes ...', 'scene_detection');
+        // Progress callback for scene detection (updates UI with current position)
+        const sceneDetectionProgress = async (currentTime, totalDuration, formattedProgress) => {
+            // Calculate progress: 10-25% is scene detection phase
+            const progressPercent = Math.min(24, 10 + Math.floor((currentTime / totalDuration) * 14));
+            await safePhaseProgress(2, progressPercent, `Detecting scenes: ${formattedProgress}`, 'scene_detection');
+        };
+        // Detect scenes without extracting frames (batch processing optimization)
+        const { scenes: detectedScenes } = await detectScenesOnly(videoPath, videoMetadata, sceneDetectionProgress);
+        scenes = detectedScenes;
+        console.log(`  ✓ Detected ${scenes.length} scenes`);
+        // Save scene cuts to checkpoint
+        if (uploadId && checkpoint) {
+            try {
+                const sceneCuts = scenes.map(scene => ({
+                    timestamp: scene.startTime,
+                    confidence: 0.95,
+                    source: 'ffmpeg_standard',
+                }));
+                await setSceneCuts(uploadId, sceneCuts);
+                console.log(`  💾 Saved ${sceneCuts.length} scene cuts to checkpoint`);
+            }
+            catch (err) {
+                console.warn(`  ⚠️ Failed to save scene cuts checkpoint: ${err}`);
+            }
+        }
+    }
+    // Determine if batch processing is needed (for memory optimization)
+    const useBatchProcessing = shouldUseBatchProcessing(scenes.length);
+    if (useBatchProcessing) {
+        console.log(`  📦 Batch processing ENABLED (${scenes.length} scenes > threshold)`);
+        logMemoryUsage('Before batch decision');
+    }
+    else {
+        // For smaller videos, extract frames immediately (traditional approach)
+        console.log(`  ⚡ Traditional processing (${scenes.length} scenes - fast path)`);
+        const framesDir = path.join(os.tmpdir(), `frames-${Date.now()}`);
+        scenes = await extractFramesForBatch(videoPath, scenes, framesDir, videoMetadata);
+    }
+    await safePhaseProgress(2, 25, `${scenes.length} scenes detected`, 'frame_extraction');
     // Enhanced mode statistics
     let luminanceTransitionsDetected = 0;
     let textStabilizationPoints = 0;
-    // Enhanced mode: Additional detection for fade/dissolve transitions
+    let transnetCutsCount = 0;
+    let supplementaryCutsCount = 0;
+    let fallbackUsed = false;
+    // Enhanced mode: TransNet V2 + Supplementary detection
     if (detectionMode === 'enhanced') {
-        console.log('\n🔦 Step 2.5: Enhanced Mode - Luminance-based detection...');
-        if (uploadId) {
-            await updateStatus(uploadId, {
-                status: 'processing',
-                progress: 55,
-                stage: 'luminance_detection'
-            }).catch(err => console.warn('Failed to update status:', err));
-        }
-        try {
-            // Step 2.5a: Run luminance detection
-            const luminanceResults = await runLuminanceDetection(videoPath);
-            luminanceTransitionsDetected = luminanceResults.stabilizationPoints.length;
-            console.log(`  ✓ Found ${luminanceResults.whiteIntervals.length} white screen intervals`);
-            console.log(`  ✓ Found ${luminanceResults.blackIntervals.length} black screen intervals`);
-            console.log(`  ✓ Found ${luminanceTransitionsDetected} stabilization points`);
-            // Step 2.5b: Process text stabilization if stabilization points were found
-            if (luminanceResults.stabilizationPoints.length > 0) {
-                if (uploadId) {
-                    await updateStatus(uploadId, {
-                        status: 'processing',
-                        progress: 58,
-                        stage: 'text_stabilization'
-                    }).catch(err => console.warn('Failed to update status:', err));
-                }
-                // Create temporary directory for stabilization frames
-                const stabTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'stab-frames-'));
+        console.log('\n🚀 Step 2.5: Enhanced Mode V2 - TransNet V2 + Supplementary Detection...');
+        // Check if TransNet V2 is enabled and available
+        const transnetEnabled = isTransNetEnabled();
+        console.log(`  TransNet V2 enabled: ${transnetEnabled}`);
+        if (transnetEnabled) {
+            // Validate TransNet installation
+            const validation = await validateTransNetInstallation();
+            console.log(`  TransNet V2 validation: ${validation.valid ? '✓ Available' : '✗ Not available'}`);
+            if (validation.valid) {
+                // Phase 2 enhanced mode progress: 25-30%
+                await safePhaseProgress(2, 28, 'TransNet V2: Processing video...', 'scene_detection');
                 try {
-                    const textResults = await processStabilizationPoints(videoPath, luminanceResults.stabilizationPoints, stabTempDir);
-                    textStabilizationPoints = textResults.length;
-                    console.log(`  ✓ Found ${textStabilizationPoints} text stabilization points`);
-                    // Step 2.5c: Merge text stabilization results with existing scenes
-                    if (textResults.length > 0) {
-                        scenes = mergeEnhancedDetectionResults(scenes, textResults);
-                        console.log(`  ✓ Merged enhanced detection: ${scenes.length} total scenes`);
+                    // Step 2.5a: Transcode to 720p for faster processing
+                    console.log('\n  📹 Step 2.5a: Transcoding to 720p for processing...');
+                    const processingVideoPath = path.join(os.tmpdir(), `transnet_720p_${Date.now()}.mp4`);
+                    await transcodeToProcessingResolution(videoPath, processingVideoPath, 720);
+                    console.log(`  ✓ Transcoded to 720p: ${processingVideoPath}`);
+                    // Step 2.5b: Split video into chunks for parallel processing
+                    console.log('\n  📦 Step 2.5b: Splitting video into chunks...');
+                    const chunksDir = fs.mkdtempSync(path.join(os.tmpdir(), 'transnet-chunks-'));
+                    const chunks = await splitVideoWithOverlap(processingVideoPath, chunksDir, 60, 10);
+                    console.log(`  ✓ Split into ${chunks.length} chunks (60s each, 10s overlap)`);
+                    // Phase 2 progress: 30%
+                    await safePhaseProgress(2, 30, `TransNet V2: Processing ${chunks.length} chunks...`, 'scene_detection');
+                    // Step 2.5c: Run TransNet V2 with fallback
+                    console.log('\n  🧠 Step 2.5c: Running TransNet V2 detection...');
+                    const transnetResult = await detectWithTransNetAndFallback(processingVideoPath, chunks, 
+                    // FFmpeg fallback function
+                    async (fallbackPath) => {
+                        console.log('  🔄 Falling back to FFmpeg detection...');
+                        const ffmpegScenes = await extractScenesWithFrames(fallbackPath);
+                        return ffmpegScenes.map(scene => ({
+                            timestamp: scene.startTime,
+                            confidence: 0.8,
+                            source: 'ffmpeg_enhanced',
+                        }));
+                    }, 
+                    // Fallback callback for developer notification
+                    async (error) => {
+                        console.warn(`  ⚠️ TransNet V2 failed, sending alert: ${error}`);
+                        await sendTransNetFailureAlert(error, {
+                            uploadId,
+                            fileName: projectTitle,
+                            stage: 'transnet_detection',
+                            error,
+                        });
+                    });
+                    transnetCutsCount = transnetResult.cuts.length;
+                    fallbackUsed = transnetResult.fallbackUsed;
+                    console.log(`  ✓ TransNet detection: ${transnetCutsCount} cuts (fallback: ${fallbackUsed})`);
+                    // Step 2.5d: Run supplementary detection
+                    console.log('\n  🔍 Step 2.5d: Running supplementary detection...');
+                    // Phase 2 progress: 35%
+                    await safePhaseProgress(2, 35, 'Supplementary detection: Analyzing...', 'scene_detection');
+                    const supplementaryResult = await detectSupplementarySections(processingVideoPath);
+                    supplementaryCutsCount = supplementaryResult.cuts.length;
+                    luminanceTransitionsDetected = supplementaryResult.luminanceSections.length;
+                    console.log(`  ✓ Supplementary detection: ${supplementaryCutsCount} cuts`);
+                    console.log(`    - Luminance sections: ${supplementaryResult.luminanceSections.length}`);
+                    console.log(`    - Motion sections: ${supplementaryResult.motionSections.length}`);
+                    // Step 2.5e: Merge all cuts
+                    console.log('\n  🔀 Step 2.5e: Merging detection results...');
+                    const allCuts = mergeWithTransNetCuts(transnetResult.cuts, supplementaryResult.cuts, 0.5);
+                    console.log(`  ✓ Total merged cuts: ${allCuts.length}`);
+                    // Step 2.5f: Convert cuts to scenes (extract frames from ORIGINAL video)
+                    console.log('\n  🎬 Step 2.5f: Converting cuts to scenes with original resolution frames...');
+                    const enhancedScenes = await convertCutsToScenes(allCuts, videoPath, // Use original video for high-quality screenshots
+                    videoMetadata.duration);
+                    // Merge with standard detection or replace
+                    if (enhancedScenes.length > 0) {
+                        scenes = enhancedScenes;
+                        console.log(`  ✓ Enhanced mode produced ${scenes.length} scenes`);
                     }
+                    // Cleanup temporary files
+                    console.log('\n  🧹 Cleaning up temporary files...');
+                    await cleanupChunks(chunks);
+                    await fsPromises.unlink(processingVideoPath).catch(() => { });
+                    await fsPromises.rm(chunksDir, { recursive: true, force: true }).catch(() => { });
+                    console.log('  ✓ Cleanup complete');
                 }
-                finally {
-                    // Cleanup temporary frames
+                catch (transnetError) {
+                    // TransNet mode errors are non-fatal - continue with standard detection
+                    console.warn('\n⚠️ TransNet V2 enhanced mode failed, continuing with standard results:');
+                    console.warn(`  Error: ${transnetError instanceof Error ? transnetError.message : String(transnetError)}`);
+                    // Send failure alert
+                    await sendTransNetFailureAlert(transnetError instanceof Error ? transnetError.message : String(transnetError), { uploadId, fileName: projectTitle, stage: 'transnet_pipeline' }).catch(e => console.warn('Failed to send alert:', e));
+                }
+            }
+            else {
+                console.warn(`  ⚠️ TransNet V2 not available: ${validation.error}`);
+                console.log('  Falling back to legacy enhanced mode...');
+                // Fall through to legacy enhanced mode
+            }
+        }
+        // Legacy enhanced mode (if TransNet is not enabled or not available)
+        if (!transnetEnabled || transnetCutsCount === 0) {
+            console.log('\n🔦 Step 2.5 (Legacy): Luminance-based detection...');
+            // Phase 2 progress: 28%
+            await safePhaseProgress(2, 28, 'Luminance-based detection: Analyzing...', 'scene_detection');
+            try {
+                // Step 2.5a: Run luminance detection
+                const luminanceResults = await runLuminanceDetection(videoPath);
+                luminanceTransitionsDetected = luminanceResults.stabilizationPoints.length;
+                console.log(`  ✓ Found ${luminanceResults.whiteIntervals.length} white screen intervals`);
+                console.log(`  ✓ Found ${luminanceResults.blackIntervals.length} black screen intervals`);
+                console.log(`  ✓ Found ${luminanceTransitionsDetected} stabilization points`);
+                // Step 2.5b: Process text stabilization if stabilization points were found
+                if (luminanceResults.stabilizationPoints.length > 0) {
+                    // Phase 2 progress: 35%
+                    await safePhaseProgress(2, 35, 'Processing text stabilization points...', 'scene_detection');
+                    // Create temporary directory for stabilization frames
+                    const stabTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'stab-frames-'));
                     try {
-                        fs.rmSync(stabTempDir, { recursive: true, force: true });
+                        const textResults = await processStabilizationPoints(videoPath, luminanceResults.stabilizationPoints, stabTempDir);
+                        textStabilizationPoints = textResults.length;
+                        console.log(`  ✓ Found ${textStabilizationPoints} text stabilization points`);
+                        // Step 2.5c: Merge text stabilization results with existing scenes
+                        if (textResults.length > 0) {
+                            scenes = mergeEnhancedDetectionResults(scenes, textResults);
+                            console.log(`  ✓ Merged enhanced detection: ${scenes.length} total scenes`);
+                        }
                     }
-                    catch (e) {
-                        console.warn('  ⚠️ Failed to cleanup stabilization frames:', e);
+                    finally {
+                        // Cleanup temporary frames
+                        try {
+                            fs.rmSync(stabTempDir, { recursive: true, force: true });
+                        }
+                        catch (e) {
+                            console.warn('  ⚠️ Failed to cleanup stabilization frames:', e);
+                        }
                     }
                 }
             }
-        }
-        catch (enhancedError) {
-            // Enhanced mode errors are non-fatal - continue with standard detection
-            console.warn('\n⚠️ Enhanced mode detection failed, continuing with standard results:');
-            console.warn(`  Error: ${enhancedError instanceof Error ? enhancedError.message : String(enhancedError)}`);
+            catch (enhancedError) {
+                // Enhanced mode errors are non-fatal - continue with standard detection
+                console.warn('\n⚠️ Enhanced mode detection failed, continuing with standard results:');
+                console.warn(`  Error: ${enhancedError instanceof Error ? enhancedError.message : String(enhancedError)}`);
+            }
         }
     }
-    // Step 3: Perform OCR on each scene frame
-    console.log('\n🔍 Step 3: Performing OCR on scene frames...');
-    const scenesWithRawOCR = await performSceneBasedOCR(scenes, uploadId);
+    // Phase 2 Step 3: Perform OCR on each scene frame
+    // Phase 2 progress: 25-90% (batch processing) or 40-90% (traditional)
+    let scenesWithRawOCR;
+    if (useBatchProcessing) {
+        // Batch processing: extract frames → OCR → cleanup in batches
+        // This keeps peak memory under control for long videos
+        console.log('\n🔍 Step 3: Batch Processing (Frame Extraction + OCR + Cleanup)...');
+        await safePhaseProgress(2, 25, `Starting batch processing on ${scenes.length} scenes...`, 'batch_processing', 'Processing in batches for memory optimization');
+        scenesWithRawOCR = await processScenesInBatches(videoPath, scenes, videoMetadata, uploadId, DEFAULT_BATCH_SIZE, checkpoint);
+    }
+    else {
+        // Traditional processing: OCR on already-extracted frames
+        await safePhaseProgress(2, 40, `Starting OCR on ${scenes.length} scenes...`, 'ocr_processing', 'About 2-5 min (estimate)');
+        console.log('\n🔍 Step 3: Performing OCR on scene frames...');
+        scenesWithRawOCR = await performSceneBasedOCR(scenes, uploadId, videoMetadata.duration, checkpoint);
+    }
     // Step 3.5: Filter out persistent overlays (logos, watermarks)
     console.log('\n🧹 Step 3.5: Filtering persistent overlays...');
     const scenesWithFilteredOverlays = filterPersistentOverlays(scenesWithRawOCR);
     // Step 3.6: Remove consecutive duplicate OCR text
     console.log('\n🔄 Step 3.6: Removing consecutive duplicate OCR text...');
     const scenesWithOCR = removeConsecutiveDuplicateOCR(scenesWithFilteredOverlays);
-    // Step 4: Map transcription to scenes
+    // Phase 2 complete, Phase 3 starts: Create report
+    // Complete Phase 2
+    if (uploadId) {
+        try {
+            await completePhase(uploadId, 2);
+            console.log(`  ✅ Phase 2 complete: Reading on-screen text`);
+        }
+        catch (err) {
+            console.warn(`Failed to complete Phase 2: ${err}`);
+        }
+    }
+    // Phase 3 Step 1: Map transcription to scenes
+    // Phase 3 progress: 0-30%
+    await safePhaseProgress(3, 0, 'Mapping narration to scenes...', 'narration_mapping');
     console.log('\n🎙️ Step 4: Mapping transcription to scenes...');
     const scenesWithNarration = mapTranscriptionToScenes(scenesWithOCR, transcription);
+    await safePhaseProgress(3, 30, 'Narration mapping complete', 'narration_mapping');
     // Step 5: Convert to Excel rows
     console.log('\n📝 Step 5: Converting to Excel rows...');
     const excelRows = convertScenesToExcelRows(scenesWithNarration);
-    // Step 6: Generate Excel file
+    // Phase 3 Step 2: Generate Excel file
+    // Phase 3 progress: 30-70%
+    await safePhaseProgress(3, 30, 'Generating Excel file...', 'excel_generation');
     console.log('\n📊 Step 6: Generating Excel file...');
     const excelFilename = generateExcelFilename(projectTitle);
     const excelPath = path.join('/tmp', excelFilename);
+    await safePhaseProgress(3, 40, 'Creating workbook...', 'excel_generation');
     const excelBuffer = await generateExcel({
         projectTitle,
         rows: excelRows,
@@ -127,7 +335,9 @@ export async function executeIdealPipeline(videoPath, projectTitle, transcriptio
         includeStatistics: true
     });
     // Write Excel buffer to file
+    await safePhaseProgress(3, 60, 'Writing Excel file...', 'excel_generation');
     await fsPromises.writeFile(excelPath, excelBuffer);
+    await safePhaseProgress(3, 70, 'Excel file created', 'excel_generation');
     // Step 7: Calculate statistics
     const stats = {
         totalScenes: scenes.length,
@@ -142,8 +352,10 @@ export async function executeIdealPipeline(videoPath, projectTitle, transcriptio
     console.log('\n✅ Ideal Pipeline Execution Complete');
     console.log(`  📊 Excel file: ${excelPath}`);
     console.log(`  📈 Statistics:`, stats);
-    // Cleanup frames
-    await cleanupFrames(scenes);
+    // Cleanup frames (only for traditional processing - batch processing cleans up automatically)
+    if (!useBatchProcessing) {
+        await cleanupFrames(scenes);
+    }
     return { excelPath, stats };
 }
 /**
@@ -153,255 +365,317 @@ export async function executeIdealPipeline(videoPath, projectTitle, transcriptio
  * @returns Array of scenes with OCR results
  */
 /**
- * Extract text from Gemini's natural language response
- * Handles cases where Gemini doesn't return JSON
+ * Perform OCR on scenes using multi-provider OCR router
+ * Supports: Gemini (primary), Mistral, GLM, OpenAI (fallback)
+ * Automatically boosts parallelism for videos > 1 hour
+ *
+ * @param scenes - Array of scenes to process
+ * @param uploadId - Optional upload ID for progress tracking
+ * @param videoDuration - Optional video duration in seconds (enables auto-parallel boost for 1h+ videos)
+ * @param checkpoint - Optional checkpoint for resumable processing
+ * @returns Array of scenes with OCR results
  */
-function extractTextFromNaturalLanguage(response) {
-    // Pattern 1: Common phrases followed by quoted text (English/Japanese quotes)
-    // Matches: "contains: 'text'" / "shows: 'text'" / "text: 'text'" / "says: 'text'" / "reads: 'text'" / "displays: 'text'"
-    const patterns = [
-        /contains[:\s]+["']([^"']+)["']/gi,
-        /shows[:\s]+["']([^"']+)["']/gi,
-        /text[:\s]+["']([^"']+)["']/gi,
-        /says[:\s]+["']([^"']+)["']/gi,
-        /reads[:\s]+["']([^"']+)["']/gi,
-        /displays[:\s]+["']([^"']+)["']/gi,
-    ];
-    // Try each pattern
-    for (const pattern of patterns) {
-        const matches = [...response.matchAll(pattern)];
-        if (matches.length > 0 && matches[0][1]) {
-            return matches[0][1].trim();
-        }
+async function performSceneBasedOCR(scenes, uploadId, videoDuration, checkpoint) {
+    // Get OCR router singleton
+    const ocrRouter = getOCRRouter();
+    // Set video duration for automatic parallel boost (1h+ videos)
+    if (videoDuration !== undefined) {
+        ocrRouter.setVideoDuration(videoDuration);
     }
-    // Pattern 2: Text enclosed in Japanese or English quotes
-    const quotedPattern = /[「『"']([^」』"']{3,})[」』"']/g;
-    const quotedMatches = [...response.matchAll(quotedPattern)];
-    if (quotedMatches.length > 0) {
-        return quotedMatches.map(m => m[1]).join('\n');
-    }
-    return '';
-}
-async function performSceneBasedOCR(scenes, uploadId) {
-    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-    // Use latest stable model: gemini-2.5-flash (fast, supports Japanese text)
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-    // Initialize parallel processing components
-    const limit = pLimit(5); // Increased parallel degree to 5 for better performance
-    const rateLimiter = new RateLimiter(30); // 30 requests per minute (2 seconds between requests)
-    const progressReporter = uploadId ? new ProgressReporter(5) : null; // Report every 5%
     // Progress tracking
-    let completedScenes = 0;
-    const OCR_PROGRESS_START = 60;
-    const OCR_PROGRESS_END = 85;
-    const OCR_PROGRESS_RANGE = OCR_PROGRESS_END - OCR_PROGRESS_START;
-    console.log(`  🚀 Starting parallel OCR processing (${scenes.length} scenes, parallel degree: 5)`);
+    const OCR_PHASE_PROGRESS_START = 40;
+    const OCR_PHASE_PROGRESS_END = 90;
+    // Check for cached OCR results from checkpoint
+    const cachedOcrResults = checkpoint?.ocrResults || {};
+    const completedOcrScenes = new Set(checkpoint?.completedOcrScenes || []);
+    const hasCachedResults = completedOcrScenes.size > 0;
+    if (hasCachedResults) {
+        console.log(`  ▶️ Resuming OCR processing`);
+        console.log(`     - Cached results: ${completedOcrScenes.size}/${scenes.length} scenes`);
+        console.log(`     - Remaining: ${scenes.length - completedOcrScenes.size} scenes`);
+    }
+    console.log(`  🚀 Starting multi-provider OCR processing (${scenes.length} scenes)`);
+    console.log(`  📡 Available providers: ${ocrRouter.getAvailableProviderCount()}`);
+    if (videoDuration && videoDuration > 3600) {
+        console.log(`  ⚡ Long video mode enabled (${(videoDuration / 60).toFixed(1)} min) - parallel boost active`);
+    }
     const startTime = Date.now();
-    // Process all scenes in parallel with Promise.allSettled
-    const results = await Promise.allSettled(scenes.map((scene, index) => limit(async () => {
-        // Handle scenes without screenshots
-        if (!scene.screenshotPath) {
-            console.log(`  ⚠️ Scene ${scene.sceneNumber}: No screenshot, skipping OCR`);
-            completedScenes++;
-            return {
-                ...scene,
-                ocrText: '',
-                ocrConfidence: 0
-            };
+    // Prepare image tasks (read all screenshots), skipping cached results
+    const tasks = [];
+    const sceneIndices = [];
+    for (let i = 0; i < scenes.length; i++) {
+        const scene = scenes[i];
+        // Skip scenes that already have cached OCR results
+        if (completedOcrScenes.has(i)) {
+            continue; // Will be populated from cache later
         }
-        // Retry configuration
-        const MAX_RETRIES = 3;
-        const INITIAL_BACKOFF_MS = 2000; // 2 seconds
-        let lastError = null;
-        // Retry loop for handling transient errors (503, 429)
-        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        if (scene.screenshotPath) {
             try {
-                // Apply rate limiting before each attempt
-                await rateLimiter.acquire();
-                // Read screenshot file
                 const imageBuffer = fs.readFileSync(scene.screenshotPath);
-                const base64Image = imageBuffer.toString('base64');
-                // Gemini Vision OCR prompt - Specialized for video subtitles and captions
-                const prompt = `You are an OCR system specialized for VIDEO SUBTITLES and CAPTIONS.
-
-IMPORTANT: Focus ONLY on PRIMARY TEXT (subtitles, captions, main titles).
-IGNORE background text, small product labels, logos, watermarks.
-
-OUTPUT FORMAT:
-Return ONLY a valid JSON object (no markdown, no additional text):
-{
-  "text": "extracted text (use \\n for line breaks)",
-  "confidence": 0.95
-}
-
-PRIORITY ORDER (extract in this order):
-1. **HIGHEST**: Subtitles/Captions in bottom 20% of screen (largest, most important)
-2. **HIGH**: Main titles in center of screen (large, prominent)
-3. **MEDIUM**: On-screen text overlays (medium size)
-4. **IGNORE**: Small text (height < 3% of screen height)
-5. **IGNORE**: Background text (signs, posters, product labels, logos)
-6. **IGNORE**: Watermarks, copyright notices
-
-TEXT SIZE RULES:
-- Extract text ONLY if its height is at least 3% of screen height
-- If text is too small or blurry, IGNORE it
-- Focus on LARGE, CLEAR text that viewers are meant to read
-
-REGION OF INTEREST:
-- Prioritize bottom 20% of screen (subtitle area)
-- Prioritize center 30% of screen (title area)
-- Deprioritize edges and corners
-
-SUPPORTED LANGUAGES:
-- Japanese (kanji: 漢字, hiragana: ひらがな, katakana: カタカナ)
-- English (A-Z, a-z)
-- Numbers and symbols
-
-IF NO PRIMARY TEXT (subtitles/titles) IS VISIBLE:
-- Return: {"text": "", "confidence": 0}
-- Do NOT extract background text just because "all text" was requested
-
-CONFIDENCE SCORE:
-- 0.9-1.0: Very clear primary text, high certainty
-- 0.7-0.9: Readable primary text, medium certainty
-- 0.5-0.7: Partially obscured primary text
-- 0.0-0.5: Very unclear or no primary text
-
-EXAMPLE GOOD OUTPUT:
-{"text": "今日の天気は晴れ\\nToday's weather is sunny", "confidence": 0.92}
-
-EXAMPLE BAD OUTPUT (DO NOT DO THIS):
-{"text": "会社ロゴ\\n製品名ABC\\n©2023 Company\\n小さな注意書き\\nポスターの文字", "confidence": 0.85}`;
-                // Call Gemini Vision API
-                const result = await model.generateContent([
-                    prompt,
-                    { inlineData: { mimeType: 'image/png', data: base64Image } }
-                ]);
-                const responseText = result.response.text();
-                // Log raw response for debugging (first 200 chars)
-                console.log(`  [Scene ${scene.sceneNumber}] Gemini raw response: ${responseText.substring(0, 200)}`);
-                // Parse JSON response with enhanced error handling
-                let ocrResult;
-                try {
-                    // Remove markdown code blocks if present
-                    const jsonText = responseText.replace(/```json\n?|\n?```/g, '').trim();
-                    const parsed = JSON.parse(jsonText);
-                    // Validate required fields
-                    if (typeof parsed.text !== 'string') {
-                        throw new Error('Missing or invalid "text" field in JSON response');
-                    }
-                    if (typeof parsed.confidence !== 'number' || parsed.confidence < 0 || parsed.confidence > 1) {
-                        console.warn(`  [Scene ${scene.sceneNumber}] Invalid confidence value: ${parsed.confidence}, defaulting to 0.5`);
-                        parsed.confidence = 0.5;
-                    }
-                    ocrResult = { text: parsed.text, confidence: parsed.confidence };
-                }
-                catch (parseError) {
-                    // JSON parsing failed - log detailed error and try natural language extraction
-                    console.warn(`  [Scene ${scene.sceneNumber}] JSON parse failed: ${parseError instanceof Error ? parseError.message : String(parseError)}`);
-                    console.warn(`  [Scene ${scene.sceneNumber}] Attempting natural language extraction...`);
-                    const extractedText = extractTextFromNaturalLanguage(responseText);
-                    if (extractedText) {
-                        console.log(`  [Scene ${scene.sceneNumber}] Natural language extraction succeeded (${extractedText.length} chars)`);
-                        ocrResult = { text: extractedText, confidence: 0.5 };
-                    }
-                    else {
-                        console.warn(`  [Scene ${scene.sceneNumber}] Natural language extraction failed, using empty result`);
-                        ocrResult = { text: '', confidence: 0 };
-                    }
-                }
-                completedScenes++;
-                // Report progress if reporter is available
-                if (progressReporter && uploadId) {
-                    const progress = Math.floor(OCR_PROGRESS_START + (completedScenes / scenes.length) * OCR_PROGRESS_RANGE);
-                    await progressReporter.report(uploadId, progress, 'ocr_processing', `OCR: ${completedScenes}/${scenes.length} scenes completed`);
-                }
-                // Enhanced logging - success case
-                const retryInfo = attempt > 0 ? ` (succeeded after ${attempt} retries)` : '';
-                const textPreview = ocrResult.text.length > 0
-                    ? ocrResult.text.substring(0, 50).replace(/\n/g, ' ')
-                    : '(no text)';
-                console.log(`  ✓ Scene ${scene.sceneNumber}: OCR complete ` +
-                    `(text: ${ocrResult.text.length} chars, confidence: ${ocrResult.confidence.toFixed(2)})${retryInfo} ` +
-                    `[${completedScenes}/${scenes.length}]`);
-                // Log text preview if available
-                if (ocrResult.text.length > 0) {
-                    console.log(`    Preview: "${textPreview}${ocrResult.text.length > 50 ? '...' : ''}"`);
-                }
-                else {
-                    console.log(`    (No text detected)`);
-                }
-                // Warn on low confidence
-                if (ocrResult.confidence < 0.5 && ocrResult.text.length > 0) {
-                    console.warn(`  ⚠️ Scene ${scene.sceneNumber}: Low confidence (${ocrResult.confidence.toFixed(2)})`);
-                }
-                return {
-                    ...scene,
-                    ocrText: ocrResult.text || '',
-                    ocrConfidence: ocrResult.confidence || 0
-                };
+                tasks.push({
+                    id: scene.sceneNumber,
+                    imageBuffer,
+                    metadata: { sceneIndex: i },
+                });
+                sceneIndices.push(i);
             }
-            catch (error) {
-                lastError = error instanceof Error ? error : new Error(String(error));
-                // Check if error is retryable (503 Service Unavailable or 429 Rate Limit)
-                const isRetryable = lastError.message.includes('503') ||
-                    lastError.message.includes('429') ||
-                    lastError.message.includes('overloaded') ||
-                    lastError.message.includes('rate limit');
-                // If not retryable or max retries reached, break
-                if (!isRetryable || attempt >= MAX_RETRIES) {
-                    console.error(`  ✗ Scene ${scene.sceneNumber}: OCR failed (attempt ${attempt + 1}/${MAX_RETRIES + 1})`);
-                    console.error(`    Error: ${lastError.message}`);
-                    // Log detailed error for debugging
-                    if (lastError.message.includes('503')) {
-                        console.error(`    ⚠️  Gemini API overloaded (503)`);
-                    }
-                    else if (lastError.message.includes('429')) {
-                        console.error(`    ⚠️  Rate limit exceeded (429)`);
-                    }
-                    break;
-                }
-                // Calculate exponential backoff delay
-                const backoffDelay = INITIAL_BACKOFF_MS * Math.pow(2, attempt);
-                console.warn(`  ⚠️  Scene ${scene.sceneNumber}: Temporary error (attempt ${attempt + 1}/${MAX_RETRIES + 1}), ` +
-                    `retrying after ${backoffDelay}ms...`);
-                console.warn(`    Reason: ${lastError.message.substring(0, 100)}`);
-                // Wait before retrying
-                await new Promise(resolve => setTimeout(resolve, backoffDelay));
+            catch (err) {
+                console.warn(`  ⚠️ Scene ${scene.sceneNumber}: Failed to read screenshot: ${err}`);
             }
-        }
-        // All retries failed - increment counter and return empty result
-        completedScenes++;
-        return {
-            ...scene,
-            ocrText: '',
-            ocrConfidence: 0
-        };
-    })));
-    // Calculate and log performance metrics
-    const duration = (Date.now() - startTime) / 1000;
-    console.log(`  ✓ Parallel OCR completed in ${duration.toFixed(2)}s`);
-    console.log(`  📊 Average: ${(duration / scenes.length).toFixed(2)}s per scene`);
-    // Convert Promise.allSettled results to SceneWithOCR array
-    const scenesWithOCR = results.map((result, index) => {
-        if (result.status === 'fulfilled') {
-            return result.value;
         }
         else {
-            console.error(`  Scene ${scenes[index].sceneNumber} promise rejected:`, result.reason);
-            return {
-                ...scenes[index],
-                ocrText: '',
-                ocrConfidence: 0
-            };
+            console.log(`  ⚠️ Scene ${scene.sceneNumber}: No screenshot, skipping OCR`);
         }
-    });
-    // Final progress report
-    if (progressReporter && uploadId) {
-        await progressReporter.forceReport(uploadId, OCR_PROGRESS_END, 'ocr_completed', 'OCR processing completed');
     }
-    console.log(`  ✓ OCR complete: ${scenesWithOCR.filter(s => s.ocrText).length}/${scenes.length} scenes with text`);
+    const cachedCount = completedOcrScenes.size;
+    console.log(`  📸 Loaded ${tasks.length}/${scenes.length} screenshots for OCR (${cachedCount} cached)`);
+    // If all scenes are cached, skip OCR processing
+    if (tasks.length === 0 && cachedCount > 0) {
+        console.log(`  ✓ All OCR results loaded from cache`);
+        const scenesWithOCR = scenes.map((scene, i) => ({
+            ...scene,
+            ocrText: cachedOcrResults[i] || '',
+            ocrConfidence: cachedOcrResults[i] ? 0.95 : 0,
+        }));
+        return scenesWithOCR;
+    }
+    // Update progress before starting batch processing
+    if (uploadId) {
+        try {
+            await updatePhaseProgress(uploadId, 2, OCR_PHASE_PROGRESS_START, {
+                subTask: `OCR: Processing ${tasks.length} scenes...`,
+                stage: 'ocr_processing',
+            });
+        }
+        catch (err) {
+            console.warn(`Failed to update OCR progress: ${err}`);
+        }
+    }
+    // Process all images in parallel using OCR router
+    const batchResult = await ocrRouter.processParallel(tasks);
+    // Map results back to scenes (initialize with cached results)
+    const scenesWithOCR = scenes.map((scene, i) => ({
+        ...scene,
+        ocrText: cachedOcrResults[i] || '',
+        ocrConfidence: cachedOcrResults[i] ? 0.95 : 0,
+    }));
+    // Populate OCR results from new processing
+    const newOcrResults = {};
+    const newCompletedScenes = [];
+    let lastSavedIndex = -1; // Track last checkpoint-saved index for emergency save
+    for (let i = 0; i < batchResult.results.length; i++) {
+        const result = batchResult.results[i];
+        const sceneIndex = sceneIndices[i];
+        if (sceneIndex !== undefined) {
+            scenesWithOCR[sceneIndex].ocrText = result.text;
+            scenesWithOCR[sceneIndex].ocrConfidence = result.confidence;
+            // Track for checkpoint
+            newOcrResults[sceneIndex] = result.text;
+            newCompletedScenes.push(sceneIndex);
+            // Register progress for emergency save on SIGTERM
+            if (uploadId) {
+                registerOcrProgress(uploadId, newCompletedScenes, newOcrResults, lastSavedIndex);
+            }
+            // Log result
+            const scene = scenesWithOCR[sceneIndex];
+            const textPreview = result.text.length > 0
+                ? result.text.substring(0, 50).replace(/\n/g, ' ')
+                : '(no text)';
+            console.log(`  ✓ Scene ${scene.sceneNumber}: OCR complete ` +
+                `(text: ${result.text.length} chars, confidence: ${result.confidence.toFixed(2)}, provider: ${result.provider})`);
+            if (result.text.length > 0) {
+                console.log(`    Preview: "${textPreview}${result.text.length > 50 ? '...' : ''}"`);
+            }
+            // Save checkpoint every OCR_CHECKPOINT_INTERVAL scenes
+            if (uploadId && checkpoint && newCompletedScenes.length > 0 && newCompletedScenes.length % OCR_CHECKPOINT_INTERVAL === 0) {
+                try {
+                    await addCompletedOcrScenes(uploadId, newCompletedScenes, newOcrResults);
+                    lastSavedIndex = Math.max(...newCompletedScenes); // Update last saved index
+                    console.log(`  💾 OCR Checkpoint saved: ${completedOcrScenes.size + newCompletedScenes.length}/${scenes.length} scenes`);
+                }
+                catch (err) {
+                    console.warn(`  ⚠️ Failed to save OCR checkpoint: ${err}`);
+                }
+            }
+        }
+    }
+    // Save final OCR checkpoint
+    if (uploadId && checkpoint && newCompletedScenes.length > 0) {
+        try {
+            await addCompletedOcrScenes(uploadId, newCompletedScenes, newOcrResults);
+            console.log(`  💾 Final OCR checkpoint saved: ${completedOcrScenes.size + newCompletedScenes.length}/${scenes.length} scenes`);
+        }
+        catch (err) {
+            console.warn(`  ⚠️ Failed to save final OCR checkpoint: ${err}`);
+        }
+    }
+    // Clear emergency checkpoint state (OCR complete)
+    if (uploadId) {
+        clearOcrProgress();
+    }
+    // Calculate and log performance metrics
+    const duration = (Date.now() - startTime) / 1000;
+    console.log(`\n  ✓ Multi-provider OCR completed in ${duration.toFixed(2)}s`);
+    console.log(`  📊 Average: ${(duration / scenes.length).toFixed(2)}s per scene`);
+    console.log(`  📈 Stats: ${batchResult.stats.successCount}/${batchResult.stats.totalProcessed} succeeded`);
+    console.log(`  🔀 Provider usage:`, batchResult.stats.providerUsage);
+    // Log router status
+    ocrRouter.logStatus();
+    // Final progress report - Phase 2 at 95% (OCR complete)
+    if (uploadId) {
+        try {
+            await updatePhaseProgress(uploadId, 2, OCR_PHASE_PROGRESS_END + 5, {
+                subTask: 'OCR processing complete',
+                stage: 'ocr_completed',
+            });
+        }
+        catch (err) {
+            console.warn(`Failed to update final OCR progress: ${err}`);
+        }
+    }
+    const scenesWithText = scenesWithOCR.filter((s) => s.ocrText).length;
+    console.log(`  ✓ OCR complete: ${scenesWithText}/${scenes.length} scenes with text`);
     return scenesWithOCR;
+}
+// ============================================================
+// Batch Processing Functions (Memory Optimization)
+// Added: 2026-02-06
+// Purpose: Process frames in batches to reduce peak memory usage
+// ============================================================
+/**
+ * Process scenes in batches: extract frames → OCR → cleanup
+ * This approach reduces peak memory from 3-5GB to ~500MB-1GB
+ *
+ * @param videoPath - Path to video file
+ * @param scenes - All scenes (without screenshots)
+ * @param videoMetadata - Video metadata for frame extraction
+ * @param uploadId - Optional upload ID for progress tracking
+ * @param batchSize - Number of scenes per batch (default: 100)
+ * @param checkpoint - Optional checkpoint for resumable processing
+ * @returns Scenes with OCR results
+ */
+async function processScenesInBatches(videoPath, scenes, videoMetadata, uploadId, batchSize = DEFAULT_BATCH_SIZE, checkpoint) {
+    console.log('\n📦 Starting Batch Processing (Memory Optimized)');
+    console.log(`  📊 Total scenes: ${scenes.length}`);
+    console.log(`  📦 Batch size: ${batchSize}`);
+    console.log(`  🔢 Total batches: ${Math.ceil(scenes.length / batchSize)}`);
+    logMemoryUsage('Before batch processing');
+    const allResults = [];
+    const framesDir = path.join(os.tmpdir(), `batch-frames-${Date.now()}`);
+    // Create frames directory
+    await fsPromises.mkdir(framesDir, { recursive: true });
+    const totalBatches = Math.ceil(scenes.length / batchSize);
+    const startTime = Date.now();
+    // Track batch timing for ETA calculation
+    let batchTimes = [];
+    // Helper for safe progress updates with ETA
+    const safePhaseProgress = async (phaseProgress, subTask, estimatedTimeRemaining) => {
+        if (!uploadId)
+            return;
+        try {
+            await updatePhaseProgress(uploadId, 2, phaseProgress, {
+                subTask,
+                stage: 'batch_processing',
+                estimatedTimeRemaining,
+            });
+        }
+        catch (err) {
+            console.warn(`Failed to update batch progress: ${err}`);
+        }
+    };
+    // Format remaining time for display
+    const formatTimeRemaining = (seconds) => {
+        if (seconds < 60) {
+            return `About ${Math.ceil(seconds)} seconds remaining`;
+        }
+        else if (seconds < 3600) {
+            const minutes = Math.ceil(seconds / 60);
+            return `About ${minutes} minute${minutes > 1 ? 's' : ''} remaining`;
+        }
+        else {
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.ceil((seconds % 3600) / 60);
+            return `About ${hours}h ${minutes}m remaining`;
+        }
+    };
+    for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+        const batchStartTime = Date.now();
+        const batchStart = batchIndex * batchSize;
+        const batchEnd = Math.min(batchStart + batchSize, scenes.length);
+        const batchScenes = scenes.slice(batchStart, batchEnd);
+        const batchNumber = batchIndex + 1;
+        console.log(`\n━━━ Batch ${batchNumber}/${totalBatches} (scenes ${batchStart + 1}-${batchEnd}) ━━━`);
+        logMemoryUsage(`Batch ${batchNumber} start`);
+        // Calculate progress (25-90% for batch processing)
+        const batchProgress = 25 + Math.floor((batchIndex / totalBatches) * 65);
+        // Calculate ETA based on previous batch times
+        let estimatedTimeRemaining;
+        if (batchTimes.length > 0) {
+            const avgBatchTime = batchTimes.reduce((a, b) => a + b, 0) / batchTimes.length;
+            const remainingBatches = totalBatches - batchIndex;
+            const remainingSeconds = (avgBatchTime / 1000) * remainingBatches;
+            estimatedTimeRemaining = formatTimeRemaining(remainingSeconds);
+        }
+        else if (batchIndex === 0) {
+            // First batch: provide rough estimate based on typical processing time
+            // ~0.5 seconds per scene is a reasonable estimate
+            const roughEstimate = scenes.length * 0.5;
+            estimatedTimeRemaining = formatTimeRemaining(roughEstimate);
+        }
+        await safePhaseProgress(batchProgress, `Batch ${batchNumber}/${totalBatches}: Processing ${batchScenes.length} scenes...`, estimatedTimeRemaining);
+        // Step 1: Extract frames for this batch
+        console.log(`  [1/3] Extracting ${batchScenes.length} frames...`);
+        const batchScenesWithFrames = await extractFramesForBatch(videoPath, batchScenes, framesDir, videoMetadata);
+        logMemoryUsage(`Batch ${batchNumber} after frame extraction`);
+        // Step 2: Run OCR for this batch (pass video duration for long video optimization)
+        console.log(`  [2/3] Running OCR on ${batchScenes.length} frames...`);
+        const batchOCRResults = await performSceneBasedOCR(batchScenesWithFrames, uploadId, videoMetadata.duration, checkpoint);
+        logMemoryUsage(`Batch ${batchNumber} after OCR`);
+        // Step 3: Cleanup frames immediately to free memory
+        console.log(`  [3/3] Cleaning up batch frames...`);
+        await cleanupBatchFrames(batchScenesWithFrames);
+        // Force garbage collection hint (Node.js may or may not honor this)
+        if (global.gc) {
+            global.gc();
+        }
+        logMemoryUsage(`Batch ${batchNumber} after cleanup`);
+        // Accumulate results (only text data, not images)
+        allResults.push(...batchOCRResults);
+        // Track batch processing time for ETA calculation
+        const batchDuration = Date.now() - batchStartTime;
+        batchTimes.push(batchDuration);
+        const batchElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        const avgPerScene = (parseFloat(batchElapsed) / allResults.length).toFixed(2);
+        const batchDurationSec = (batchDuration / 1000).toFixed(1);
+        console.log(`  ✓ Batch ${batchNumber} complete: ${allResults.length}/${scenes.length} scenes processed`);
+        console.log(`    Batch time: ${batchDurationSec}s | Total: ${batchElapsed}s | Avg: ${avgPerScene}s/scene`);
+    }
+    // Cleanup frames directory
+    try {
+        await fsPromises.rm(framesDir, { recursive: true, force: true });
+        console.log(`  🧹 Cleaned up batch frames directory`);
+    }
+    catch (e) {
+        console.warn(`  ⚠️ Failed to cleanup frames directory: ${e}`);
+    }
+    const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`\n✅ Batch Processing Complete`);
+    console.log(`  📊 Processed: ${allResults.length} scenes`);
+    console.log(`  ⏱️ Total time: ${totalElapsed}s`);
+    console.log(`  📈 Average: ${(parseFloat(totalElapsed) / allResults.length).toFixed(2)}s/scene`);
+    logMemoryUsage('After batch processing');
+    return allResults;
+}
+/**
+ * Determine if batch processing should be used based on scene count
+ * @param sceneCount - Number of scenes to process
+ * @returns true if batch processing should be used
+ */
+function shouldUseBatchProcessing(sceneCount) {
+    // Use batch processing for videos with more than 200 scenes
+    // This threshold balances memory safety with processing overhead
+    const BATCH_THRESHOLD = 200;
+    return sceneCount > BATCH_THRESHOLD;
 }
 /**
  * Calculate dynamic threshold based on total scene count
@@ -721,5 +995,63 @@ function mergeEnhancedDetectionResults(existingScenes, textResults) {
     }
     console.log(`  ✓ Merged result: ${mergedScenes.length} total scenes`);
     return mergedScenes;
+}
+/**
+ * Convert scene cuts (timestamps) to Scene objects with extracted frames
+ *
+ * @param cuts - Array of scene cuts with timestamps
+ * @param videoPath - Path to original video (for high-quality frame extraction)
+ * @param videoDuration - Total video duration in seconds
+ * @returns Array of Scene objects with extracted screenshots
+ */
+async function convertCutsToScenes(cuts, videoPath, videoDuration) {
+    // Sort cuts by timestamp
+    const sortedCuts = [...cuts].sort((a, b) => a.timestamp - b.timestamp);
+    // Create temp directory for frames
+    const framesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enhanced-frames-'));
+    const scenes = [];
+    // Add scene at timestamp 0 if first cut is not at the start
+    if (sortedCuts.length === 0 || sortedCuts[0].timestamp > 0.5) {
+        const startTime = 0;
+        const endTime = sortedCuts.length > 0 ? sortedCuts[0].timestamp : videoDuration;
+        const midTime = (startTime + endTime) / 2;
+        const framePath = path.join(framesDir, `scene_0001_${midTime.toFixed(3)}.png`);
+        await extractFrameAtTime(videoPath, midTime, framePath);
+        scenes.push({
+            sceneNumber: 1,
+            startTime,
+            endTime,
+            midTime,
+            timecode: formatTimecode(startTime),
+            screenshotPath: framePath,
+        });
+    }
+    // Convert each cut to a scene
+    for (let i = 0; i < sortedCuts.length; i++) {
+        const cut = sortedCuts[i];
+        const nextCut = sortedCuts[i + 1];
+        const startTime = cut.timestamp;
+        const endTime = nextCut ? nextCut.timestamp : videoDuration;
+        const midTime = (startTime + endTime) / 2;
+        const sceneNumber = scenes.length + 1;
+        const framePath = path.join(framesDir, `scene_${String(sceneNumber).padStart(4, '0')}_${midTime.toFixed(3)}.png`);
+        try {
+            await extractFrameAtTime(videoPath, midTime, framePath);
+            scenes.push({
+                sceneNumber,
+                startTime,
+                endTime,
+                midTime,
+                timecode: formatTimecode(startTime),
+                screenshotPath: framePath,
+            });
+        }
+        catch (error) {
+            console.warn(`  ⚠️ Failed to extract frame for scene ${sceneNumber} at ${midTime}s: ${error}`);
+            // Skip this scene if frame extraction fails
+        }
+    }
+    console.log(`  ✓ Converted ${cuts.length} cuts to ${scenes.length} scenes with frames`);
+    return scenes;
 }
 //# sourceMappingURL=pipeline.js.map

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { useAuth } from "@clerk/nextjs";
 import { UploadCloud, X, Film, AlertTriangle, Settings2, Zap, Sparkles } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -10,6 +10,38 @@ import type { DetectionMode } from "@/types/shared";
 interface VideoUploaderProps {
   onUploadSuccess: (uploadId: string) => void;
   disabled?: boolean;
+}
+
+/**
+ * Silent warmup for Cloud Run cold start avoidance
+ * Runs in background on component mount - no UI feedback
+ */
+async function performSilentWarmup(): Promise<void> {
+  try {
+    // Get the nearest Cloud Run URL via our warmup endpoint
+    // This endpoint returns the geo-routed URL from middleware
+    const response = await fetch('/api/warmup', {
+      method: 'GET',
+      // Short timeout - warmup failure is acceptable
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!response.ok) return;
+
+    const { cloudRunUrl } = await response.json();
+    if (!cloudRunUrl) return;
+
+    // Silent health check to Cloud Run (no-cors to avoid CORS issues)
+    // This triggers the instance to start if it's cold
+    await fetch(`${cloudRunUrl}/health`, {
+      method: 'GET',
+      mode: 'no-cors', // We don't need the response, just trigger the request
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch {
+    // Silently ignore all errors - warmup failure is acceptable
+    // User experience should not be affected
+  }
 }
 
 export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps) {
@@ -23,6 +55,12 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
   const [showAdvanced, setShowAdvanced] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Silent warmup on component mount
+  // Runs once to pre-warm Cloud Run instance based on user's geo location
+  useEffect(() => {
+    performSilentWarmup();
+  }, []);
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
@@ -277,7 +315,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
       )}
 
       {/* Advanced Options - Detection Mode Selection */}
-      {file && !uploading && (
+      {!uploading && (
         <div className="space-y-3">
           <button
             onClick={() => setShowAdvanced(!showAdvanced)}
@@ -307,7 +345,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
                     <span className="font-semibold text-foreground">Standard</span>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    Fast processing, works well for most videos with hard cuts
+                    カット編集中心の動画向け（ディゾルブなし）
                   </p>
                 </button>
 
@@ -326,14 +364,14 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
                     <span className="font-semibold text-foreground">Enhanced</span>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    Better for fades, dissolves, text animations (2-3x processing time)
+                    AIを用いた高精度シーン検出
                   </p>
                 </button>
               </div>
               {detectionMode === 'enhanced' && (
                 <p className="text-xs text-amber-600 dark:text-amber-400 flex items-center gap-1">
                   <AlertTriangle className="w-3 h-3" />
-                  Enhanced mode takes longer but detects more transitions
+                  AI処理のため処理時間が長くなります
                 </p>
               )}
             </div>

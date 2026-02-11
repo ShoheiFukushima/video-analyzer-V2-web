@@ -16,7 +16,7 @@ import ffmpeg from 'fluent-ffmpeg';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { RateLimiter } from './rateLimiter.js';
+import { SimpleRateLimiter } from './rateLimiter.js';
 // ========================================
 // Constants
 // ========================================
@@ -345,7 +345,7 @@ export async function processStabilizationPoints(videoPath, stabilizationPoints,
     console.log(`\n🔍 Processing ${stabilizationPoints.length} stabilization points...`);
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
     const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-    const rateLimiter = new RateLimiter(30); // 30 requests per minute
+    const rateLimiter = new SimpleRateLimiter(30); // 30 requests per minute
     const results = [];
     for (const point of stabilizationPoints) {
         const result = await detectTextStabilization(videoPath, point, outputDir, model, rateLimiter, config);

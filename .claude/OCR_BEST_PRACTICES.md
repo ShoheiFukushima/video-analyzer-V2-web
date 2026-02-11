@@ -226,7 +226,7 @@ IGNORE background text, small product labels, logos, watermarks."
 
 | 変数名 | 値 | 説明 |
 |-------|---|------|
-| `GEMINI_API_KEY` | `AIzaSyCtfrRpKju19o390K7MAnnaWHWwvnyUKR8` | Gemini Vision APIキー |
+| `GEMINI_API_KEY` | (環境変数で管理) | Gemini Vision APIキー |
 | `NODE_ENV` | `production` | 本番環境 |
 
 **注意**: APIキーは環境変数で管理（ハードコード禁止）

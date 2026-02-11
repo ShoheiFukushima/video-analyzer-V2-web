@@ -2,26 +2,64 @@ import dotenv from 'dotenv';
 import { createClient } from '@libsql/client';
 // Load environment variables
 dotenv.config();
-// Determine if Turso should be used
-// Use Turso in production, or when explicitly enabled
-const USE_TURSO = process.env.NODE_ENV === 'production' || process.env.USE_TURSO === 'true';
+// Import shutdown flag to prevent race condition during graceful shutdown
+// Note: Dynamic import to avoid circular dependency
+let getShutdownFlag = () => false;
+import('../index.js').then(m => {
+    getShutdownFlag = () => m.isShuttingDown;
+}).catch(() => {
+    // Fallback for test environments
+    console.log('[StatusManager] Could not import shutdown flag, using default');
+});
 // In-memory status storage (development mode only)
 const inMemoryStatusMap = new Map();
-// Turso client (production mode only)
+// Turso client (lazy initialization to avoid race condition with Secret Manager)
 let turso = null;
-// Initialize Turso client if enabled
-if (USE_TURSO) {
-    if (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN) {
-        throw new Error('Missing required Turso environment variables: TURSO_DATABASE_URL, TURSO_AUTH_TOKEN');
+let tursoInitialized = false;
+/**
+ * Lazy initialization of Turso client
+ * This avoids race conditions with Cloud Run Secret Manager injection
+ */
+function getTursoClient() {
+    if (tursoInitialized) {
+        return turso;
     }
-    turso = createClient({
-        url: process.env.TURSO_DATABASE_URL,
-        authToken: process.env.TURSO_AUTH_TOKEN,
-    });
-    console.log('[StatusManager] Turso mode enabled');
+    // Determine if Turso should be used
+    // Use Turso in production, or when explicitly enabled
+    const useTurso = process.env.NODE_ENV === 'production' || process.env.USE_TURSO === 'true';
+    if (!useTurso) {
+        console.log('[StatusManager] In-memory mode enabled (development)');
+        tursoInitialized = true;
+        return null;
+    }
+    // Check for required environment variables
+    if (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN) {
+        console.error('[StatusManager] Missing Turso environment variables, falling back to in-memory mode');
+        console.error('[StatusManager] TURSO_DATABASE_URL:', process.env.TURSO_DATABASE_URL ? 'set' : 'NOT SET');
+        console.error('[StatusManager] TURSO_AUTH_TOKEN:', process.env.TURSO_AUTH_TOKEN ? 'set' : 'NOT SET');
+        tursoInitialized = true;
+        return null;
+    }
+    try {
+        turso = createClient({
+            url: process.env.TURSO_DATABASE_URL,
+            authToken: process.env.TURSO_AUTH_TOKEN,
+        });
+        console.log('[StatusManager] Turso mode enabled');
+        tursoInitialized = true;
+        return turso;
+    }
+    catch (error) {
+        console.error('[StatusManager] Failed to initialize Turso client:', error);
+        tursoInitialized = true;
+        return null;
+    }
 }
-else {
-    console.log('[StatusManager] In-memory mode enabled (development)');
+/**
+ * Check if Turso is available
+ */
+function isTursoAvailable() {
+    return getTursoClient() !== null;
 }
 /**
  * Initialize processing status (Dual mode: Turso or In-memory)
@@ -39,9 +77,10 @@ export const initStatus = async (uploadId, userId) => {
         startedAt: now,
         updatedAt: now,
     };
-    if (USE_TURSO && turso) {
+    const client = getTursoClient();
+    if (client) {
         // Turso mode - INSERT OR REPLACE
-        await turso.execute({
+        await client.execute({
             sql: `INSERT INTO processing_status
             (upload_id, user_id, status, progress, current_step, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -68,7 +107,8 @@ export const initStatus = async (uploadId, userId) => {
  */
 export const updateStatus = async (uploadId, updates) => {
     const now = new Date().toISOString();
-    if (USE_TURSO && turso) {
+    const client = getTursoClient();
+    if (client) {
         // Build dynamic SET clause
         const setClauses = ['updated_at = ?'];
         const args = [now];
@@ -98,24 +138,30 @@ export const updateStatus = async (uploadId, updates) => {
         }
         // Add upload_id for WHERE clause
         args.push(uploadId);
-        await turso.execute({
+        await client.execute({
             sql: `UPDATE processing_status SET ${setClauses.join(', ')} WHERE upload_id = ?`,
             args,
         });
         // Fetch updated record
-        const result = await turso.execute({
+        const result = await client.execute({
             sql: 'SELECT * FROM processing_status WHERE upload_id = ?',
             args: [uploadId],
         });
         if (result.rows.length === 0) {
             throw new Error(`[${uploadId}] Status not found in Turso`);
         }
-        console.log(`[${uploadId}] [Turso] Status updated:`, {
+        // Log with phase info if available
+        const logInfo = {
             status: updates.status,
             progress: updates.progress,
             stage: updates.stage,
-        });
-        return mapDbRowToStatus(result.rows[0]);
+        };
+        if (updates.phase)
+            logInfo.phase = updates.phase;
+        if (updates.phaseProgress !== undefined)
+            logInfo.phaseProgress = updates.phaseProgress;
+        console.log(`[${uploadId}] [Turso] Status updated:`, logInfo);
+        return mapDbRowToStatus(result.rows[0], updates);
     }
     else {
         // In-memory mode
@@ -129,20 +175,108 @@ export const updateStatus = async (uploadId, updates) => {
             updatedAt: now,
         };
         inMemoryStatusMap.set(uploadId, updatedStatus);
-        console.log(`[${uploadId}] [InMemory] Status updated:`, {
+        // Log with phase info if available
+        const logInfo = {
             status: updatedStatus.status,
             progress: updatedStatus.progress,
             stage: updatedStatus.stage,
-        });
+        };
+        if (updatedStatus.phase)
+            logInfo.phase = updatedStatus.phase;
+        if (updatedStatus.phaseProgress !== undefined)
+            logInfo.phaseProgress = updatedStatus.phaseProgress;
+        console.log(`[${uploadId}] [InMemory] Status updated:`, logInfo);
         return updatedStatus;
     }
+};
+/**
+ * Update phase progress (helper function for 3-phase UI)
+ * Phase data is stored in metadata JSON for persistence
+ */
+export const updatePhaseProgress = async (uploadId, phase, phaseProgress, options) => {
+    // Skip progress updates during shutdown to prevent race condition with error status
+    if (getShutdownFlag()) {
+        console.log(`[${uploadId}] Skipping phase update - shutdown in progress`);
+        const currentStatus = await getStatus(uploadId);
+        if (currentStatus)
+            return currentStatus;
+        // If status not found, return a minimal status object
+        const now = new Date().toISOString();
+        return {
+            uploadId,
+            userId: '',
+            status: 'processing',
+            progress: 0,
+            startedAt: now,
+            updatedAt: now,
+        };
+    }
+    // Calculate overall progress based on phase
+    // Phase 1: 0-33%, Phase 2: 33-66%, Phase 3: 66-100%
+    const phaseRanges = {
+        1: [0, 33],
+        2: [33, 66],
+        3: [66, 100],
+    };
+    const [start, end] = phaseRanges[phase];
+    const overallProgress = Math.round(start + (phaseProgress / 100) * (end - start));
+    // Store phase data in metadata for persistence (Turso doesn't have phase columns)
+    const phaseMetadata = {
+        phase,
+        phaseProgress,
+        phaseStatus: options?.phaseStatus || 'in_progress',
+        estimatedTimeRemaining: options?.estimatedTimeRemaining,
+        subTask: options?.subTask,
+    };
+    return updateStatus(uploadId, {
+        status: 'processing',
+        progress: overallProgress,
+        phase,
+        phaseProgress,
+        phaseStatus: options?.phaseStatus || 'in_progress',
+        estimatedTimeRemaining: options?.estimatedTimeRemaining,
+        subTask: options?.subTask,
+        stage: options?.stage,
+        metadata: phaseMetadata, // Store phase data in metadata
+    });
+};
+/**
+ * Mark phase as complete and move to next phase
+ */
+export const completePhase = async (uploadId, completedPhase) => {
+    // Calculate progress at end of phase
+    const phaseEndProgress = {
+        1: 33,
+        2: 66,
+        3: 100,
+    };
+    return updateStatus(uploadId, {
+        status: 'processing',
+        progress: phaseEndProgress[completedPhase],
+        phase: completedPhase,
+        phaseProgress: 100,
+        phaseStatus: 'completed',
+    });
+};
+/**
+ * Skip a phase (e.g., no audio detected)
+ */
+export const skipPhase = async (uploadId, skippedPhase, reason) => {
+    return updateStatus(uploadId, {
+        status: 'processing',
+        phase: skippedPhase,
+        phaseProgress: 100,
+        phaseStatus: 'skipped',
+        subTask: reason || 'Skipped',
+    });
 };
 /**
  * Get processing status (Dual mode: Turso or In-memory)
  */
 export const getStatus = async (uploadId) => {
-    if (USE_TURSO && turso) {
-        const result = await turso.execute({
+    const client = getTursoClient();
+    if (client) {
+        const result = await client.execute({
             sql: 'SELECT * FROM processing_status WHERE upload_id = ?',
             args: [uploadId],
         });
@@ -195,9 +329,11 @@ export const failStatus = async (uploadId, error) => {
  * - current_step → stage
  * - error_message → error
  * - created_at → startedAt
+ * @param row - Database row
+ * @param updates - Optional updates with phase info (DB doesn't store phase fields yet)
  */
-function mapDbRowToStatus(row) {
-    return {
+function mapDbRowToStatus(row, updates) {
+    const status = {
         uploadId: row.upload_id,
         userId: row.user_id,
         status: row.status,
@@ -209,5 +345,19 @@ function mapDbRowToStatus(row) {
         metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
         error: row.error_message, // Map error_message → error
     };
+    // Merge phase info from updates (DB doesn't have phase columns yet)
+    if (updates) {
+        if (updates.phase !== undefined)
+            status.phase = updates.phase;
+        if (updates.phaseProgress !== undefined)
+            status.phaseProgress = updates.phaseProgress;
+        if (updates.phaseStatus !== undefined)
+            status.phaseStatus = updates.phaseStatus;
+        if (updates.estimatedTimeRemaining !== undefined)
+            status.estimatedTimeRemaining = updates.estimatedTimeRemaining;
+        if (updates.subTask !== undefined)
+            status.subTask = updates.subTask;
+    }
+    return status;
 }
 //# sourceMappingURL=statusManager.js.map

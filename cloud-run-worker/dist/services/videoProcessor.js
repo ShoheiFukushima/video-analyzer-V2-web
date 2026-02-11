@@ -1,13 +1,13 @@
-import axios from 'axios';
-import { initStatus, updateStatus, completeStatus, failStatus } from './statusManager.js';
+import { initStatus, updateStatus, completeStatus, failStatus, updatePhaseProgress, completePhase, skipPhase } from './statusManager.js';
 import { executeIdealPipeline } from './pipeline.js';
 import { getVideoMetadata } from './ffmpeg.js';
 import { uploadResultFile } from './blobUploader.js';
 import { extractAudioForWhisper, hasAudioStream, preprocessAudioForVAD } from './audioExtractor.js';
 import { processAudioWithVADAndWhisper } from './audioWhisperPipeline.js';
-import { getDownloadUrl, deleteFromR2 } from './r2Client.js';
+import { downloadFromR2Parallel, deleteFromR2 } from './r2Client.js';
 import { logCriticalError } from './errorTracking.js';
-import { resultFileMap } from '../index.js';
+import { resultFileMap, setCurrentProcessingUpload } from '../index.js';
+import { getOrCreateCheckpoint, saveCheckpoint, deleteCheckpoint, } from './checkpointService.js';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -56,11 +56,22 @@ dataConsent, detectionMode = 'standard' // Enhanced mode for fade/dissolve detec
     const overallStartTime = Date.now();
     let r2Deleted = false; // Track if R2 object has been deleted
     let tempDir = null;
+    let checkpoint = null;
     try {
+        // Track current processing for graceful shutdown handling
+        setCurrentProcessingUpload(uploadId);
         console.log(`[${uploadId}] ═══════════════════════════════════════════════`);
         console.log(`[${uploadId}] Starting video processing for user ${userId}`);
         console.log(`[${uploadId}] R2 Key: ${r2Key}`);
         console.log(`[${uploadId}] Detection mode: ${detectionMode}`);
+        // Load or create checkpoint for resumable processing
+        checkpoint = await getOrCreateCheckpoint(uploadId, userId);
+        const isResuming = checkpoint.currentStep !== 'downloading' || checkpoint.completedAudioChunks.length > 0;
+        if (isResuming) {
+            console.log(`[${uploadId}] ▶️ RESUMING from step: ${checkpoint.currentStep}`);
+            console.log(`[${uploadId}]   - Completed audio chunks: ${checkpoint.completedAudioChunks.length}/${checkpoint.totalAudioChunks || '?'}`);
+            console.log(`[${uploadId}]   - Completed OCR scenes: ${checkpoint.completedOcrScenes.length}/${checkpoint.totalScenes || '?'}`);
+        }
         // Security: Initialize status with userId for access control
         try {
             await initStatus(uploadId, userId);
@@ -77,17 +88,88 @@ dataConsent, detectionMode = 'standard' // Enhanced mode for fade/dissolve detec
         try {
             // Ref object to track R2 deletion status (passed by reference to helper function)
             const r2DeletedRef = { value: false };
+            // Type assertion: checkpoint is guaranteed to be non-null after getOrCreateCheckpoint
+            const cp = checkpoint;
+            const stepOrder = [
+                'downloading', 'audio_extraction', 'transcription', 'scene_detection', 'ocr', 'excel_generation'
+            ];
+            const getStepIndex = (step) => stepOrder.indexOf(step);
+            const shouldRunStep = (step) => getStepIndex(cp.currentStep) <= getStepIndex(step);
             // Step 1: Download video from R2, delete source, and compress if needed
-            await downloadAndPrepareVideo(uploadId, r2Key, videoPath, r2DeletedRef, userId);
-            r2Deleted = r2DeletedRef.value;
+            // Skip if already completed (resuming from later step)
+            if (shouldRunStep('downloading')) {
+                await downloadAndPrepareVideo(uploadId, r2Key, videoPath, r2DeletedRef, userId);
+                r2Deleted = r2DeletedRef.value;
+                // Save checkpoint: download complete
+                cp.currentStep = 'audio_extraction';
+                await saveCheckpoint(cp);
+            }
+            else {
+                console.log(`[${uploadId}] ⏭️ Skipping download (resuming from ${cp.currentStep})`);
+                // For resume: download video from intermediate storage or original R2 key
+                try {
+                    if (cp.intermediateVideoPath) {
+                        await downloadFromR2Parallel(cp.intermediateVideoPath, videoPath);
+                    }
+                    else {
+                        // Try downloading from original R2 key (may have been deleted)
+                        await downloadFromR2Parallel(r2Key, videoPath);
+                    }
+                }
+                catch (downloadErr) {
+                    console.error(`[${uploadId}] ❌ Failed to download video for resume: ${downloadErr}`);
+                    throw new Error(`Cannot resume: video file not available. Please re-upload.`);
+                }
+                r2Deleted = true; // Assume already deleted on first run
+            }
             // Step 2-3: Extract metadata and audio
-            const { videoMetadata, hasAudio } = await extractMetadataAndAudio(uploadId, videoPath, audioPath);
+            // Skip audio extraction if already completed
+            let videoMetadata;
+            let hasAudio;
+            if (shouldRunStep('audio_extraction')) {
+                const result = await extractMetadataAndAudio(uploadId, videoPath, audioPath);
+                videoMetadata = result.videoMetadata;
+                hasAudio = result.hasAudio;
+                // Save checkpoint: audio extraction complete
+                cp.currentStep = 'transcription';
+                cp.videoDuration = videoMetadata.duration;
+                await saveCheckpoint(cp);
+            }
+            else {
+                console.log(`[${uploadId}] ⏭️ Skipping audio extraction (resuming from ${cp.currentStep})`);
+                videoMetadata = await getVideoMetadata(videoPath);
+                hasAudio = await hasAudioStream(videoPath);
+            }
             // Step 4: Perform VAD + Whisper transcription (if audio exists)
-            const { transcription, vadStats } = await performTranscription(uploadId, audioPath, hasAudio);
+            // Resume from checkpoint if partially completed
+            let transcription;
+            let vadStats = null;
+            if (shouldRunStep('transcription')) {
+                const result = await performTranscriptionWithCheckpoint(uploadId, audioPath, hasAudio, cp);
+                transcription = result.transcription;
+                vadStats = result.vadStats;
+                // Save checkpoint: transcription complete
+                cp.currentStep = 'scene_detection';
+                cp.transcriptionSegments = transcription;
+                await saveCheckpoint(cp);
+            }
+            else if (cp.transcriptionSegments.length > 0) {
+                console.log(`[${uploadId}] ⏭️ Using cached transcription (${cp.transcriptionSegments.length} segments)`);
+                transcription = cp.transcriptionSegments;
+            }
+            else {
+                // Should not happen, but fallback to empty transcription
+                console.warn(`[${uploadId}] ⚠️ No cached transcription, proceeding with empty`);
+                transcription = [];
+            }
             // Step 5: Execute scene detection, OCR, and Excel generation
-            const { excelPath, stats } = await executeSceneDetectionAndOCR(uploadId, videoPath, fileName, transcription, detectionMode);
+            // Resume from checkpoint if partially completed
+            const { excelPath, stats } = await executeSceneDetectionAndOCRWithCheckpoint(uploadId, videoPath, fileName, transcription, detectionMode, cp);
             // Step 6: Upload result and complete processing
             await uploadResultAndComplete(uploadId, excelPath, videoMetadata, transcription, stats, overallStartTime, detectionMode, userId);
+            // Cleanup checkpoint on successful completion
+            await deleteCheckpoint(uploadId);
+            console.log(`[${uploadId}] ✅ Checkpoint deleted (processing complete)`);
         }
         finally {
             // Cleanup temporary directory
@@ -128,10 +210,14 @@ dataConsent, detectionMode = 'standard' // Enhanced mode for fade/dissolve detec
                 }
             }
         }
+        // Clear current processing tracking (job completed or failed)
+        setCurrentProcessingUpload(null);
+        console.log(`[${uploadId}] Processing tracking cleared`);
     }
 };
 /**
  * Download video from R2, delete source, and compress if needed
+ * Phase 1 progress: 0-30% (download 0-20%, compress 20-30%)
  *
  * @param uploadId - Upload ID for logging
  * @param r2Key - Source video R2 key
@@ -141,13 +227,31 @@ dataConsent, detectionMode = 'standard' // Enhanced mode for fade/dissolve detec
  * @returns void
  */
 async function downloadAndPrepareVideo(uploadId, r2Key, videoPath, r2Deleted, userId) {
-    // Step 1: Get presigned URL and download video from R2
-    await safeUpdateStatus(uploadId, { status: 'processing', progress: 10, stage: 'downloading' });
-    await timeStep(uploadId, 'Download Video from R2', async () => {
-        // Get presigned download URL from R2
-        const downloadUrl = await getDownloadUrl(r2Key);
-        console.log(`[${uploadId}] Generated R2 presigned URL for download`);
-        await downloadFile(downloadUrl, videoPath, uploadId, { start: 10, end: 20 });
+    // Phase 1 Step 1: Download video directly from R2 using AWS SDK
+    // Phase 1 progress: 0-20%
+    await updatePhaseProgress(uploadId, 1, 0, {
+        phaseStatus: 'in_progress',
+        subTask: 'Downloading video...',
+        stage: 'downloading',
+    });
+    await timeStep(uploadId, 'Download Video from R2 (Parallel)', async () => {
+        // Download directly from R2 using parallel chunk downloads for high-speed transfer
+        console.log(`[${uploadId}] Starting parallel download from R2: ${r2Key}`);
+        await downloadFromR2Parallel(r2Key, videoPath, {
+            chunkSize: 50 * 1024 * 1024, // 50MB chunks
+            concurrency: 5, // 5 parallel downloads
+            onProgress: async (downloaded, total) => {
+                const progressPercent = downloaded / total;
+                // Phase 1 progress: 0-20% for download
+                const phaseProgress = Math.round(progressPercent * 20);
+                const downloadedMB = (downloaded / 1024 / 1024).toFixed(0);
+                const totalMB = (total / 1024 / 1024).toFixed(0);
+                await updatePhaseProgress(uploadId, 1, phaseProgress, {
+                    subTask: `Downloading ${downloadedMB}MB / ${totalMB}MB`,
+                    stage: 'downloading',
+                });
+            },
+        });
     });
     // Delete source video from R2 after successful download (early cleanup)
     try {
@@ -159,11 +263,11 @@ async function downloadAndPrepareVideo(uploadId, r2Key, videoPath, r2Deleted, us
     catch (deleteError) {
         console.warn(`[${uploadId}] ⚠️  Failed to delete R2 object (will retry in finally):`, deleteError);
     }
-    // Step 1.5: Compress video if needed
-    await safeUpdateStatus(uploadId, {
-        status: 'processing',
-        progress: 15,
-        stage: 'compressing'
+    // Phase 1 Step 2: Compress video if needed
+    // Phase 1 progress: 20-30%
+    await updatePhaseProgress(uploadId, 1, 20, {
+        subTask: 'Preparing video...',
+        stage: 'compressing',
     });
     try {
         const compressionResult = await timeStep(uploadId, 'Compress Video (if needed)', async () => {
@@ -184,9 +288,15 @@ async function downloadAndPrepareVideo(uploadId, r2Key, videoPath, r2Deleted, us
         console.warn(`[${uploadId}] ⚠️  Compression failed, continuing with original file:`, compressionError);
         // Continue processing with original file (compression failure is not fatal)
     }
+    // Phase 1 progress: 30% complete
+    await updatePhaseProgress(uploadId, 1, 30, {
+        subTask: 'Video ready',
+        stage: 'compressing',
+    });
 }
 /**
  * Extract video metadata and audio (if available)
+ * Phase 1 progress: 30-50% (metadata 30-35%, audio detection 35-40%, audio extraction 40-50%)
  *
  * @param uploadId - Upload ID for logging
  * @param videoPath - Path to video file
@@ -194,22 +304,42 @@ async function downloadAndPrepareVideo(uploadId, r2Key, videoPath, r2Deleted, us
  * @returns Object containing video metadata and hasAudio flag
  */
 async function extractMetadataAndAudio(uploadId, videoPath, audioPath) {
-    // Step 2: Extract video metadata
-    await safeUpdateStatus(uploadId, { status: 'processing', progress: 20, stage: 'metadata' });
+    // Phase 1 Step 3: Extract video metadata
+    // Phase 1 progress: 30-35%
+    await updatePhaseProgress(uploadId, 1, 30, {
+        subTask: 'Reading video info...',
+        stage: 'metadata',
+    });
     const videoMetadata = await timeStep(uploadId, 'Extract Video Metadata', async () => {
         return await getVideoMetadata(videoPath);
     });
-    // Step 3: Extract audio (Whisper-optimized)
-    await safeUpdateStatus(uploadId, { status: 'processing', progress: 30, stage: 'audio' });
+    await updatePhaseProgress(uploadId, 1, 35, {
+        subTask: 'Video info extracted',
+        stage: 'metadata',
+    });
+    // Phase 1 Step 4: Detect and extract audio (Whisper-optimized)
+    // Phase 1 progress: 35-50%
+    await updatePhaseProgress(uploadId, 1, 35, {
+        subTask: 'Detecting audio...',
+        stage: 'audio',
+    });
     const hasAudio = await timeStep(uploadId, 'Detect Audio Stream', async () => {
         return await hasAudioStream(videoPath);
     });
     if (hasAudio) {
+        await updatePhaseProgress(uploadId, 1, 40, {
+            subTask: 'Extracting audio...',
+            stage: 'audio',
+        });
         await timeStep(uploadId, 'Extract Audio (16kHz mono)', async () => {
             await extractAudioForWhisper(videoPath, audioPath);
         });
         // Audio preprocessing for improved VAD detection (BGM suppression + voice enhancement)
         // Re-enabled after baseline test completion (2025-11-12)
+        await updatePhaseProgress(uploadId, 1, 45, {
+            subTask: 'Enhancing audio quality...',
+            stage: 'audio',
+        });
         await timeStep(uploadId, 'Preprocess Audio (BGM suppression)', async () => {
             try {
                 await preprocessAudioForVAD(audioPath, uploadId);
@@ -222,14 +352,23 @@ async function extractMetadataAndAudio(uploadId, videoPath, audioPath) {
                 // Do not throw - processing continues with original audio
             }
         });
+        await updatePhaseProgress(uploadId, 1, 50, {
+            subTask: 'Audio ready',
+            stage: 'audio',
+        });
     }
     else {
         console.log(`[${uploadId}] ⚠️ No audio stream detected, skipping audio extraction`);
+        await updatePhaseProgress(uploadId, 1, 50, {
+            subTask: 'No audio detected',
+            stage: 'audio_skipped',
+        });
     }
     return { videoMetadata, hasAudio };
 }
 /**
  * Perform VAD + Whisper transcription (if audio exists)
+ * Phase 1 progress: 50-100% (Whisper transcription is the main work)
  *
  * @param uploadId - Upload ID for logging
  * @param audioPath - Path to audio file
@@ -240,8 +379,13 @@ async function performTranscription(uploadId, audioPath, hasAudio) {
     let transcription = [];
     let vadStats = null;
     if (hasAudio) {
-        // Step 4: VAD + Whisper pipeline (optimized processing)
-        await safeUpdateStatus(uploadId, { status: 'processing', progress: 45, stage: 'vad_whisper' });
+        // Phase 1 Step 5: VAD + Whisper pipeline (optimized processing)
+        // Phase 1 progress: 50-95% (main transcription work)
+        await updatePhaseProgress(uploadId, 1, 50, {
+            subTask: 'Starting voice detection...',
+            stage: 'vad_whisper',
+            estimatedTimeRemaining: 'About 2-5 min (estimate)',
+        });
         const pipelineResult = await timeStep(uploadId, 'VAD + Whisper Pipeline', async () => {
             return await processAudioWithVADAndWhisper(audioPath, uploadId);
         });
@@ -250,15 +394,87 @@ async function performTranscription(uploadId, audioPath, hasAudio) {
         console.log(`[${uploadId}] VAD + Whisper complete: ${transcription.length} segments`);
         console.log(`[${uploadId}]   Voice ratio: ${(vadStats.voiceRatio * 100).toFixed(1)}%`);
         console.log(`[${uploadId}]   Cost savings: ${vadStats.estimatedSavings.toFixed(1)}%`);
+        // Phase 1 complete
+        await completePhase(uploadId, 1);
+        console.log(`[${uploadId}] ✅ Phase 1 complete: Listening to narration`);
     }
     else {
+        // No audio: Skip Phase 1 (show "No audio detected")
         console.log(`[${uploadId}] ⚠️ No audio stream detected, skipping transcription`);
-        await safeUpdateStatus(uploadId, { status: 'processing', progress: 45, stage: 'audio_skipped' });
+        await skipPhase(uploadId, 1, 'No audio detected');
+        console.log(`[${uploadId}] ⏭️ Phase 1 skipped: No audio detected`);
     }
     return { transcription, vadStats };
 }
 /**
+ * Perform VAD + Whisper transcription with checkpoint support
+ * Resumes from partially completed audio chunks
+ *
+ * @param uploadId - Upload ID for logging
+ * @param audioPath - Path to audio file
+ * @param hasAudio - Whether audio stream exists
+ * @param checkpoint - Processing checkpoint for resume support
+ * @returns Object containing transcription segments and VAD statistics
+ */
+async function performTranscriptionWithCheckpoint(uploadId, audioPath, hasAudio, checkpoint) {
+    // If no audio, skip transcription
+    if (!hasAudio) {
+        console.log(`[${uploadId}] ⚠️ No audio stream detected, skipping transcription`);
+        await skipPhase(uploadId, 1, 'No audio detected');
+        return { transcription: [], vadStats: null };
+    }
+    // Check for partially completed transcription
+    const completedChunks = checkpoint.completedAudioChunks;
+    const cachedSegments = checkpoint.transcriptionSegments;
+    if (completedChunks.length > 0) {
+        console.log(`[${uploadId}] ▶️ Resuming transcription from chunk ${completedChunks.length}`);
+        console.log(`[${uploadId}]   - Cached segments: ${cachedSegments.length}`);
+    }
+    // Perform transcription (audioWhisperPipeline will handle checkpoint internally)
+    const pipelineResult = await timeStep(uploadId, 'VAD + Whisper Pipeline (Resumable)', async () => {
+        return await processAudioWithVADAndWhisper(audioPath, uploadId, checkpoint);
+    });
+    const transcription = pipelineResult.segments;
+    const vadStats = pipelineResult.vadStats;
+    console.log(`[${uploadId}] VAD + Whisper complete: ${transcription.length} segments`);
+    console.log(`[${uploadId}]   Voice ratio: ${(vadStats.voiceRatio * 100).toFixed(1)}%`);
+    console.log(`[${uploadId}]   Cost savings: ${vadStats.estimatedSavings.toFixed(1)}%`);
+    // Phase 1 complete
+    await completePhase(uploadId, 1);
+    console.log(`[${uploadId}] ✅ Phase 1 complete: Listening to narration`);
+    return { transcription, vadStats };
+}
+/**
+ * Execute scene detection, OCR, and Excel generation with checkpoint support
+ *
+ * @param uploadId - Upload ID for logging
+ * @param videoPath - Path to video file
+ * @param fileName - Original file name
+ * @param transcription - Transcription segments
+ * @param detectionMode - Detection mode ('standard' or 'enhanced')
+ * @param checkpoint - Processing checkpoint for resume support
+ * @returns Object containing Excel path and pipeline statistics
+ */
+async function executeSceneDetectionAndOCRWithCheckpoint(uploadId, videoPath, fileName, transcription, detectionMode = 'standard', checkpoint) {
+    // Phase 2 starts: Scene detection + OCR
+    await updatePhaseProgress(uploadId, 2, 0, {
+        phaseStatus: 'in_progress',
+        subTask: 'Starting scene detection...',
+        stage: 'scene_detection',
+        estimatedTimeRemaining: 'About 3-8 min (estimate)',
+    });
+    const pipelineResult = await timeStep(uploadId, 'Scene Detection + OCR + Excel Generation (Resumable)', async () => {
+        return await executeIdealPipeline(videoPath, fileName, transcription, uploadId, detectionMode, checkpoint // Pass checkpoint for OCR resume
+        );
+    });
+    return {
+        excelPath: pipelineResult.excelPath,
+        stats: pipelineResult.stats
+    };
+}
+/**
  * Execute scene detection, OCR, and Excel generation pipeline
+ * Phase 2 (0-100%) and Phase 3 (0-100%) are managed within executeIdealPipeline
  *
  * @param uploadId - Upload ID for logging
  * @param videoPath - Path to video file
@@ -268,8 +484,14 @@ async function performTranscription(uploadId, audioPath, hasAudio) {
  * @returns Object containing Excel path and pipeline statistics
  */
 async function executeSceneDetectionAndOCR(uploadId, videoPath, fileName, transcription, detectionMode = 'standard') {
-    // Step 5: Execute ideal Excel pipeline (Scene detection + OCR + Excel generation)
-    await safeUpdateStatus(uploadId, { status: 'processing', progress: 60, stage: 'scene_ocr_excel' });
+    // Phase 2 starts: Scene detection + OCR
+    // Phase 2 and Phase 3 progress are managed within executeIdealPipeline
+    await updatePhaseProgress(uploadId, 2, 0, {
+        phaseStatus: 'in_progress',
+        subTask: 'Starting scene detection...',
+        stage: 'scene_detection',
+        estimatedTimeRemaining: 'About 3-8 min (estimate)',
+    });
     const pipelineResult = await timeStep(uploadId, 'Scene Detection + OCR + Excel Generation', async () => {
         return await executeIdealPipeline(videoPath, fileName, transcription, uploadId, detectionMode);
     });
@@ -280,6 +502,7 @@ async function executeSceneDetectionAndOCR(uploadId, videoPath, fileName, transc
 }
 /**
  * Upload result file and complete processing status
+ * Phase 3 progress: 70-100% (upload 70-95%, finalize 95-100%)
  *
  * @param uploadId - Upload ID for logging
  * @param excelPath - Path to Excel file
@@ -292,8 +515,12 @@ async function executeSceneDetectionAndOCR(uploadId, videoPath, fileName, transc
  * @returns Result URL and R2 key (if in production)
  */
 async function uploadResultAndComplete(uploadId, excelPath, videoMetadata, transcription, stats, overallStartTime, detectionMode = 'standard', userId = 'system') {
-    // Step 9: Upload result file or store locally for development
-    await safeUpdateStatus(uploadId, { status: 'processing', progress: 90, stage: 'upload_result' });
+    // Phase 3 Step 3: Upload result file or store locally for development
+    // Phase 3 progress: 70-95%
+    await updatePhaseProgress(uploadId, 3, 70, {
+        subTask: 'Uploading result...',
+        stage: 'upload_result',
+    });
     let resultUrl = uploadId; // Initialize with uploadId
     let resultR2Key = null;
     await timeStep(uploadId, 'Upload Result File', async () => {
@@ -332,8 +559,16 @@ async function uploadResultAndComplete(uploadId, excelPath, videoMetadata, trans
     if (resultR2Key) {
         completionMetadata.resultR2Key = resultR2Key;
     }
+    // Phase 3 complete: Mark as 100% before final status update
+    await updatePhaseProgress(uploadId, 3, 95, {
+        subTask: 'Finalizing...',
+        stage: 'upload_result',
+    });
     // Try to update Supabase status, but don't fail if it errors (dev mode resilience)
     try {
+        // Complete Phase 3 and overall processing
+        await completePhase(uploadId, 3);
+        console.log(`[${uploadId}] ✅ Phase 3 complete: Creating your report`);
         await completeStatus(uploadId, resultUrl, completionMetadata);
     }
     catch (statusError) {
@@ -361,11 +596,18 @@ async function uploadResultAndComplete(uploadId, excelPath, videoMetadata, trans
  */
 async function compressVideoIfNeeded(inputPath, uploadId) {
     const COMPRESSION_THRESHOLD = 200 * 1024 * 1024; // 200MB in bytes
+    const COMPRESSION_MAX_SIZE = 800 * 1024 * 1024; // 800MB - skip compression for very large files (2GB support)
+    const COMPRESSION_TIMEOUT_MS = 1200000; // 20 minutes timeout (for 800MB files)
     // Check file size
     const stats = fs.statSync(inputPath);
     const originalSize = stats.size;
     if (originalSize < COMPRESSION_THRESHOLD) {
         console.log(`[${uploadId}] File size ${(originalSize / 1024 / 1024).toFixed(1)}MB is under ${COMPRESSION_THRESHOLD / 1024 / 1024}MB threshold, skipping compression`);
+        return { compressed: false, originalSize, newSize: originalSize };
+    }
+    // Skip compression for very large files to avoid timeout
+    if (originalSize > COMPRESSION_MAX_SIZE) {
+        console.log(`[${uploadId}] ⚠️  File size ${(originalSize / 1024 / 1024).toFixed(1)}MB exceeds ${COMPRESSION_MAX_SIZE / 1024 / 1024}MB, skipping compression to avoid timeout`);
         return { compressed: false, originalSize, newSize: originalSize };
     }
     console.log(`[${uploadId}] File size ${(originalSize / 1024 / 1024).toFixed(1)}MB exceeds threshold, starting compression...`);
@@ -392,9 +634,10 @@ async function compressVideoIfNeeded(inputPath, uploadId) {
             '-y',
             outputPath
         ];
-        console.log(`[${uploadId}] Running ffmpeg compression (CRF 28, fast preset)...`);
+        console.log(`[${uploadId}] Running ffmpeg compression (CRF 28, fast preset, timeout: ${COMPRESSION_TIMEOUT_MS / 1000}s)...`);
         const { stdout, stderr } = await execFileAsync('ffmpeg', ffmpegArgs, {
-            maxBuffer: 10 * 1024 * 1024 // 10MB buffer for ffmpeg output
+            maxBuffer: 10 * 1024 * 1024, // 10MB buffer for ffmpeg output
+            timeout: COMPRESSION_TIMEOUT_MS // 10 minutes timeout
         });
         const endTime = Date.now();
         const durationSec = ((endTime - startTime) / 1000).toFixed(1);
@@ -420,84 +663,5 @@ async function compressVideoIfNeeded(inputPath, uploadId) {
         console.error(`[${uploadId}] Compression failed: ${errorMessage}`);
         throw error;
     }
-}
-/**
- * Download file from URL with progress tracking
- * @param url - URL to download from
- * @param dest - Destination file path
- * @param uploadId - Upload ID for progress updates (optional)
- * @param progressRange - Progress range to map download progress to (default: 10-20%)
- */
-async function downloadFile(url, dest, uploadId, progressRange = { start: 10, end: 20 }) {
-    console.log(`[downloadFile] Starting download from: ${url.substring(0, 100)}...`);
-    const response = await axios.get(url, {
-        responseType: 'stream',
-        timeout: 300000, // 5 minutes timeout (increased from 60s for large videos)
-        maxContentLength: 500 * 1024 * 1024, // 500MB max
-        maxBodyLength: 500 * 1024 * 1024
-    }).catch(err => {
-        console.error(`[downloadFile] Axios request failed:`, {
-            message: err.message,
-            code: err.code,
-            timeout: err.timeout,
-            url: url.substring(0, 100)
-        });
-        throw new Error(`Failed to download video: ${err.message}`);
-    });
-    console.log(`[downloadFile] Response received, content-length: ${response.headers['content-length'] || 'unknown'}`);
-    return new Promise((resolve, reject) => {
-        const file = fs.createWriteStream(dest);
-        let downloadedBytes = 0;
-        let lastLoggedBytes = 0; // Track last logged position for console logging
-        const totalBytes = parseInt(response.headers['content-length'] || '0');
-        const LOG_INTERVAL = 10 * 1024 * 1024; // 10MB for console logging
-        // Progress update tracking (for Supabase updates)
-        const PROGRESS_UPDATE_THRESHOLD = 0.02; // Update every 2% of download progress
-        let lastProgressUpdate = 0;
-        response.data.on('data', (chunk) => {
-            downloadedBytes += chunk.length;
-            // Console logging (10MB intervals)
-            if (totalBytes > 0 && downloadedBytes - lastLoggedBytes >= LOG_INTERVAL) {
-                const percent = ((downloadedBytes / totalBytes) * 100).toFixed(1);
-                console.log(`[downloadFile] Progress: ${percent}% (${(downloadedBytes / 1024 / 1024).toFixed(1)}MB / ${(totalBytes / 1024 / 1024).toFixed(1)}MB)`);
-                lastLoggedBytes = downloadedBytes;
-            }
-            // Supabase progress updates (2% intervals)
-            if (uploadId && totalBytes > 0) {
-                const downloadProgress = downloadedBytes / totalBytes; // 0.0 - 1.0
-                // Update if progress changed by 2%
-                if (downloadProgress - lastProgressUpdate >= PROGRESS_UPDATE_THRESHOLD) {
-                    const range = progressRange.end - progressRange.start;
-                    const overallProgress = progressRange.start + (downloadProgress * range);
-                    // Fire-and-forget (non-blocking) Supabase update
-                    safeUpdateStatus(uploadId, {
-                        progress: Math.floor(overallProgress),
-                        stage: 'downloading'
-                    }).catch((err) => {
-                        // Non-fatal error - download continues even if Supabase update fails
-                        console.error(`[${uploadId}] Progress update failed (non-fatal):`, err);
-                    });
-                    lastProgressUpdate = downloadProgress;
-                }
-            }
-        });
-        response.data.pipe(file);
-        file.on('finish', () => {
-            file.close();
-            console.log(`[downloadFile] Download complete: ${(downloadedBytes / 1024 / 1024).toFixed(1)}MB`);
-            resolve(null);
-        });
-        file.on('error', (err) => {
-            console.error(`[downloadFile] File write error:`, err);
-            fs.unlink(dest, () => { }); // Clean up partial file
-            reject(new Error(`Failed to write file: ${err.message}`));
-        });
-        response.data.on('error', (err) => {
-            console.error(`[downloadFile] Stream error:`, err);
-            file.close();
-            fs.unlink(dest, () => { }); // Clean up partial file
-            reject(new Error(`Download stream error: ${err.message}`));
-        });
-    });
 }
 //# sourceMappingURL=videoProcessor.js.map

@@ -17,7 +17,29 @@ export declare const DETECTION_MODE_INFO: Record<DetectionMode, {
     description: string;
 }>;
 export type ProcessingStatusType = 'pending' | 'processing' | 'completed' | 'error';
-export type ProcessingStage = 'downloading' | 'compressing' | 'metadata' | 'audio' | 'audio_skipped' | 'vad_whisper' | 'luminance_detection' | 'text_stabilization' | 'scene_ocr_excel' | 'multi_frame_ocr' | 'ocr_processing' | 'ocr_completed' | 'upload_result' | 'completed';
+/**
+ * Processing phase (1-3)
+ * Phase 1: Listening to narration (download → audio → Whisper)
+ * Phase 2: Reading on-screen text (scene detection → frame extraction → OCR)
+ * Phase 3: Creating report (narration mapping → Excel → upload)
+ */
+export type ProcessingPhase = 1 | 2 | 3;
+/**
+ * Phase status
+ */
+export type PhaseStatus = 'waiting' | 'in_progress' | 'completed' | 'skipped';
+/**
+ * Phase information for UI display
+ */
+export interface PhaseInfo {
+    phase: ProcessingPhase;
+    status: PhaseStatus;
+    progress: number;
+    label: string;
+    estimatedTime?: string;
+    subTask?: string;
+}
+export type ProcessingStage = 'downloading' | 'compressing' | 'metadata' | 'audio' | 'audio_skipped' | 'vad_whisper' | 'luminance_detection' | 'text_stabilization' | 'scene_ocr_excel' | 'scene_detection' | 'frame_extraction' | 'multi_frame_ocr' | 'ocr_processing' | 'ocr_completed' | 'batch_processing' | 'narration_mapping' | 'excel_generation' | 'upload_result' | 'completed';
 export interface ProcessingMetadata {
     duration: number;
     segmentCount: number;
@@ -44,6 +66,11 @@ export interface ProcessingStatus {
     resultUrl?: string;
     metadata?: ProcessingMetadata;
     error?: string;
+    phase?: ProcessingPhase;
+    phaseProgress?: number;
+    phaseStatus?: PhaseStatus;
+    estimatedTimeRemaining?: string;
+    subTask?: string;
 }
 export interface SupabaseError {
     code?: string;
@@ -60,6 +87,11 @@ export interface SupabaseStatusUpdate {
     result_url?: string;
     error?: string;
     metadata?: ProcessingMetadata;
+    phase?: ProcessingPhase;
+    phase_progress?: number;
+    phase_status?: PhaseStatus;
+    estimated_time_remaining?: string;
+    sub_task?: string;
 }
 export interface SupabaseStatusRow {
     upload_id: string;
@@ -73,6 +105,11 @@ export interface SupabaseStatusRow {
     result_url?: string;
     metadata?: ProcessingMetadata;
     error?: string;
+    phase?: ProcessingPhase;
+    phase_progress?: number;
+    phase_status?: PhaseStatus;
+    estimated_time_remaining?: string;
+    sub_task?: string;
 }
 export interface WhisperSegment {
     id: number;
@@ -133,6 +170,25 @@ export interface CompressionResult {
     compressed: boolean;
     originalSize: number;
     newSize: number;
+}
+/**
+ * Source of scene cut detection
+ */
+export type SceneCutSource = 'transnet_v2' | 'ffmpeg_standard' | 'ffmpeg_enhanced' | 'full_frame' | 'roi_bottom' | 'roi_center' | 'roi_top_left' | 'roi_top_right' | 'both' | 'supplementary';
+/**
+ * Scene cut detected during video analysis
+ */
+export interface SceneCut {
+    /** Timestamp in seconds */
+    timestamp: number;
+    /** Confidence score (0-1) */
+    confidence: number;
+    /** Detection source */
+    source?: SceneCutSource;
+    /** Frame number (if available) */
+    frame?: number;
+    /** Detection reason/description */
+    detectionReason?: string;
 }
 export interface SceneData {
     sceneNumber: number;

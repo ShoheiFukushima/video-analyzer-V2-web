@@ -37,6 +37,32 @@ export declare const WHISPER_COST: {
     readonly PER_MINUTE: 0.006;
 };
 /**
+ * Pre-chunking configuration for long audio files
+ *
+ * Problem solved:
+ * - Long audio (2+ hours) causes "Maximum call stack size exceeded" in VAD
+ * - avr-vad NonRealTimeVAD loads entire audio into memory (460MB for 2 hours)
+ * - Spread operator in Math.max(...segments) overflows with 10,000+ segments
+ *
+ * Solution:
+ * - Split audio into smaller chunks BEFORE VAD processing
+ * - Process each chunk independently (memory efficient)
+ * - Merge results with proper timestamp adjustment
+ *
+ * Added: 2025-01-18
+ */
+export interface PreChunkConfig {
+    /** Enable pre-chunking for long audio files */
+    enabled: boolean;
+    /** Chunk duration in seconds (default: 300 = 5 minutes) */
+    chunkDuration: number;
+    /** Overlap duration in seconds for boundary detection (default: 1) */
+    overlapDuration: number;
+    /** Minimum audio duration to trigger chunking in seconds (default: 600 = 10 minutes) */
+    minDurationForChunking: number;
+}
+export declare const DEFAULT_PRE_CHUNK_CONFIG: PreChunkConfig;
+/**
  * Merge user config with defaults
  *
  * @param config - User-provided partial configuration

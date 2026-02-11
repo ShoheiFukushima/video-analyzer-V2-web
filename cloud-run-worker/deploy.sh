@@ -19,7 +19,8 @@ echo "Commit: $COMMIT_SHA"
 # 1. ビルド（COMMIT_SHAを環境変数で渡す）
 echo ""
 echo "[1/5] Building..."
-COMMIT_SHA=$COMMIT_SHA npm run build
+export COMMIT_SHA
+npm run build
 
 # 2. デプロイ
 echo ""

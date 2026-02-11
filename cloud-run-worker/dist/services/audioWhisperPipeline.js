@@ -1,8 +1,11 @@
 import path from 'path';
 import fs from 'fs';
 import OpenAI from 'openai';
+import pLimit from 'p-limit';
 import { processAudioWithVAD, extractAudioChunk, cleanupVADFiles } from './vadService.js';
-import { getVADConfig, WHISPER_COST } from '../config/vad.js';
+import { splitAudioIntoChunks, cleanupPreChunks, getAudioMetadata } from './audioExtractor.js';
+import { getVADConfig, WHISPER_COST, DEFAULT_PRE_CHUNK_CONFIG } from '../config/vad.js';
+import { addCompletedAudioChunks, WHISPER_CHECKPOINT_INTERVAL, } from './checkpointService.js';
 /**
  * VAD + Whisper Integration Pipeline
  *
@@ -31,6 +34,7 @@ const openai = new OpenAI({
  *
  * @param audioPath - Path to full audio file (16kHz mono MP3)
  * @param uploadId - Upload ID for logging
+ * @param checkpoint - Optional checkpoint for resumable processing
  * @returns Transcription segments with VAD statistics
  *
  * @example
@@ -43,7 +47,7 @@ const openai = new OpenAI({
  * console.log(`Cost savings: ${result.vadStats.estimatedSavings.toFixed(1)}%`);
  * ```
  */
-export async function processAudioWithVADAndWhisper(audioPath, uploadId) {
+export async function processAudioWithVADAndWhisper(audioPath, uploadId, checkpoint) {
     console.log(`[${uploadId}] Starting VAD + Whisper pipeline`);
     const chunksDir = path.join(path.dirname(audioPath), 'vad-chunks');
     try {
@@ -85,8 +89,9 @@ export async function processAudioWithVADAndWhisper(audioPath, uploadId) {
         // 2. Extract audio chunks
         console.log(`[${uploadId}] Step 2: Extracting ${vadResult.audioChunks.length} audio chunks`);
         await extractAllAudioChunks(audioPath, vadResult.audioChunks);
-        // 3. Transcribe chunks with Whisper
-        const segments = await transcribeChunksWithWhisper(vadResult.audioChunks, uploadId);
+        // 3. Transcribe chunks with Whisper (with checkpoint support)
+        const segments = await transcribeChunksWithWhisper(vadResult.audioChunks, uploadId, 5, // concurrency
+        checkpoint);
         // 4. Calculate statistics
         const stats = calculatePipelineStatistics(vadResult, vadResult.audioChunks.length);
         // 5. Log completion
@@ -115,6 +120,9 @@ async function extractAllAudioChunks(audioPath, chunks) {
 /**
  * Run VAD detection on audio file
  *
+ * For long audio files (>10 minutes), splits audio into 5-minute chunks
+ * before VAD processing to prevent "Maximum call stack size exceeded" errors.
+ *
  * @param audioPath - Path to audio file
  * @param chunksDir - Directory for temporary chunks
  * @param uploadId - Upload ID for logging
@@ -122,33 +130,262 @@ async function extractAllAudioChunks(audioPath, chunks) {
  */
 async function runVADDetection(audioPath, chunksDir, uploadId) {
     console.log(`[${uploadId}] Step 1: Voice Activity Detection`);
-    // Use centralized VAD configuration (fixes narration detection issue)
-    // Reference: .serena/memories/narration_detection_issue_root_cause_2025-11-12.md
-    return await processAudioWithVAD(audioPath, chunksDir, getVADConfig());
+    // Get audio duration to check if pre-chunking is needed
+    let audioDuration;
+    try {
+        const metadata = await getAudioMetadata(audioPath);
+        audioDuration = metadata.duration;
+        console.log(`[${uploadId}] Audio duration: ${audioDuration.toFixed(1)}s (${(audioDuration / 60).toFixed(1)} minutes)`);
+    }
+    catch (error) {
+        console.warn(`[${uploadId}] Could not get audio duration, proceeding without pre-chunking`);
+        // Fallback: process without pre-chunking
+        return await processAudioWithVAD(audioPath, chunksDir, getVADConfig());
+    }
+    // Check if pre-chunking is needed (audio > 10 minutes)
+    if (!DEFAULT_PRE_CHUNK_CONFIG.enabled || audioDuration < DEFAULT_PRE_CHUNK_CONFIG.minDurationForChunking) {
+        console.log(`[${uploadId}] Pre-chunking not needed, processing full audio`);
+        return await processAudioWithVAD(audioPath, chunksDir, getVADConfig());
+    }
+    // Pre-chunk the audio for long files
+    console.log(`[${uploadId}] ═══════════════════════════════════════`);
+    console.log(`[${uploadId}] 🔀 PRE-CHUNKING MODE ACTIVATED`);
+    console.log(`[${uploadId}] ═══════════════════════════════════════`);
+    console.log(`[${uploadId}] Audio is ${(audioDuration / 60).toFixed(1)} minutes (>${(DEFAULT_PRE_CHUNK_CONFIG.minDurationForChunking / 60).toFixed(0)} min threshold)`);
+    console.log(`[${uploadId}] Will split into ${DEFAULT_PRE_CHUNK_CONFIG.chunkDuration / 60}-minute chunks`);
+    const preChunksDir = path.join(path.dirname(audioPath), 'pre-chunks');
+    try {
+        // Split audio into 5-minute chunks
+        const preChunks = await splitAudioIntoChunks(audioPath, preChunksDir, audioDuration, DEFAULT_PRE_CHUNK_CONFIG);
+        if (preChunks.length === 0) {
+            console.log(`[${uploadId}] Pre-chunking returned 0 chunks, falling back to full audio`);
+            return await processAudioWithVAD(audioPath, chunksDir, getVADConfig());
+        }
+        console.log(`[${uploadId}] Created ${preChunks.length} pre-chunks, processing each with VAD...`);
+        // Process each pre-chunk with VAD and collect results
+        const vadResults = [];
+        for (const preChunk of preChunks) {
+            console.log(`[${uploadId}] Processing pre-chunk ${preChunk.index + 1}/${preChunks.length} (${preChunk.startTime.toFixed(1)}s - ${preChunk.endTime.toFixed(1)}s)`);
+            // Create separate output dir for each pre-chunk's VAD chunks
+            const preChunkVADDir = path.join(chunksDir, `prechunk-${preChunk.index}`);
+            const result = await processAudioWithVAD(preChunk.filePath, preChunkVADDir, getVADConfig());
+            vadResults.push({
+                result,
+                offset: preChunk.startTime,
+            });
+        }
+        // Merge VAD results with proper timestamp adjustment
+        const mergedResult = mergeVADResults(vadResults, audioDuration, uploadId);
+        console.log(`[${uploadId}] ═══════════════════════════════════════`);
+        console.log(`[${uploadId}] ✓ PRE-CHUNKING COMPLETE`);
+        console.log(`[${uploadId}] ═══════════════════════════════════════`);
+        console.log(`[${uploadId}] Pre-chunks processed: ${preChunks.length}`);
+        console.log(`[${uploadId}] Total voice segments: ${mergedResult.voiceSegments.length}`);
+        console.log(`[${uploadId}] Total audio chunks: ${mergedResult.audioChunks.length}`);
+        return mergedResult;
+    }
+    finally {
+        // Cleanup pre-chunk files
+        await cleanupPreChunks(preChunksDir);
+    }
 }
 /**
- * Transcribe audio chunks with Whisper
+ * Merge VAD results from multiple pre-chunks into a single result
+ *
+ * Applies timestamp offsets and removes duplicate segments at chunk boundaries.
+ *
+ * @param vadResults - Array of VAD results with their time offsets
+ * @param totalDuration - Total audio duration in seconds
+ * @param uploadId - Upload ID for logging
+ * @returns Merged VAD result with adjusted timestamps
+ */
+function mergeVADResults(vadResults, totalDuration, uploadId) {
+    console.log(`[${uploadId}] Merging ${vadResults.length} VAD results...`);
+    const allVoiceSegments = [];
+    const allAudioChunks = [];
+    let totalVoiceDuration = 0;
+    // Track chunk index across all pre-chunks
+    let globalChunkIndex = 0;
+    for (const { result, offset } of vadResults) {
+        // Adjust voice segment timestamps
+        for (const segment of result.voiceSegments) {
+            allVoiceSegments.push({
+                ...segment,
+                startTime: segment.startTime + offset,
+                endTime: segment.endTime + offset,
+            });
+        }
+        // Adjust audio chunk timestamps and indices
+        for (const chunk of result.audioChunks) {
+            allAudioChunks.push({
+                ...chunk,
+                chunkIndex: globalChunkIndex,
+                startTime: chunk.startTime + offset,
+                endTime: chunk.endTime + offset,
+                voiceSegments: chunk.voiceSegments.map(seg => ({
+                    ...seg,
+                    startTime: seg.startTime + offset,
+                    endTime: seg.endTime + offset,
+                })),
+            });
+            globalChunkIndex++;
+        }
+        totalVoiceDuration += result.totalVoiceDuration;
+    }
+    // Remove duplicate segments at chunk boundaries (within 100ms overlap window)
+    const deduplicatedSegments = deduplicateSegments(allVoiceSegments, 0.1);
+    const deduplicatedChunks = deduplicateChunks(allAudioChunks, 0.1);
+    console.log(`[${uploadId}] After deduplication: ${deduplicatedSegments.length} segments, ${deduplicatedChunks.length} chunks`);
+    // Calculate merged statistics
+    const voiceRatio = totalDuration > 0 ? totalVoiceDuration / totalDuration : 0;
+    const fullAudioCost = (totalDuration / 60) * WHISPER_COST.PER_MINUTE;
+    const vadAudioCost = (totalVoiceDuration / 60) * WHISPER_COST.PER_MINUTE;
+    const estimatedSavings = fullAudioCost > 0 ? ((fullAudioCost - vadAudioCost) / fullAudioCost) * 100 : 0;
+    return {
+        totalDuration,
+        totalVoiceDuration,
+        voiceSegments: deduplicatedSegments,
+        audioChunks: deduplicatedChunks,
+        voiceRatio,
+        estimatedSavings,
+    };
+}
+/**
+ * Remove duplicate voice segments at chunk boundaries
+ *
+ * @param segments - All voice segments from all pre-chunks
+ * @param threshold - Time threshold in seconds for considering segments as duplicates
+ * @returns Deduplicated voice segments
+ */
+function deduplicateSegments(segments, threshold) {
+    if (segments.length === 0)
+        return [];
+    // Sort by start time
+    const sorted = [...segments].sort((a, b) => a.startTime - b.startTime);
+    const result = [sorted[0]];
+    for (let i = 1; i < sorted.length; i++) {
+        const current = sorted[i];
+        const last = result[result.length - 1];
+        // Check if this segment overlaps with the previous one
+        if (current.startTime - last.endTime > threshold) {
+            // No overlap, add as new segment
+            result.push(current);
+        }
+        else if (current.endTime > last.endTime) {
+            // Overlapping, extend the previous segment
+            last.endTime = current.endTime;
+            last.duration = last.endTime - last.startTime;
+        }
+        // Otherwise, current is completely contained in last, skip it
+    }
+    return result;
+}
+/**
+ * Remove duplicate audio chunks at chunk boundaries
+ *
+ * @param chunks - All audio chunks from all pre-chunks
+ * @param threshold - Time threshold in seconds for considering chunks as duplicates
+ * @returns Deduplicated audio chunks with re-indexed chunk numbers
+ */
+function deduplicateChunks(chunks, threshold) {
+    if (chunks.length === 0)
+        return [];
+    // Sort by start time
+    const sorted = [...chunks].sort((a, b) => a.startTime - b.startTime);
+    const result = [sorted[0]];
+    for (let i = 1; i < sorted.length; i++) {
+        const current = sorted[i];
+        const last = result[result.length - 1];
+        // Check if this chunk overlaps with the previous one
+        if (current.startTime - last.endTime > threshold) {
+            // No overlap, add as new chunk
+            result.push(current);
+        }
+        // Otherwise, skip this chunk (it's a duplicate from overlap)
+    }
+    // Re-index chunks
+    return result.map((chunk, index) => ({
+        ...chunk,
+        chunkIndex: index,
+    }));
+}
+/**
+ * Transcribe audio chunks with Whisper (parallel processing with checkpoint support)
+ *
+ * Uses pLimit to control concurrency and process multiple chunks simultaneously.
+ * Default concurrency: 5 parallel Whisper API calls
  *
  * @param chunks - Audio chunks from VAD
  * @param uploadId - Upload ID for logging
- * @returns Transcription segments with absolute timestamps
+ * @param concurrency - Number of parallel Whisper API calls (default: 5)
+ * @param checkpoint - Optional checkpoint for resumable processing
+ * @returns Transcription segments with absolute timestamps (sorted by time)
  */
-async function transcribeChunksWithWhisper(chunks, uploadId) {
-    console.log(`[${uploadId}] Step 3: Transcribing chunks with Whisper`);
-    const segments = [];
-    for (const chunk of chunks) {
-        console.log(`[${uploadId}]   Processing chunk ${chunk.chunkIndex + 1}/${chunks.length}`);
+async function transcribeChunksWithWhisper(chunks, uploadId, concurrency = 5, checkpoint) {
+    // Check for already completed chunks from checkpoint
+    const completedChunkIndices = new Set(checkpoint?.completedAudioChunks || []);
+    const cachedSegments = checkpoint?.transcriptionSegments || [];
+    // Filter out already completed chunks
+    const chunksToProcess = chunks.filter(chunk => !completedChunkIndices.has(chunk.chunkIndex));
+    if (completedChunkIndices.size > 0) {
+        console.log(`[${uploadId}] ▶️ Resuming Whisper transcription`);
+        console.log(`[${uploadId}]   - Already completed: ${completedChunkIndices.size}/${chunks.length} chunks`);
+        console.log(`[${uploadId}]   - Cached segments: ${cachedSegments.length}`);
+        console.log(`[${uploadId}]   - Remaining to process: ${chunksToProcess.length} chunks`);
+    }
+    console.log(`[${uploadId}] Step 3: Transcribing ${chunksToProcess.length} chunks with Whisper (${concurrency} parallel)`);
+    const startTime = Date.now();
+    const limit = pLimit(concurrency);
+    // Track progress
+    let completedChunks = completedChunkIndices.size;
+    const totalChunks = chunks.length;
+    // Accumulate new segments for checkpoint
+    const newSegments = [];
+    const newCompletedIndices = [];
+    // Process remaining chunks in parallel with concurrency limit
+    const chunkResults = await Promise.all(chunksToProcess.map(chunk => limit(async () => {
         const chunkSegments = await transcribeAudioChunk(chunk, uploadId);
-        // Adjust timestamps to absolute time
-        for (const segment of chunkSegments) {
-            segments.push({
-                ...segment,
-                timestamp: chunk.startTime + segment.timestamp, // Add chunk offset
-                chunkIndex: chunk.chunkIndex,
-            });
+        completedChunks++;
+        const percent = ((completedChunks / totalChunks) * 100).toFixed(0);
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        console.log(`[${uploadId}]   Completed chunk ${chunk.chunkIndex + 1}/${totalChunks} (${percent}% in ${elapsed}s)`);
+        // Return segments with adjusted timestamps
+        const adjustedSegments = chunkSegments.map(segment => ({
+            ...segment,
+            timestamp: chunk.startTime + segment.timestamp, // Add chunk offset
+            chunkIndex: chunk.chunkIndex,
+        }));
+        // Track for checkpoint
+        newSegments.push(...adjustedSegments);
+        newCompletedIndices.push(chunk.chunkIndex);
+        // Save checkpoint every WHISPER_CHECKPOINT_INTERVAL chunks
+        if (checkpoint && newCompletedIndices.length > 0 && newCompletedIndices.length % WHISPER_CHECKPOINT_INTERVAL === 0) {
+            try {
+                await addCompletedAudioChunks(uploadId, newCompletedIndices, newSegments);
+                console.log(`[${uploadId}] 💾 Checkpoint saved: ${completedChunks}/${totalChunks} chunks`);
+            }
+            catch (err) {
+                console.warn(`[${uploadId}] ⚠️ Failed to save checkpoint: ${err}`);
+            }
+        }
+        return adjustedSegments;
+    })));
+    // Save final checkpoint for new chunks
+    if (checkpoint && newCompletedIndices.length > 0) {
+        try {
+            await addCompletedAudioChunks(uploadId, newCompletedIndices, newSegments);
+            console.log(`[${uploadId}] 💾 Final Whisper checkpoint saved: ${completedChunks}/${totalChunks} chunks`);
+        }
+        catch (err) {
+            console.warn(`[${uploadId}] ⚠️ Failed to save final checkpoint: ${err}`);
         }
     }
-    return segments;
+    // Combine cached segments with new results
+    const allNewSegments = chunkResults.flat();
+    const allSegments = [...cachedSegments, ...allNewSegments].sort((a, b) => a.timestamp - b.timestamp);
+    const totalDuration = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[${uploadId}] ✓ Whisper parallel processing complete: ${allSegments.length} segments in ${totalDuration}s`);
+    return allSegments;
 }
 /**
  * Calculate pipeline statistics (VAD + Whisper)

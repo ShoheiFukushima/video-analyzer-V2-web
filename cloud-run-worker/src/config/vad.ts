@@ -84,6 +84,72 @@ export const WHISPER_COST = {
 } as const;
 
 /**
+ * Pre-chunking configuration for long audio files
+ *
+ * Problem solved:
+ * - Long audio (2+ hours) causes "Maximum call stack size exceeded" in VAD
+ * - avr-vad NonRealTimeVAD loads entire audio into memory (460MB for 2 hours)
+ * - Spread operator in Math.max(...segments) overflows with 10,000+ segments
+ *
+ * Solution:
+ * - Split audio into smaller chunks BEFORE VAD processing
+ * - Process each chunk independently (memory efficient)
+ * - Merge results with proper timestamp adjustment
+ *
+ * Added: 2025-01-18
+ */
+export interface PreChunkConfig {
+  /** Enable pre-chunking for long audio files */
+  enabled: boolean;
+  /** Chunk duration in seconds (default: 300 = 5 minutes) */
+  chunkDuration: number;
+  /** Overlap duration in seconds for boundary detection (default: 1) */
+  overlapDuration: number;
+  /** Minimum audio duration to trigger chunking in seconds (default: 600 = 10 minutes) */
+  minDurationForChunking: number;
+}
+
+export const DEFAULT_PRE_CHUNK_CONFIG: PreChunkConfig = {
+  /**
+   * Enable pre-chunking
+   *
+   * When enabled, audio files longer than minDurationForChunking
+   * will be split into chunks before VAD processing.
+   */
+  enabled: true,
+
+  /**
+   * Chunk duration (5 minutes = 300 seconds)
+   *
+   * Why 5 minutes:
+   * - Memory: 38MB per chunk (vs 460MB for 2-hour audio)
+   * - VAD processes efficiently (1000-5000 segments per chunk)
+   * - Balances processing overhead vs memory efficiency
+   */
+  chunkDuration: 300,
+
+  /**
+   * Overlap duration (1 second)
+   *
+   * Why 1 second:
+   * - Prevents missing speech at chunk boundaries
+   * - Minimal processing overhead
+   * - Duplicate segments removed during merge
+   */
+  overlapDuration: 1,
+
+  /**
+   * Minimum duration for chunking (10 minutes = 600 seconds)
+   *
+   * Why 10 minutes:
+   * - Short videos don't need chunking overhead
+   * - 10-minute audio = 77MB in memory (acceptable)
+   * - Only long documentaries/videos trigger chunking
+   */
+  minDurationForChunking: 600,
+};
+
+/**
  * Merge user config with defaults
  *
  * @param config - User-provided partial configuration

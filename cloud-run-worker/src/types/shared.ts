@@ -35,6 +35,35 @@ export const DETECTION_MODE_INFO: Record<DetectionMode, { label: string; descrip
 
 export type ProcessingStatusType = 'pending' | 'processing' | 'completed' | 'error';
 
+// ========================================
+// 3-Phase Processing Types
+// ========================================
+
+/**
+ * Processing phase (1-3)
+ * Phase 1: Listening to narration (download → audio → Whisper)
+ * Phase 2: Reading on-screen text (scene detection → frame extraction → OCR)
+ * Phase 3: Creating report (narration mapping → Excel → upload)
+ */
+export type ProcessingPhase = 1 | 2 | 3;
+
+/**
+ * Phase status
+ */
+export type PhaseStatus = 'waiting' | 'in_progress' | 'completed' | 'skipped';
+
+/**
+ * Phase information for UI display
+ */
+export interface PhaseInfo {
+  phase: ProcessingPhase;
+  status: PhaseStatus;
+  progress: number;           // 0-100 within this phase
+  label: string;              // e.g., "Listening to narration..."
+  estimatedTime?: string;     // e.g., "About 2-3 min (estimate)"
+  subTask?: string;           // e.g., "Processing chunk 45/240"
+}
+
 export type ProcessingStage =
   | 'downloading'
   | 'compressing'
@@ -44,10 +73,15 @@ export type ProcessingStage =
   | 'vad_whisper'
   | 'luminance_detection'
   | 'text_stabilization'
-  | 'scene_ocr_excel'
+  | 'scene_ocr_excel'        // @deprecated - Use scene_detection, ocr_processing, excel_generation instead
+  | 'scene_detection'        // シーン検出中 (60-67%)
+  | 'frame_extraction'       // フレーム抽出中 (67-70%)
   | 'multi_frame_ocr'
-  | 'ocr_processing'
+  | 'ocr_processing'         // OCR処理中 (70-85%)
   | 'ocr_completed'
+  | 'batch_processing'       // バッチ処理中（メモリ最適化モード）- フレーム抽出+OCR+クリーンアップを反復
+  | 'narration_mapping'      // ナレーションマッピング中 (85-87%)
+  | 'excel_generation'       // Excel生成中 (87-90%)
   | 'upload_result'
   | 'completed';
 
@@ -78,6 +112,12 @@ export interface ProcessingStatus {
   resultUrl?: string;
   metadata?: ProcessingMetadata;
   error?: string;
+  // 3-Phase UI support
+  phase?: ProcessingPhase;
+  phaseProgress?: number;      // 0-100 within current phase
+  phaseStatus?: PhaseStatus;
+  estimatedTimeRemaining?: string;  // e.g., "About 2-3 min (estimate)"
+  subTask?: string;            // e.g., "Processing chunk 45/240"
 }
 
 // ========================================
@@ -100,6 +140,12 @@ export interface SupabaseStatusUpdate {
   result_url?: string;
   error?: string;
   metadata?: ProcessingMetadata;
+  // 3-Phase UI support
+  phase?: ProcessingPhase;
+  phase_progress?: number;
+  phase_status?: PhaseStatus;
+  estimated_time_remaining?: string;
+  sub_task?: string;
 }
 
 export interface SupabaseStatusRow {
@@ -114,6 +160,12 @@ export interface SupabaseStatusRow {
   result_url?: string;
   metadata?: ProcessingMetadata;
   error?: string;
+  // 3-Phase UI support
+  phase?: ProcessingPhase;
+  phase_progress?: number;
+  phase_status?: PhaseStatus;
+  estimated_time_remaining?: string;
+  sub_task?: string;
 }
 
 // ========================================
@@ -193,6 +245,41 @@ export interface CompressionResult {
   compressed: boolean;
   originalSize: number;
   newSize: number;
+}
+
+// ========================================
+// Scene Detection Types
+// ========================================
+
+/**
+ * Source of scene cut detection
+ */
+export type SceneCutSource =
+  | 'transnet_v2'      // TransNet V2 deep learning detection
+  | 'ffmpeg_standard'  // FFmpeg standard detection
+  | 'ffmpeg_enhanced'  // FFmpeg enhanced detection
+  | 'full_frame'       // Full-frame detection (for ROI compatibility)
+  | 'roi_bottom'       // ROI detection (bottom region)
+  | 'roi_center'       // ROI detection (center region)
+  | 'roi_top_left'     // ROI detection (top-left region)
+  | 'roi_top_right'    // ROI detection (top-right region)
+  | 'both'             // Detected by both methods
+  | 'supplementary';   // Supplementary detection (luminance, black, etc.)
+
+/**
+ * Scene cut detected during video analysis
+ */
+export interface SceneCut {
+  /** Timestamp in seconds */
+  timestamp: number;
+  /** Confidence score (0-1) */
+  confidence: number;
+  /** Detection source */
+  source?: SceneCutSource;
+  /** Frame number (if available) */
+  frame?: number;
+  /** Detection reason/description */
+  detectionReason?: string;
 }
 
 // ========================================

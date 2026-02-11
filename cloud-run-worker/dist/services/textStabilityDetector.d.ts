@@ -13,7 +13,7 @@
  * @module textStabilityDetector
  */
 import { GenerativeModel } from '@google/generative-ai';
-import { RateLimiter } from './rateLimiter.js';
+import { SimpleRateLimiter } from './rateLimiter.js';
 import type { StabilizationPoint } from './luminanceDetector.js';
 export interface TextStabilityConfig {
     /** Interval between frames in seconds (default: 0.1) */
@@ -73,7 +73,7 @@ export declare function extractStabilizationFrames(videoPath: string, stabilizat
 export declare function performFrameOCR(frames: {
     timestamp: number;
     path: string;
-}[], model: GenerativeModel, rateLimiter: RateLimiter): Promise<FrameOCRResult[]>;
+}[], model: GenerativeModel, rateLimiter: SimpleRateLimiter): Promise<FrameOCRResult[]>;
 /**
  * Classify content in a frame as TEXT or OBJECT
  *
@@ -82,7 +82,7 @@ export declare function performFrameOCR(frames: {
  * @param rateLimiter - Rate limiter for API calls
  * @returns Text classification result
  */
-export declare function classifyContent(framePath: string, model: GenerativeModel, rateLimiter: RateLimiter): Promise<TextClassification>;
+export declare function classifyContent(framePath: string, model: GenerativeModel, rateLimiter: SimpleRateLimiter): Promise<TextClassification>;
 /**
  * Find the first stable text frame (2 consecutive frames with same text)
  *
@@ -109,7 +109,7 @@ export declare function calculateFinalScore(classification: TextClassification, 
  * @param config - Configuration options
  * @returns Stable text result or null if no text detected
  */
-export declare function detectTextStabilization(videoPath: string, stabilizationPoint: StabilizationPoint, outputDir: string, model: GenerativeModel, rateLimiter: RateLimiter, config?: Partial<TextStabilityConfig>): Promise<StableTextResult | null>;
+export declare function detectTextStabilization(videoPath: string, stabilizationPoint: StabilizationPoint, outputDir: string, model: GenerativeModel, rateLimiter: SimpleRateLimiter, config?: Partial<TextStabilityConfig>): Promise<StableTextResult | null>;
 /**
  * Process multiple stabilization points and return all text results
  *

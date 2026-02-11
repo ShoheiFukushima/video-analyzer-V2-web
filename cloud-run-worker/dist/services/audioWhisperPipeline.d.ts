@@ -1,4 +1,5 @@
 import type { TranscriptionSegment } from '../types/shared.js';
+import { type ProcessingCheckpoint } from './checkpointService.js';
 export interface PipelineResult {
     /** Transcription segments with timestamps */
     segments: TranscriptionSegment[];
@@ -22,6 +23,7 @@ export interface PipelineResult {
  *
  * @param audioPath - Path to full audio file (16kHz mono MP3)
  * @param uploadId - Upload ID for logging
+ * @param checkpoint - Optional checkpoint for resumable processing
  * @returns Transcription segments with VAD statistics
  *
  * @example
@@ -34,5 +36,5 @@ export interface PipelineResult {
  * console.log(`Cost savings: ${result.vadStats.estimatedSavings.toFixed(1)}%`);
  * ```
  */
-export declare function processAudioWithVADAndWhisper(audioPath: string, uploadId: string): Promise<PipelineResult>;
+export declare function processAudioWithVADAndWhisper(audioPath: string, uploadId: string, checkpoint?: ProcessingCheckpoint): Promise<PipelineResult>;
 //# sourceMappingURL=audioWhisperPipeline.d.ts.map

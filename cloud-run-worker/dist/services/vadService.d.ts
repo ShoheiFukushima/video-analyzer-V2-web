@@ -67,6 +67,9 @@ export interface VADResult {
  * console.log(`Voice ratio: ${result.voiceRatio * 100}%`);
  * console.log(`Chunks: ${result.audioChunks.length}`);
  * ```
+ *
+ * Note: For pre-chunked audio, timestamp offsets are applied during
+ * the merge phase in audioWhisperPipeline.ts, not here.
  */
 export declare function processAudioWithVAD(audioPath: string, outputDir: string, config?: VADConfig): Promise<VADResult>;
 /**

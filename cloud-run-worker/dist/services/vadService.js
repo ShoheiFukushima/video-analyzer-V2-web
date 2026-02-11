@@ -27,6 +27,9 @@ const __dirname = path.dirname(__filename);
  * console.log(`Voice ratio: ${result.voiceRatio * 100}%`);
  * console.log(`Chunks: ${result.audioChunks.length}`);
  * ```
+ *
+ * Note: For pre-chunked audio, timestamp offsets are applied during
+ * the merge phase in audioWhisperPipeline.ts, not here.
  */
 export async function processAudioWithVAD(audioPath, outputDir, config = {}) {
     // Validate file paths (security)
@@ -38,7 +41,7 @@ export async function processAudioWithVAD(audioPath, outputDir, config = {}) {
     console.log(`[VAD] Config:`, finalConfig);
     // Create output directory
     await fs.promises.mkdir(outputDir, { recursive: true });
-    // Detect voice segments
+    // Detect voice segments (local timestamps, relative to audio file start)
     const voiceSegments = await detectVoiceSegments(audioPath, finalConfig);
     console.log(`[VAD] Detected ${voiceSegments.length} voice segments`);
     // Filter out very short segments
@@ -64,8 +67,11 @@ export async function processAudioWithVAD(audioPath, outputDir, config = {}) {
         console.log(`[VAD] 📊 Excluded segments statistics:`);
         console.log(`[VAD]   - Total excluded duration: ${totalExcludedDuration.toFixed(2)}s`);
         console.log(`[VAD]   - Average excluded duration: ${avgExcludedDuration.toFixed(2)}s`);
-        console.log(`[VAD]   - Shortest excluded: ${Math.min(...excludedSegments.map(s => s.duration)).toFixed(2)}s`);
-        console.log(`[VAD]   - Longest excluded: ${Math.max(...excludedSegments.map(s => s.duration)).toFixed(2)}s`);
+        // Use reduce instead of spread to avoid "Maximum call stack size exceeded" for large arrays
+        const shortestExcluded = excludedSegments.reduce((min, s) => Math.min(min, s.duration), Infinity);
+        const longestExcluded = excludedSegments.reduce((max, s) => Math.max(max, s.duration), -Infinity);
+        console.log(`[VAD]   - Shortest excluded: ${shortestExcluded.toFixed(2)}s`);
+        console.log(`[VAD]   - Longest excluded: ${longestExcluded.toFixed(2)}s`);
     }
     else {
         console.log(`[VAD] ✓ No segments excluded (all segments >= ${finalConfig.minSpeechDuration}s)`);
@@ -73,8 +79,9 @@ export async function processAudioWithVAD(audioPath, outputDir, config = {}) {
     // Split into chunks
     const audioChunks = await splitIntoChunks(audioPath, filteredSegments, outputDir, finalConfig.maxChunkDuration);
     // Calculate statistics
+    // Use reduce instead of spread to avoid "Maximum call stack size exceeded" for large arrays
     const totalDuration = voiceSegments.length > 0
-        ? Math.max(...voiceSegments.map(s => s.endTime))
+        ? voiceSegments.reduce((max, s) => Math.max(max, s.endTime), -Infinity)
         : 0;
     const totalVoiceDuration = filteredSegments.reduce((sum, seg) => sum + seg.duration, 0);
     const voiceRatio = totalDuration > 0 ? totalVoiceDuration / totalDuration : 0;

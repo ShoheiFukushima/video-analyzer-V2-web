@@ -11,7 +11,7 @@
  * @module multiFrameOCR
  */
 import { GenerativeModel } from '@google/generative-ai';
-import { RateLimiter } from './rateLimiter.js';
+import { SimpleRateLimiter } from './rateLimiter.js';
 import type { Scene } from '../types/excel.js';
 export interface MultiFrameConfig {
     /** Frame positions within scene (default: [0.25, 0.5, 0.75]) */
@@ -75,7 +75,7 @@ export declare function performMultiFrameOCR(scene: Scene, frames: {
     position: number;
     timestamp: number;
     path: string;
-}[], model: GenerativeModel, rateLimiter: RateLimiter, config?: Partial<MultiFrameConfig>): Promise<MultiFrameOCRResult>;
+}[], model: GenerativeModel, rateLimiter: SimpleRateLimiter, config?: Partial<MultiFrameConfig>): Promise<MultiFrameOCRResult>;
 /**
  * Process multiple scenes with multi-frame OCR
  *

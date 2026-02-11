@@ -1,86 +1,82 @@
 import dotenv from 'dotenv';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import type {
-  ProcessingStatus,
-  SupabaseError,
-  SupabaseStatusUpdate,
-  SupabaseStatusRow,
-} from '../types/shared.js';
+import { createClient, type Client } from '@libsql/client';
+import type { ProcessingStatus, ProcessingPhase, PhaseStatus } from '../types/shared.js';
 
 // Load environment variables
 dotenv.config();
 
-// Determine if Supabase should be used
-// Use Supabase in production, or when explicitly enabled
-const USE_SUPABASE = process.env.NODE_ENV === 'production' || process.env.USE_SUPABASE === 'true';
+// Import shutdown flag to prevent race condition during graceful shutdown
+// Note: Dynamic import to avoid circular dependency
+let getShutdownFlag: () => boolean = () => false;
+import('../index.js').then(m => {
+  getShutdownFlag = () => m.isShuttingDown;
+}).catch(() => {
+  // Fallback for test environments
+  console.log('[StatusManager] Could not import shutdown flag, using default');
+});
 
 // In-memory status storage (development mode only)
 const inMemoryStatusMap = new Map<string, ProcessingStatus>();
 
-// Supabase client (production mode only)
-let supabase: SupabaseClient | null = null;
+// Turso client (lazy initialization to avoid race condition with Secret Manager)
+let turso: Client | null = null;
+let tursoInitialized = false;
 
-// Initialize Supabase client if enabled
-if (USE_SUPABASE) {
-  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error(
-      'Missing required Supabase environment variables: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY'
-    );
+/**
+ * Lazy initialization of Turso client
+ * This avoids race conditions with Cloud Run Secret Manager injection
+ */
+function getTursoClient(): Client | null {
+  if (tursoInitialized) {
+    return turso;
   }
-  supabase = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
-  console.log('[StatusManager] Supabase mode enabled');
-} else {
-  console.log('[StatusManager] In-memory mode enabled (development)');
+
+  // Determine if Turso should be used
+  // Use Turso in production, or when explicitly enabled
+  const useTurso = process.env.NODE_ENV === 'production' || process.env.USE_TURSO === 'true';
+
+  if (!useTurso) {
+    console.log('[StatusManager] In-memory mode enabled (development)');
+    tursoInitialized = true;
+    return null;
+  }
+
+  // Check for required environment variables
+  if (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN) {
+    console.error('[StatusManager] Missing Turso environment variables, falling back to in-memory mode');
+    console.error('[StatusManager] TURSO_DATABASE_URL:', process.env.TURSO_DATABASE_URL ? 'set' : 'NOT SET');
+    console.error('[StatusManager] TURSO_AUTH_TOKEN:', process.env.TURSO_AUTH_TOKEN ? 'set' : 'NOT SET');
+    tursoInitialized = true;
+    return null;
+  }
+
+  try {
+    turso = createClient({
+      url: process.env.TURSO_DATABASE_URL,
+      authToken: process.env.TURSO_AUTH_TOKEN,
+    });
+    console.log('[StatusManager] Turso mode enabled');
+    tursoInitialized = true;
+    return turso;
+  } catch (error) {
+    console.error('[StatusManager] Failed to initialize Turso client:', error);
+    tursoInitialized = true;
+    return null;
+  }
+}
+
+/**
+ * Check if Turso is available
+ */
+function isTursoAvailable(): boolean {
+  return getTursoClient() !== null;
 }
 
 // Re-export ProcessingStatus for backward compatibility
 export type { ProcessingStatus };
 
 /**
- * Enhanced error handler with detailed diagnostics
- */
-function handleSupabaseError(uploadId: string, operation: string, error: SupabaseError): never {
-  console.error(`[${uploadId}] Supabase ${operation} failed:`, {
-    code: error.code,
-    message: error.message,
-    details: error.details,
-    hint: error.hint,
-  });
-
-  // PGRST205: Schema cache issue
-  if (error.code === 'PGRST205') {
-    throw new Error(
-      `Supabase schema cache error: Table 'processing_status' not found in cache. ` +
-      `Please reload schema in Supabase Dashboard (Settings → API → Reload Schema) ` +
-      `or run: NOTIFY pgrst, 'reload schema'; in SQL Editor`
-    );
-  }
-
-  // PGRST116: No rows returned
-  if (error.code === 'PGRST116') {
-    throw new Error(
-      `No rows returned for upload_id: ${uploadId}. ` +
-      `Ensure the record exists before calling ${operation}.`
-    );
-  }
-
-  // RLS violation
-  if (error.code === '42501') {
-    throw new Error(
-      `Permission denied: Row-level security policy violation. ` +
-      `Ensure service_role key is used and RLS policies are configured correctly.`
-    );
-  }
-
-  // Generic error
-  throw new Error(`Supabase ${operation} failed: ${error.message}`);
-}
-
-/**
- * Initialize processing status (Dual mode: Supabase or In-memory)
+ * Initialize processing status (Dual mode: Turso or In-memory)
  * @param uploadId - Unique upload identifier
  * @param userId - Clerk user ID for IDOR protection
  */
@@ -88,7 +84,7 @@ export const initStatus = async (uploadId: string, userId: string): Promise<Proc
   const now = new Date().toISOString();
   const status: ProcessingStatus = {
     uploadId,
-    userId, // Security: Store userId for access control
+    userId,
     status: 'pending',
     progress: 0,
     stage: 'downloading',
@@ -96,26 +92,23 @@ export const initStatus = async (uploadId: string, userId: string): Promise<Proc
     updatedAt: now,
   };
 
-  if (USE_SUPABASE && supabase) {
-    // Supabase mode - store userId for RLS
-    const { data, error } = await supabase
-      .from('processing_status')
-      .upsert({
-        upload_id: uploadId,
-        user_id: userId, // Security: Critical for IDOR protection
-        status: status.status,
-        progress: status.progress,
-        stage: status.stage,
-        started_at: status.startedAt,
-        updated_at: status.updatedAt,
-      })
-      .select()
-      .single();
+  const client = getTursoClient();
+  if (client) {
+    // Turso mode - INSERT OR REPLACE
+    await client.execute({
+      sql: `INSERT INTO processing_status
+            (upload_id, user_id, status, progress, current_step, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(upload_id) DO UPDATE SET
+              user_id = excluded.user_id,
+              status = excluded.status,
+              progress = excluded.progress,
+              current_step = excluded.current_step,
+              updated_at = excluded.updated_at`,
+      args: [uploadId, userId, status.status, status.progress, status.stage ?? 'downloading', now, now],
+    });
 
-    if (error) {
-      handleSupabaseError(uploadId, 'initStatus', error);
-    }
-
+    console.log(`[${uploadId}] [Turso] Status initialized for user ${userId}`);
     return status;
   } else {
     // In-memory mode
@@ -126,38 +119,74 @@ export const initStatus = async (uploadId: string, userId: string): Promise<Proc
 };
 
 /**
- * Update processing status (Dual mode: Supabase or In-memory)
+ * Update processing status (Dual mode: Turso or In-memory)
  */
 export const updateStatus = async (
   uploadId: string,
   updates: Partial<ProcessingStatus>
 ): Promise<ProcessingStatus> => {
-  if (USE_SUPABASE && supabase) {
-    // Supabase mode
-    const updatePayload: SupabaseStatusUpdate = {
-      updated_at: new Date().toISOString(),
-    };
+  const now = new Date().toISOString();
+  const client = getTursoClient();
 
-    // Map camelCase to snake_case for Supabase
-    if (updates.status) updatePayload.status = updates.status;
-    if (updates.progress !== undefined) updatePayload.progress = updates.progress;
-    if (updates.stage) updatePayload.stage = updates.stage;
-    if (updates.resultUrl) updatePayload.result_url = updates.resultUrl;
-    if (updates.error) updatePayload.error = updates.error;
-    if (updates.metadata) updatePayload.metadata = updates.metadata;
+  if (client) {
+    // Build dynamic SET clause
+    const setClauses: string[] = ['updated_at = ?'];
+    const args: (string | number | null)[] = [now];
 
-    const { data, error } = await supabase
-      .from('processing_status')
-      .update(updatePayload)
-      .eq('upload_id', uploadId)
-      .select()
-      .single();
-
-    if (error) {
-      handleSupabaseError(uploadId, 'updateStatus', error);
+    if (updates.status) {
+      setClauses.push('status = ?');
+      args.push(updates.status);
+    }
+    if (updates.progress !== undefined) {
+      setClauses.push('progress = ?');
+      args.push(updates.progress);
+    }
+    if (updates.stage) {
+      setClauses.push('current_step = ?'); // Map stage → current_step
+      args.push(updates.stage);
+    }
+    if (updates.resultUrl) {
+      setClauses.push('result_url = ?');
+      args.push(updates.resultUrl);
+    }
+    if (updates.error) {
+      setClauses.push('error_message = ?'); // Map error → error_message
+      args.push(updates.error);
+    }
+    if (updates.metadata) {
+      setClauses.push('metadata = ?');
+      args.push(JSON.stringify(updates.metadata));
     }
 
-    return mapDbRowToStatus(data);
+    // Add upload_id for WHERE clause
+    args.push(uploadId);
+
+    await client.execute({
+      sql: `UPDATE processing_status SET ${setClauses.join(', ')} WHERE upload_id = ?`,
+      args,
+    });
+
+    // Fetch updated record
+    const result = await client.execute({
+      sql: 'SELECT * FROM processing_status WHERE upload_id = ?',
+      args: [uploadId],
+    });
+
+    if (result.rows.length === 0) {
+      throw new Error(`[${uploadId}] Status not found in Turso`);
+    }
+
+    // Log with phase info if available
+    const logInfo: Record<string, unknown> = {
+      status: updates.status,
+      progress: updates.progress,
+      stage: updates.stage,
+    };
+    if (updates.phase) logInfo.phase = updates.phase;
+    if (updates.phaseProgress !== undefined) logInfo.phaseProgress = updates.phaseProgress;
+    console.log(`[${uploadId}] [Turso] Status updated:`, logInfo);
+
+    return mapDbRowToStatus(result.rows[0], updates);
   } else {
     // In-memory mode
     const currentStatus = inMemoryStatusMap.get(uploadId);
@@ -168,41 +197,145 @@ export const updateStatus = async (
     const updatedStatus: ProcessingStatus = {
       ...currentStatus,
       ...updates,
-      updatedAt: new Date().toISOString(),
+      updatedAt: now,
     };
 
     inMemoryStatusMap.set(uploadId, updatedStatus);
-    console.log(`[${uploadId}] [InMemory] Status updated:`, {
+
+    // Log with phase info if available
+    const logInfo: Record<string, unknown> = {
       status: updatedStatus.status,
       progress: updatedStatus.progress,
       stage: updatedStatus.stage,
-    });
+    };
+    if (updatedStatus.phase) logInfo.phase = updatedStatus.phase;
+    if (updatedStatus.phaseProgress !== undefined) logInfo.phaseProgress = updatedStatus.phaseProgress;
+    console.log(`[${uploadId}] [InMemory] Status updated:`, logInfo);
 
     return updatedStatus;
   }
 };
 
 /**
- * Get processing status (Dual mode: Supabase or In-memory)
+ * Update phase progress (helper function for 3-phase UI)
+ * Phase data is stored in metadata JSON for persistence
+ */
+export const updatePhaseProgress = async (
+  uploadId: string,
+  phase: ProcessingPhase,
+  phaseProgress: number,
+  options?: {
+    phaseStatus?: PhaseStatus;
+    estimatedTimeRemaining?: string;
+    subTask?: string;
+    stage?: ProcessingStatus['stage'];
+  }
+): Promise<ProcessingStatus> => {
+  // Skip progress updates during shutdown to prevent race condition with error status
+  if (getShutdownFlag()) {
+    console.log(`[${uploadId}] Skipping phase update - shutdown in progress`);
+    const currentStatus = await getStatus(uploadId);
+    if (currentStatus) return currentStatus;
+    // If status not found, return a minimal status object
+    const now = new Date().toISOString();
+    return {
+      uploadId,
+      userId: '',
+      status: 'processing',
+      progress: 0,
+      startedAt: now,
+      updatedAt: now,
+    };
+  }
+
+  // Calculate overall progress based on phase
+  // Phase 1: 0-33%, Phase 2: 33-66%, Phase 3: 66-100%
+  const phaseRanges: Record<ProcessingPhase, [number, number]> = {
+    1: [0, 33],
+    2: [33, 66],
+    3: [66, 100],
+  };
+  const [start, end] = phaseRanges[phase];
+  const overallProgress = Math.round(start + (phaseProgress / 100) * (end - start));
+
+  // Store phase data in metadata for persistence (Turso doesn't have phase columns)
+  const phaseMetadata = {
+    phase,
+    phaseProgress,
+    phaseStatus: options?.phaseStatus || 'in_progress',
+    estimatedTimeRemaining: options?.estimatedTimeRemaining,
+    subTask: options?.subTask,
+  };
+
+  return updateStatus(uploadId, {
+    status: 'processing',
+    progress: overallProgress,
+    phase,
+    phaseProgress,
+    phaseStatus: options?.phaseStatus || 'in_progress',
+    estimatedTimeRemaining: options?.estimatedTimeRemaining,
+    subTask: options?.subTask,
+    stage: options?.stage,
+    metadata: phaseMetadata as any, // Store phase data in metadata
+  });
+};
+
+/**
+ * Mark phase as complete and move to next phase
+ */
+export const completePhase = async (
+  uploadId: string,
+  completedPhase: ProcessingPhase
+): Promise<ProcessingStatus> => {
+  // Calculate progress at end of phase
+  const phaseEndProgress: Record<ProcessingPhase, number> = {
+    1: 33,
+    2: 66,
+    3: 100,
+  };
+
+  return updateStatus(uploadId, {
+    status: 'processing',
+    progress: phaseEndProgress[completedPhase],
+    phase: completedPhase,
+    phaseProgress: 100,
+    phaseStatus: 'completed',
+  });
+};
+
+/**
+ * Skip a phase (e.g., no audio detected)
+ */
+export const skipPhase = async (
+  uploadId: string,
+  skippedPhase: ProcessingPhase,
+  reason?: string
+): Promise<ProcessingStatus> => {
+  return updateStatus(uploadId, {
+    status: 'processing',
+    phase: skippedPhase,
+    phaseProgress: 100,
+    phaseStatus: 'skipped',
+    subTask: reason || 'Skipped',
+  });
+};
+
+/**
+ * Get processing status (Dual mode: Turso or In-memory)
  */
 export const getStatus = async (uploadId: string): Promise<ProcessingStatus | null> => {
-  if (USE_SUPABASE && supabase) {
-    // Supabase mode
-    const { data, error } = await supabase
-      .from('processing_status')
-      .select()
-      .eq('upload_id', uploadId)
-      .single();
+  const client = getTursoClient();
+  if (client) {
+    const result = await client.execute({
+      sql: 'SELECT * FROM processing_status WHERE upload_id = ?',
+      args: [uploadId],
+    });
 
-    if (error) {
-      if (error.code === 'PGRST116') {
-        // Not found (this is expected)
-        return null;
-      }
-      handleSupabaseError(uploadId, 'getStatus', error);
+    if (result.rows.length === 0) {
+      return null;
     }
 
-    return mapDbRowToStatus(data);
+    return mapDbRowToStatus(result.rows[0]);
   } else {
     // In-memory mode
     const status = inMemoryStatusMap.get(uploadId);
@@ -220,7 +353,7 @@ export const getStatus = async (uploadId: string): Promise<ProcessingStatus | nu
 };
 
 /**
- * Mark processing as complete (Dual mode: Supabase or In-memory)
+ * Mark processing as complete (Dual mode: Turso or In-memory)
  */
 export const completeStatus = async (
   uploadId: string,
@@ -237,7 +370,7 @@ export const completeStatus = async (
 };
 
 /**
- * Mark processing as failed (Dual mode: Supabase or In-memory)
+ * Mark processing as failed (Dual mode: Turso or In-memory)
  */
 export const failStatus = async (uploadId: string, error: string): Promise<ProcessingStatus> => {
   return updateStatus(uploadId, {
@@ -248,19 +381,39 @@ export const failStatus = async (uploadId: string, error: string): Promise<Proce
 };
 
 /**
- * Map database row to ProcessingStatus type
+ * Map Turso database row to ProcessingStatus type
+ * Column mapping:
+ * - current_step → stage
+ * - error_message → error
+ * - created_at → startedAt
+ * @param row - Database row
+ * @param updates - Optional updates with phase info (DB doesn't store phase fields yet)
  */
-function mapDbRowToStatus(row: SupabaseStatusRow): ProcessingStatus {
-  return {
-    uploadId: row.upload_id,
-    userId: row.user_id, // Security: Include userId for access control
-    status: row.status,
-    progress: row.progress,
-    stage: row.stage,
-    startedAt: row.started_at,
-    updatedAt: row.updated_at,
-    resultUrl: row.result_url,
-    metadata: row.metadata,
-    error: row.error,
+function mapDbRowToStatus(
+  row: Record<string, unknown>,
+  updates?: Partial<ProcessingStatus>
+): ProcessingStatus {
+  const status: ProcessingStatus = {
+    uploadId: row.upload_id as string,
+    userId: row.user_id as string,
+    status: row.status as ProcessingStatus['status'],
+    progress: row.progress as number,
+    stage: row.current_step as ProcessingStatus['stage'], // Map current_step → stage
+    startedAt: row.created_at as string, // Map created_at → startedAt
+    updatedAt: row.updated_at as string,
+    resultUrl: row.result_url as string | undefined,
+    metadata: row.metadata ? JSON.parse(row.metadata as string) : undefined,
+    error: row.error_message as string | undefined, // Map error_message → error
   };
+
+  // Merge phase info from updates (DB doesn't have phase columns yet)
+  if (updates) {
+    if (updates.phase !== undefined) status.phase = updates.phase;
+    if (updates.phaseProgress !== undefined) status.phaseProgress = updates.phaseProgress;
+    if (updates.phaseStatus !== undefined) status.phaseStatus = updates.phaseStatus;
+    if (updates.estimatedTimeRemaining !== undefined) status.estimatedTimeRemaining = updates.estimatedTimeRemaining;
+    if (updates.subTask !== undefined) status.subTask = updates.subTask;
+  }
+
+  return status;
 }

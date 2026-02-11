@@ -5,6 +5,60 @@ import { isValidR2Key } from "@/lib/r2-client";
 export const runtime = "nodejs";
 export const maxDuration = 30; // 30 second timeout for processing request
 
+/**
+ * Call Cloud Run worker with automatic failover to backup regions
+ * Tries primary URL first, then falls back to other regions on failure
+ */
+async function callCloudRunWithFailover(
+  primaryUrl: string,
+  fallbackUrls: string[],
+  payload: object,
+  workerSecret: string,
+  uploadId: string
+): Promise<{ response: Response; usedUrl: string; failedUrls: string[] }> {
+  const allUrls = [primaryUrl, ...fallbackUrls];
+  const failedUrls: string[] = [];
+
+  for (let i = 0; i < allUrls.length; i++) {
+    const url = allUrls[i];
+    const isPrimary = i === 0;
+
+    try {
+      console.log(`[${uploadId}] ${isPrimary ? 'Primary' : 'Fallback'} attempt: ${url}`);
+
+      const response = await fetch(`${url}/process`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${workerSecret}`,
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(10000), // 10 second timeout for failover speed
+      });
+
+      if (response.ok) {
+        if (!isPrimary) {
+          console.log(`[${uploadId}] Failover successful: ${url} (failed: ${failedUrls.join(', ')})`);
+        }
+        return { response, usedUrl: url, failedUrls };
+      }
+
+      // Non-OK response - try next URL
+      const status = response.status;
+      console.warn(`[${uploadId}] ${url} returned ${status}, trying next...`);
+      failedUrls.push(`${url}:${status}`);
+
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+      console.warn(`[${uploadId}] ${url} failed: ${errorMsg}, trying next...`);
+      failedUrls.push(`${url}:${errorMsg}`);
+    }
+  }
+
+  // All URLs failed
+  throw new Error(`All Cloud Run regions failed: ${failedUrls.join(', ')}`);
+}
+
 export async function POST(request: NextRequest) {
   try {
     // Check authentication - Required for all environments
@@ -67,15 +121,26 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Use localhost for development, production URL for deployment
-    const cloudRunUrl = process.env.NODE_ENV === 'development'
-      ? process.env.CLOUD_RUN_URL?.trim() || 'http://localhost:8080'
-      : process.env.CLOUD_RUN_URL?.trim();
-
     // Always require WORKER_SECRET from environment (no defaults for security)
     const workerSecret = process.env.WORKER_SECRET?.trim();
 
-    if (!cloudRunUrl || !workerSecret) {
+    // Get Cloud Run URL - prioritize geo-routed URL from middleware
+    const geoRoutedUrl = request.headers.get('x-target-cloud-run');
+    const fallbackUrlsHeader = request.headers.get('x-fallback-cloud-run');
+    const geoCountry = request.headers.get('x-geo-country');
+    const geoRegion = request.headers.get('x-geo-region');
+
+    // Fallback to environment variable if geo-routing not available
+    const primaryCloudRunUrl = process.env.NODE_ENV === 'development'
+      ? process.env.CLOUD_RUN_URL?.trim() || 'http://localhost:8080'
+      : geoRoutedUrl || process.env.CLOUD_RUN_URL?.trim();
+
+    // Parse fallback URLs
+    const fallbackUrls = fallbackUrlsHeader
+      ? fallbackUrlsHeader.split(',').filter(Boolean)
+      : [];
+
+    if (!primaryCloudRunUrl || !workerSecret) {
       console.error("Missing environment variables: CLOUD_RUN_URL or WORKER_SECRET");
       return NextResponse.json(
         {
@@ -86,46 +151,37 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // MVP: Trigger processing asynchronously (without waiting for completion)
-    // Works for both local development (localhost:8080) and production (Cloud Run)
-
-    console.log(`[${uploadId}] Sending processing request to worker: ${cloudRunUrl}`);
+    // Log geo-routing info
+    if (geoCountry) {
+      console.log(`[${uploadId}] Geo-routing: country=${geoCountry}, region=${geoRegion}`);
+    }
+    console.log(`[${uploadId}] Primary URL: ${primaryCloudRunUrl}`);
+    if (fallbackUrls.length > 0) {
+      console.log(`[${uploadId}] Fallback URLs: ${fallbackUrls.join(', ')}`);
+    }
     console.log(`[${uploadId}] Detection mode: ${mode}`);
 
-    // Call worker (local or production) - MUST await to ensure request is sent
-    const workerResponse = await fetch(`${cloudRunUrl}/process`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${workerSecret}`,
-      },
-      body: JSON.stringify({
-        uploadId,
-        r2Key,
-        fileName,
-        userId, // Security: Pass userId to Worker for IDOR protection
-        dataConsent: dataConsent || false,
-        detectionMode: mode, // Detection mode: 'standard' or 'enhanced'
-      }),
-      signal: AbortSignal.timeout(25000),
-    });
+    // Prepare payload
+    const payload = {
+      uploadId,
+      r2Key,
+      fileName,
+      userId, // Security: Pass userId to Worker for IDOR protection
+      dataConsent: dataConsent || false,
+      detectionMode: mode, // Detection mode: 'standard' or 'enhanced'
+    };
 
-    // Check if worker accepted the request
-    if (!workerResponse.ok) {
-      console.error(`[${uploadId}] Worker returned status ${workerResponse.status}`);
-      const errorText = await workerResponse.text().catch(() => 'Unable to read error response');
-      return NextResponse.json(
-        {
-          error: "Processing failed to start",
-          message: `Worker service returned error: ${workerResponse.status}`,
-          details: errorText,
-        },
-        { status: 502 }
-      );
-    }
+    // Call worker with failover support
+    const { response: workerResponse, usedUrl, failedUrls } = await callCloudRunWithFailover(
+      primaryCloudRunUrl,
+      fallbackUrls,
+      payload,
+      workerSecret,
+      uploadId
+    );
 
     const workerData = await workerResponse.json().catch(() => ({}));
-    console.log(`[${uploadId}] Worker accepted request:`, workerData);
+    console.log(`[${uploadId}] Worker accepted request from ${usedUrl}:`, workerData);
 
     // Return immediately - processing happens in background
     return NextResponse.json({
@@ -134,6 +190,8 @@ export async function POST(request: NextRequest) {
       message: "Video processing started successfully",
       status: "processing",
       detectionMode: mode,
+      region: geoRegion || 'default',
+      failedRegions: failedUrls.length > 0 ? failedUrls : undefined,
     });
   } catch (error) {
     console.error("Process endpoint error:", error);
@@ -145,6 +203,7 @@ export async function POST(request: NextRequest) {
       {
         error: "Internal server error",
         message: "An unexpected error occurred while starting processing. Please try again.",
+        details: errorMessage,
       },
       { status: 500 }
     );

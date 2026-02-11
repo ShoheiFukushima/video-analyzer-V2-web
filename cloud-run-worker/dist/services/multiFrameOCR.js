@@ -14,7 +14,7 @@ import ffmpeg from 'fluent-ffmpeg';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { RateLimiter } from './rateLimiter.js';
+import { SimpleRateLimiter } from './rateLimiter.js';
 import pLimit from 'p-limit';
 // ========================================
 // Constants
@@ -250,7 +250,7 @@ export async function processMultiFrameOCRBatch(scenes, videoPath, outputDir, up
     console.log(`\n🔍 Running Multi-Frame OCR on ${scenes.length} scenes...`);
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
     const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-    const rateLimiter = new RateLimiter(30); // 30 requests per minute
+    const rateLimiter = new SimpleRateLimiter(30); // 30 requests per minute
     const limit = pLimit(3); // Process 3 scenes at a time
     const results = [];
     let completed = 0;

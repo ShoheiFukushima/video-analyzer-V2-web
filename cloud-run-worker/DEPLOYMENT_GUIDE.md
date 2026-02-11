@@ -1,13 +1,15 @@
 # Cloud Run Worker Deployment Guide
 
+**最終更新**: 2026年2月5日
+
 ## Overview
 
 This is the backend worker service that processes uploaded videos. It handles:
-- Video download from Vercel Blob storage
+- Video download from Cloudflare R2 storage
 - Audio extraction and transcription (OpenAI Whisper)
 - Frame extraction and OCR (Google Gemini Vision)
 - Excel report generation
-- Result file upload back to Vercel Blob
+- Result file upload back to R2
 
 ## Prerequisites
 
@@ -64,23 +66,36 @@ docker run \
 
 ### 3. Deploy to Google Cloud Run
 
-#### Option A: Using gcloud CLI
+#### Option A: Using gcloud CLI (推奨)
 
 ```bash
 # Authenticate with Google Cloud
 gcloud auth login
 gcloud config set project YOUR-PROJECT-ID
 
-# Deploy from Docker image
+# Deploy with optimized settings (2026-02-10 updated)
+# Timeout extended to 3600s (1 hour) for long video processing
 gcloud run deploy video-analyzer-worker \
   --source . \
   --platform managed \
   --region us-central1 \
-  --memory 2Gi \
+  --memory 4Gi \
+  --cpu 4 \
   --timeout 3600 \
-  --allow-unauthenticated \
-  --set-env-vars=WORKER_SECRET=your-secret,OPENAI_API_KEY=...,GEMINI_API_KEY=...,SUPABASE_URL=...,SUPABASE_ANON_KEY=...,BLOB_READ_WRITE_TOKEN=...
+  --max-instances 10 \
+  --concurrency 1 \
+  --no-cpu-throttling \
+  --execution-environment gen2 \
+  --allow-unauthenticated
 ```
+
+**重要な設定オプション**:
+- `--cpu 4`: FFmpeg処理に必要な十分なCPU
+- `--memory 4Gi`: CPUに合わせて増加
+- `--timeout 3600`: **1時間タイムアウト（2GB動画対応）**
+- `--concurrency 1`: 動画処理はリソース集約型なので1リクエストずつ
+- `--no-cpu-throttling`: 常時CPUを割り当て（スロットリング無効）
+- `--execution-environment gen2`: gVisorではなくLinux VM（FFmpegハング回避）
 
 #### Option B: Using Google Cloud Console
 
@@ -205,12 +220,65 @@ Returns:
 - Check that `processing_status` table exists
 - Ensure table schema matches expected structure
 
-## Performance Notes
+## Performance Notes (2026-02-05 Updated)
 
-- **Memory**: 2GB recommended for video processing
-- **Timeout**: 3600 seconds (1 hour) for long videos
-- **Concurrent Processing**: Cloud Run auto-scales based on load
-- **Frame Extraction**: 1 frame every 5 seconds for OCR
+| 設定 | 推奨値 | 説明 |
+|-----|-------|------|
+| **CPU** | 4 vCPU | FFmpeg処理に最適化 |
+| **Memory** | 4 GB | CPU に合わせて増加 |
+| **Concurrency** | 1 | 動画処理は1リクエストずつ |
+| **CPUスロットリング** | 無効 | 常時フルパワー |
+| **実行環境** | gen2 | Linux VM（gVisorではない） |
+| **Timeout** | 3600秒 | 1時間（2GB/10時間動画対応） |
+
+**重要**:
+- gen2実行環境を使用することで、FFmpeg/ffprobeのハング問題を回避
+- CPUスロットリングを無効にすることで、処理速度が10-50倍向上
+
+## Long Video Processing (Checkpoint System)
+
+2026年2月10日追加: 2GB/10時間以上の動画に対応するためのチェックポイント機能
+
+### 概要
+- **タイムアウト**: 3600秒（1時間）
+- **チェックポイント保存**: Tursoに定期保存
+- **中間ファイル**: Cloudflare R2に保存
+- **自動再開**: 中断箇所から自動的に再開
+
+### チェックポイント保存タイミング
+| ステップ | 保存間隔 |
+|---------|---------|
+| Whisper処理 | 50チャンク毎 |
+| OCR処理 | 100シーン毎 |
+| シーン検出完了 | 完了時 |
+
+### 中間ファイルパス構造
+```
+uploads/{userId}/{uploadId}/
+  ├── source.mp4          # ソース動画
+  ├── audio.mp3           # 抽出音声
+  └── frames/             # 抽出フレーム
+```
+
+### チェックポイント有効期限
+- **7日間**: 7日後に自動削除（Turso + R2）
+
+### 処理時間見積もり（2GB/10時間動画）
+| ステップ | 所要時間 |
+|---------|---------|
+| R2ダウンロード | 2-5分 |
+| 音声抽出 | 3-5分 |
+| VAD + Whisper | 20-40分 |
+| シーン検出 | 5-10分 |
+| OCR処理 | 10-20分 |
+| Excel生成 | 2-3分 |
+| **合計** | **約1.5時間** |
+
+### 環境変数（追加）
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `TURSO_DATABASE_URL` | Yes (Production) | Turso database URL |
+| `TURSO_AUTH_TOKEN` | Yes (Production) | Turso auth token |
 
 ## Database Schema
 

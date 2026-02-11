@@ -69,6 +69,42 @@ export const WHISPER_COST = {
     /** Cost per minute of audio (USD) */
     PER_MINUTE: 0.006,
 };
+export const DEFAULT_PRE_CHUNK_CONFIG = {
+    /**
+     * Enable pre-chunking
+     *
+     * When enabled, audio files longer than minDurationForChunking
+     * will be split into chunks before VAD processing.
+     */
+    enabled: true,
+    /**
+     * Chunk duration (5 minutes = 300 seconds)
+     *
+     * Why 5 minutes:
+     * - Memory: 38MB per chunk (vs 460MB for 2-hour audio)
+     * - VAD processes efficiently (1000-5000 segments per chunk)
+     * - Balances processing overhead vs memory efficiency
+     */
+    chunkDuration: 300,
+    /**
+     * Overlap duration (1 second)
+     *
+     * Why 1 second:
+     * - Prevents missing speech at chunk boundaries
+     * - Minimal processing overhead
+     * - Duplicate segments removed during merge
+     */
+    overlapDuration: 1,
+    /**
+     * Minimum duration for chunking (10 minutes = 600 seconds)
+     *
+     * Why 10 minutes:
+     * - Short videos don't need chunking overhead
+     * - 10-minute audio = 77MB in memory (acceptable)
+     * - Only long documentaries/videos trigger chunking
+     */
+    minDurationForChunking: 600,
+};
 /**
  * Merge user config with defaults
  *

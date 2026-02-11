@@ -1,8 +1,9 @@
-import ffmpeg from 'fluent-ffmpeg';
+import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs/promises';
 import { validateFilePath } from '../utils/security.js';
 import { TIMEOUTS, getTimeoutMinutes } from '../config/timeouts.js';
+import { DEFAULT_PRE_CHUNK_CONFIG } from '../config/vad.js';
 const DEFAULT_CONFIG = {
     sampleRate: 16000, // 16kHz recommended by OpenAI
     channels: 1, // Mono for speech
@@ -11,20 +12,30 @@ const DEFAULT_CONFIG = {
     bitrate: '64k', // Sufficient for speech
 };
 /**
+ * gVisor-compatible environment for FFmpeg
+ * Disables fontconfig and other features that cause hangs
+ */
+function getGVisorEnv() {
+    return {
+        ...process.env,
+        FONTCONFIG_PATH: '',
+        FONTCONFIG_FILE: '/dev/null',
+        FC_DEBUG: '0',
+        HOME: '/tmp',
+        XDG_CACHE_HOME: '/tmp',
+        XDG_CONFIG_HOME: '/tmp',
+        FFREPORT: '',
+        AV_LOG_FORCE_NOCOLOR: '1',
+    };
+}
+/**
  * Extract audio from video file optimized for Whisper transcription
+ * Uses spawn directly for gVisor compatibility
  *
  * @param videoPath - Path to input video file
  * @param outputPath - Path to output MP3 file
  * @param config - Optional audio extraction configuration
  * @returns Promise resolving to output file path
- *
- * @example
- * ```typescript
- * const audioPath = await extractAudioForWhisper(
- *   '/tmp/video.mp4',
- *   '/tmp/audio.mp3'
- * );
- * ```
  */
 export async function extractAudioForWhisper(videoPath, outputPath, config = {}) {
     // Validate file paths (security)
@@ -42,83 +53,68 @@ export async function extractAudioForWhisper(videoPath, outputPath, config = {})
     }
     const TIMEOUT_MS = TIMEOUTS.AUDIO_EXTRACTION;
     return new Promise((resolve, reject) => {
-        let command = ffmpeg(videoPath);
-        let isTimedOut = false;
-        let lastProgressLog = 0; // Track last progress log time to avoid spam
-        // Timeout handler
-        const timeoutId = setTimeout(() => {
-            isTimedOut = true;
-            console.error(`[AudioExtractor] ✗ Process timed out after ${TIMEOUT_MS / 1000}s (${getTimeoutMinutes(TIMEOUT_MS)} minutes)`);
-            try {
-                command.kill('SIGKILL');
-            }
-            catch (killError) {
-                console.error(`[AudioExtractor] Failed to kill FFmpeg process:`, killError);
-            }
-            reject(new Error(`Audio extraction timed out after ${TIMEOUT_MS}ms`));
-        }, TIMEOUT_MS);
-        // Set audio codec to MP3
-        command = command.audioCodec('libmp3lame');
-        // Set sample rate (16kHz for Whisper)
-        command = command.audioFrequency(finalConfig.sampleRate);
-        // Set channels (mono for speech)
-        command = command.audioChannels(finalConfig.channels);
-        // Set bitrate
-        command = command.audioBitrate(finalConfig.bitrate);
-        // Apply audio filters for Whisper optimization
+        let completed = false;
+        let lastActivityTime = Date.now();
+        let lastProgressLog = 0;
+        // Build audio filters
         const filters = [];
-        // ❌ DISABLED: Noise reduction filters conflict with preprocessAudioForVAD
-        // The preprocessAudioForVAD function applies comprehensive filtering (80-8000Hz)
-        // before VAD processing. If we apply narrow band-pass here (200-3000Hz),
-        // the subsequent preprocessing becomes ineffective.
-        //
-        // Processing order: extractAudioForWhisper → preprocessAudioForVAD → VAD → Whisper
-        // Therefore, we only apply basic volume normalization here.
-        //
-        // if (finalConfig.noiseReduction) {
-        //   // High-pass filter: Remove low-frequency noise (< 200 Hz)
-        //   filters.push('highpass=f=200');
-        //
-        //   // Low-pass filter: Remove high-frequency noise (> 3000 Hz)
-        //   // Speech is typically 80-3000 Hz
-        //   filters.push('lowpass=f=3000');
-        // }
         if (finalConfig.volumeNormalization) {
-            // Normalize audio volume
-            // dynaudnorm: Dynamic Audio Normalizer for consistent levels
             filters.push('dynaudnorm=f=150:g=15');
         }
+        // Build FFmpeg arguments
+        const ffmpegArgs = [
+            '-nostdin',
+            '-y',
+            '-i', videoPath,
+            '-vn', // No video
+            '-acodec', 'libmp3lame',
+            '-ar', finalConfig.sampleRate.toString(),
+            '-ac', finalConfig.channels.toString(),
+            '-b:a', finalConfig.bitrate,
+        ];
         if (filters.length > 0) {
-            command = command.audioFilters(filters);
+            ffmpegArgs.push('-af', filters.join(','));
         }
-        // Set output format and path
-        command = command
-            .format('mp3')
-            .output(outputPath);
-        // Progress logging
-        command.on('start', (commandLine) => {
-            console.log(`[AudioExtractor] FFmpeg command: ${commandLine}`);
-            console.log(`[AudioExtractor] Starting audio extraction (timeout: ${getTimeoutMinutes(TIMEOUT_MS)} minutes)...`);
+        ffmpegArgs.push('-f', 'mp3', outputPath);
+        console.log(`[AudioExtractor] FFmpeg command: ffmpeg ${ffmpegArgs.slice(0, 10).join(' ')}...`);
+        console.log(`[AudioExtractor] Starting audio extraction (timeout: ${getTimeoutMinutes(TIMEOUT_MS)} minutes)...`);
+        const proc = spawn('ffmpeg', ffmpegArgs, {
+            env: getGVisorEnv(),
+            stdio: ['ignore', 'pipe', 'pipe'],
         });
-        command.on('progress', (progress) => {
-            // Note: fluent-ffmpeg's progress event may not fire reliably
-            // We also parse stderr for progress info (see stderr handler below)
-            if (progress.percent) {
-                const now = Date.now();
-                // Log every 10 seconds to avoid spam
-                if (now - lastProgressLog >= 10000) {
-                    console.log(`[AudioExtractor] Progress: ${progress.percent.toFixed(1)}% (timemark: ${progress.timemark || 'unknown'})`);
-                    lastProgressLog = now;
+        // Timeout handler
+        const timeoutId = setTimeout(() => {
+            if (!completed) {
+                completed = true;
+                console.error(`[AudioExtractor] ✗ Process timed out after ${TIMEOUT_MS / 1000}s (${getTimeoutMinutes(TIMEOUT_MS)} minutes)`);
+                proc.kill('SIGKILL');
+                reject(new Error(`Audio extraction timed out after ${TIMEOUT_MS}ms`));
+            }
+        }, TIMEOUT_MS);
+        // Activity watchdog - kill if no output for 60 seconds
+        const activityInterval = setInterval(() => {
+            const idleTime = Date.now() - lastActivityTime;
+            if (idleTime > 60000) {
+                if (!completed) {
+                    completed = true;
+                    console.error(`[AudioExtractor] ✗ FFmpeg idle for ${idleTime / 1000}s - killing process`);
+                    clearTimeout(timeoutId);
+                    clearInterval(activityInterval);
+                    proc.kill('SIGKILL');
+                    reject(new Error(`Audio extraction stalled (no output for ${idleTime / 1000}s)`));
                 }
             }
+        }, 10000);
+        proc.stdout?.on('data', () => {
+            lastActivityTime = Date.now();
         });
-        command.on('stderr', (stderrLine) => {
-            // Parse FFmpeg stderr for progress info (more reliable than 'progress' event)
-            // FFmpeg outputs lines like: "time=00:01:23.45 bitrate= 128.0kbits/s speed=1.00x"
-            const timeMatch = stderrLine.match(/time=(\d{2}):(\d{2}):(\d{2}\.\d{2})/);
+        proc.stderr?.on('data', (data) => {
+            lastActivityTime = Date.now();
+            const line = data.toString();
+            // Parse FFmpeg stderr for progress info
+            const timeMatch = line.match(/time=(\d{2}):(\d{2}):(\d{2}\.\d{2})/);
             if (timeMatch) {
                 const now = Date.now();
-                // Log every 30 seconds to avoid spam
                 if (now - lastProgressLog >= 30000) {
                     const hours = parseInt(timeMatch[1], 10);
                     const minutes = parseInt(timeMatch[2], 10);
@@ -129,59 +125,94 @@ export async function extractAudioForWhisper(videoPath, outputPath, config = {})
                 }
             }
         });
-        command.on('end', () => {
-            if (!isTimedOut) {
-                clearTimeout(timeoutId);
+        proc.on('close', (code, signal) => {
+            if (completed)
+                return;
+            completed = true;
+            clearTimeout(timeoutId);
+            clearInterval(activityInterval);
+            if (code === 0 || code === null) {
                 console.log(`[AudioExtractor] ✓ Audio extraction complete: ${path.basename(outputPath)}`);
                 resolve(outputPath);
             }
-        });
-        command.on('error', (error, stdout, stderr) => {
-            clearTimeout(timeoutId);
-            if (!isTimedOut) {
-                console.error(`[AudioExtractor] ✗ FFmpeg error:`, error.message);
-                console.error(`[AudioExtractor] stderr (last 500 chars):`, stderr?.slice(-500) || 'none');
-                reject(new Error(`Audio extraction failed: ${error.message}`));
+            else {
+                console.error(`[AudioExtractor] ✗ FFmpeg exited with code ${code}, signal ${signal}`);
+                reject(new Error(`Audio extraction failed with code ${code}`));
             }
         });
-        // Start processing
-        command.run();
+        proc.on('error', (err) => {
+            if (completed)
+                return;
+            completed = true;
+            clearTimeout(timeoutId);
+            clearInterval(activityInterval);
+            console.error(`[AudioExtractor] ✗ FFmpeg spawn error: ${err.message}`);
+            reject(new Error(`Audio extraction spawn error: ${err.message}`));
+        });
     });
 }
 /**
- * Get audio metadata from video file
- *
- * @param videoPath - Path to video file
- * @returns Promise resolving to audio metadata
+ * Get audio metadata from video file using ffprobe
+ * Uses spawn directly for gVisor compatibility
  */
 export async function getAudioMetadata(videoPath) {
     return new Promise((resolve, reject) => {
-        ffmpeg.ffprobe(videoPath, (err, metadata) => {
-            if (err) {
-                reject(new Error(`Failed to read audio metadata: ${err.message}`));
-                return;
-            }
-            const audioStream = metadata.streams.find(s => s.codec_type === 'audio');
-            if (!audioStream) {
-                reject(new Error('No audio stream found in video file'));
-                return;
-            }
-            resolve({
-                duration: metadata.format.duration || 0,
-                sampleRate: typeof audioStream.sample_rate === 'string'
-                    ? parseInt(audioStream.sample_rate, 10)
-                    : (audioStream.sample_rate || 0),
-                channels: audioStream.channels || 0,
-                codec: audioStream.codec_name || 'unknown',
-            });
+        const ffprobeArgs = [
+            '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_streams',
+            '-show_format',
+            videoPath
+        ];
+        const proc = spawn('ffprobe', ffprobeArgs, {
+            env: getGVisorEnv(),
+            stdio: ['ignore', 'pipe', 'pipe'],
         });
+        let stdout = '';
+        let stderr = '';
+        proc.stdout?.on('data', (data) => {
+            stdout += data.toString();
+        });
+        proc.stderr?.on('data', (data) => {
+            stderr += data.toString();
+        });
+        proc.on('close', (code) => {
+            if (code !== 0) {
+                reject(new Error(`Failed to read audio metadata: ffprobe exited with ${code}`));
+                return;
+            }
+            try {
+                const metadata = JSON.parse(stdout);
+                const audioStream = metadata.streams?.find((s) => s.codec_type === 'audio');
+                if (!audioStream) {
+                    reject(new Error('No audio stream found in video file'));
+                    return;
+                }
+                resolve({
+                    duration: parseFloat(metadata.format?.duration) || 0,
+                    sampleRate: typeof audioStream.sample_rate === 'string'
+                        ? parseInt(audioStream.sample_rate, 10)
+                        : (audioStream.sample_rate || 0),
+                    channels: audioStream.channels || 0,
+                    codec: audioStream.codec_name || 'unknown',
+                });
+            }
+            catch (parseError) {
+                reject(new Error(`Failed to parse ffprobe output: ${parseError}`));
+            }
+        });
+        proc.on('error', (err) => {
+            reject(new Error(`ffprobe spawn error: ${err.message}`));
+        });
+        // Timeout
+        setTimeout(() => {
+            proc.kill('SIGKILL');
+            reject(new Error('ffprobe timed out'));
+        }, 30000);
     });
 }
 /**
  * Check if video file has audio stream
- *
- * @param videoPath - Path to video file
- * @returns Promise resolving to true if audio exists
  */
 export async function hasAudioStream(videoPath) {
     try {
@@ -194,39 +225,13 @@ export async function hasAudioStream(videoPath) {
 }
 /**
  * Preprocess audio for improved VAD detection
+ * Uses spawn directly for gVisor compatibility
  *
  * Applies FFmpeg filters to suppress background music (BGM) and enhance human voice.
- * This improves Voice Activity Detection (VAD) accuracy in videos with loud BGM.
- *
- * Filter chain:
- * 1. highpass=f=80: Remove sub-bass (<80Hz) - kick drums, rumble
- * 2. lowpass=f=8000: Remove high-frequency noise (>8kHz) - cymbals, hiss
- * 3. equalizer (60Hz, -15dB): Suppress BGM bass (40-80Hz)
- * 4. equalizer (160Hz, +10dB): Enhance voice fundamentals (80-240Hz)
- * 5. equalizer (3000Hz, +6dB): Enhance voice harmonics (2-4kHz)
- * 6. afftdn: FFT-based noise reduction
- * 7. dynaudnorm: Volume normalization
- *
- * @param audioPath - Path to input audio file (16kHz mono MP3)
- * @param uploadId - Upload ID for logging
- * @returns Promise<void> - Replaces original file with preprocessed audio
- * @throws Error - On preprocessing failure (caller should use original audio as fallback)
- *
- * @example
- * ```typescript
- * try {
- *   await preprocessAudioForVAD('/tmp/audio.mp3', 'upload_123');
- * } catch (error) {
- *   console.warn('Preprocessing failed, using original audio:', error);
- *   // Continue with original audio
- * }
- * ```
  */
 export async function preprocessAudioForVAD(audioPath, uploadId) {
-    // Validate file path (security)
     validateFilePath(audioPath);
     console.log(`[${uploadId}] [AudioPreprocessing] Starting audio preprocessing for VAD`);
-    // Validate input file exists
     try {
         await fs.access(audioPath);
     }
@@ -236,65 +241,67 @@ export async function preprocessAudioForVAD(audioPath, uploadId) {
     const tempOutputPath = audioPath.replace('.mp3', '_preprocessed.mp3');
     const TIMEOUT_MS = TIMEOUTS.AUDIO_PREPROCESSING;
     // Build filter chain for BGM suppression and voice enhancement
-    // 🔧 RELAXED PARAMETERS: Previous settings were too aggressive (removed human voice)
-    // Changes from previous version:
-    //   - BGM suppression: -15dB → -10dB (less aggressive)
-    //   - Voice boost: +10dB → +12dB (stronger emphasis)
-    //   - Noise reduction: 20dB → 10dB (preserve more original audio)
     const filterChain = [
-        'highpass=f=80', // Remove sub-bass (<80Hz)
-        'lowpass=f=8000', // Remove high frequencies (>8kHz)
-        'equalizer=f=60:width_type=h:width=40:g=-10', // Suppress BGM bass (40-80Hz, -10dB) ← RELAXED
-        'equalizer=f=160:width_type=h:width=160:g=12', // Enhance voice fundamentals (80-240Hz, +12dB) ← STRONGER
-        'equalizer=f=3000:width_type=h:width=2000:g=6', // Enhance voice harmonics (2-4kHz, +6dB)
-        'afftdn=nr=10:nf=-40:tn=1', // FFT noise reduction (10dB, -40dB floor) ← RELAXED
-        'dynaudnorm=f=150:g=15' // Volume normalization
+        'highpass=f=80',
+        'lowpass=f=8000',
+        'equalizer=f=60:width_type=h:width=40:g=-10',
+        'equalizer=f=160:width_type=h:width=160:g=12',
+        'equalizer=f=3000:width_type=h:width=2000:g=6',
+        'afftdn=nr=10:nf=-40:tn=1',
+        'dynaudnorm=f=150:g=15'
     ].join(',');
     console.log(`[${uploadId}] [AudioPreprocessing] Filter chain: ${filterChain}`);
     return new Promise((resolve, reject) => {
-        let isTimedOut = false;
+        let completed = false;
+        let lastActivityTime = Date.now();
         let lastProgressLog = 0;
-        const command = ffmpeg(audioPath)
-            .audioFilters(filterChain)
-            .audioCodec('libmp3lame')
-            .audioFrequency(16000) // Keep 16kHz for Whisper compatibility
-            .audioChannels(1) // Keep mono
-            .audioBitrate('64k') // Keep 64k bitrate
-            .format('mp3')
-            .output(tempOutputPath);
-        // Timeout handler
+        const ffmpegArgs = [
+            '-nostdin',
+            '-y',
+            '-i', audioPath,
+            '-af', filterChain,
+            '-acodec', 'libmp3lame',
+            '-ar', '16000',
+            '-ac', '1',
+            '-b:a', '64k',
+            '-f', 'mp3',
+            tempOutputPath
+        ];
+        console.log(`[${uploadId}] [AudioPreprocessing] Starting preprocessing (timeout: ${getTimeoutMinutes(TIMEOUT_MS)} minutes)...`);
+        const proc = spawn('ffmpeg', ffmpegArgs, {
+            env: getGVisorEnv(),
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
         const timeoutId = setTimeout(() => {
-            isTimedOut = true;
-            console.error(`[${uploadId}] [AudioPreprocessing] ✗ Process timed out after ${TIMEOUT_MS / 1000}s (${getTimeoutMinutes(TIMEOUT_MS)} minutes)`);
-            try {
-                command.kill('SIGKILL');
+            if (!completed) {
+                completed = true;
+                console.error(`[${uploadId}] [AudioPreprocessing] ✗ Process timed out after ${TIMEOUT_MS / 1000}s`);
+                proc.kill('SIGKILL');
+                reject(new Error(`Audio preprocessing timed out after ${TIMEOUT_MS}ms`));
             }
-            catch (killError) {
-                console.error(`[${uploadId}] [AudioPreprocessing] Failed to kill FFmpeg process:`, killError);
-            }
-            reject(new Error(`Audio preprocessing timed out after ${TIMEOUT_MS}ms`));
         }, TIMEOUT_MS);
-        command
-            .on('start', (commandLine) => {
-            console.log(`[${uploadId}] [AudioPreprocessing] FFmpeg command: ${commandLine}`);
-            console.log(`[${uploadId}] [AudioPreprocessing] Starting preprocessing (timeout: ${getTimeoutMinutes(TIMEOUT_MS)} minutes)...`);
-        })
-            .on('progress', (progress) => {
-            if (progress.percent) {
-                const now = Date.now();
-                // Log every 10 seconds to avoid spam
-                if (now - lastProgressLog >= 10000) {
-                    console.log(`[${uploadId}] [AudioPreprocessing] Progress: ${progress.percent.toFixed(1)}%`);
-                    lastProgressLog = now;
+        const activityInterval = setInterval(() => {
+            const idleTime = Date.now() - lastActivityTime;
+            if (idleTime > 60000) {
+                if (!completed) {
+                    completed = true;
+                    console.error(`[${uploadId}] [AudioPreprocessing] ✗ FFmpeg idle for ${idleTime / 1000}s - killing process`);
+                    clearTimeout(timeoutId);
+                    clearInterval(activityInterval);
+                    proc.kill('SIGKILL');
+                    reject(new Error(`Audio preprocessing stalled (no output for ${idleTime / 1000}s)`));
                 }
             }
-        })
-            .on('stderr', (stderrLine) => {
-            // Parse FFmpeg stderr for progress info
-            const timeMatch = stderrLine.match(/time=(\d{2}):(\d{2}):(\d{2}\.\d{2})/);
+        }, 10000);
+        proc.stdout?.on('data', () => {
+            lastActivityTime = Date.now();
+        });
+        proc.stderr?.on('data', (data) => {
+            lastActivityTime = Date.now();
+            const line = data.toString();
+            const timeMatch = line.match(/time=(\d{2}):(\d{2}):(\d{2}\.\d{2})/);
             if (timeMatch) {
                 const now = Date.now();
-                // Log every 30 seconds to avoid spam
                 if (now - lastProgressLog >= 30000) {
                     const hours = parseInt(timeMatch[1], 10);
                     const minutes = parseInt(timeMatch[2], 10);
@@ -304,18 +311,20 @@ export async function preprocessAudioForVAD(audioPath, uploadId) {
                     lastProgressLog = now;
                 }
             }
-        })
-            .on('end', async () => {
-            if (!isTimedOut) {
-                clearTimeout(timeoutId);
+        });
+        proc.on('close', async (code, signal) => {
+            if (completed)
+                return;
+            completed = true;
+            clearTimeout(timeoutId);
+            clearInterval(activityInterval);
+            if (code === 0 || code === null) {
                 try {
-                    // Get file sizes for logging
                     const originalStats = await fs.stat(audioPath);
                     const preprocessedStats = await fs.stat(tempOutputPath);
                     console.log(`[${uploadId}] [AudioPreprocessing] ✓ Preprocessing complete`);
                     console.log(`[${uploadId}] [AudioPreprocessing] Original: ${(originalStats.size / 1024).toFixed(1)}KB`);
                     console.log(`[${uploadId}] [AudioPreprocessing] Preprocessed: ${(preprocessedStats.size / 1024).toFixed(1)}KB`);
-                    // Replace original file with preprocessed version
                     await fs.unlink(audioPath);
                     await fs.rename(tempOutputPath, audioPath);
                     console.log(`[${uploadId}] [AudioPreprocessing] ✓ Replaced original audio with preprocessed version`);
@@ -326,85 +335,230 @@ export async function preprocessAudioForVAD(audioPath, uploadId) {
                     reject(replaceError);
                 }
             }
-        })
-            .on('error', (error, stdout, stderr) => {
-            clearTimeout(timeoutId);
-            if (!isTimedOut) {
-                console.error(`[${uploadId}] [AudioPreprocessing] ✗ FFmpeg error:`, error.message);
-                console.error(`[${uploadId}] [AudioPreprocessing] stderr (last 500 chars):`, stderr?.slice(-500) || 'none');
-                reject(new Error(`Audio preprocessing failed: ${error.message}`));
+            else {
+                console.error(`[${uploadId}] [AudioPreprocessing] ✗ FFmpeg exited with code ${code}, signal ${signal}`);
+                reject(new Error(`Audio preprocessing failed with code ${code}`));
             }
         });
-        // Start processing
-        command.run();
+        proc.on('error', (err) => {
+            if (completed)
+                return;
+            completed = true;
+            clearTimeout(timeoutId);
+            clearInterval(activityInterval);
+            console.error(`[${uploadId}] [AudioPreprocessing] ✗ FFmpeg spawn error: ${err.message}`);
+            reject(new Error(`Audio preprocessing spawn error: ${err.message}`));
+        });
     });
 }
 /**
  * Extract a specific time range from audio file
- *
- * Used by VAD service to extract voice segments
- *
- * @param inputPath - Source audio file
- * @param outputPath - Destination chunk file
- * @param startTime - Start time in seconds
- * @param duration - Duration in seconds
- * @returns Promise resolving to output file path
- *
- * @example
- * ```typescript
- * await extractAudioChunk(
- *   '/tmp/audio.mp3',
- *   '/tmp/chunk-0001.mp3',
- *   5.2,   // Start at 5.2s
- *   10.0   // Extract 10 seconds
- * );
- * ```
+ * Uses spawn directly for gVisor compatibility
  */
 export async function extractAudioChunk(inputPath, outputPath, startTime, duration) {
-    // Validate file paths (security)
     validateFilePath(inputPath);
     validateFilePath(outputPath);
     console.log(`[AudioExtractor] Extracting chunk: ${startTime}s - ${startTime + duration}s`);
     const TIMEOUT_MS = TIMEOUTS.AUDIO_CHUNK_EXTRACTION;
     return new Promise((resolve, reject) => {
-        const command = ffmpeg(inputPath)
-            .setStartTime(startTime)
-            .setDuration(duration)
-            .audioCodec('libmp3lame')
-            .audioFrequency(16000) // Keep 16kHz for Whisper
-            .audioChannels(1) // Keep mono
-            .audioBitrate('64k')
-            .format('mp3')
-            .output(outputPath);
-        let isTimedOut = false;
-        // Timeout handler
+        let completed = false;
+        let lastActivityTime = Date.now();
+        const ffmpegArgs = [
+            '-nostdin',
+            '-y',
+            '-ss', startTime.toString(),
+            '-t', duration.toString(),
+            '-i', inputPath,
+            '-acodec', 'libmp3lame',
+            '-ar', '16000',
+            '-ac', '1',
+            '-b:a', '64k',
+            '-f', 'mp3',
+            outputPath
+        ];
+        const proc = spawn('ffmpeg', ffmpegArgs, {
+            env: getGVisorEnv(),
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
         const timeoutId = setTimeout(() => {
-            isTimedOut = true;
-            console.error(`[AudioExtractor] ✗ Chunk extraction timed out after ${TIMEOUT_MS}ms`);
-            try {
-                command.kill('SIGKILL');
+            if (!completed) {
+                completed = true;
+                console.error(`[AudioExtractor] ✗ Chunk extraction timed out after ${TIMEOUT_MS}ms`);
+                proc.kill('SIGKILL');
+                reject(new Error(`Audio chunk extraction timed out after ${TIMEOUT_MS}ms`));
             }
-            catch (killError) {
-                console.error(`[AudioExtractor] Failed to kill FFmpeg process:`, killError);
-            }
-            reject(new Error(`Audio chunk extraction timed out after ${TIMEOUT_MS}ms`));
         }, TIMEOUT_MS);
-        command
-            .on('end', () => {
-            if (!isTimedOut) {
-                clearTimeout(timeoutId);
+        const activityInterval = setInterval(() => {
+            const idleTime = Date.now() - lastActivityTime;
+            if (idleTime > 30000) { // 30 seconds for chunk extraction
+                if (!completed) {
+                    completed = true;
+                    console.error(`[AudioExtractor] ✗ Chunk extraction idle for ${idleTime / 1000}s`);
+                    clearTimeout(timeoutId);
+                    clearInterval(activityInterval);
+                    proc.kill('SIGKILL');
+                    reject(new Error(`Audio chunk extraction stalled (no output for ${idleTime / 1000}s)`));
+                }
+            }
+        }, 5000);
+        proc.stdout?.on('data', () => {
+            lastActivityTime = Date.now();
+        });
+        proc.stderr?.on('data', () => {
+            lastActivityTime = Date.now();
+        });
+        proc.on('close', (code) => {
+            if (completed)
+                return;
+            completed = true;
+            clearTimeout(timeoutId);
+            clearInterval(activityInterval);
+            if (code === 0 || code === null) {
                 console.log(`[AudioExtractor] ✓ Chunk extracted: ${path.basename(outputPath)}`);
                 resolve(outputPath);
             }
-        })
-            .on('error', (error) => {
-            clearTimeout(timeoutId);
-            if (!isTimedOut) {
-                console.error(`[AudioExtractor] ✗ Chunk extraction failed:`, error.message);
-                reject(new Error(`Failed to extract audio chunk: ${error.message}`));
+            else {
+                console.error(`[AudioExtractor] ✗ Chunk extraction failed with code ${code}`);
+                reject(new Error(`Failed to extract audio chunk: code ${code}`));
             }
-        })
-            .run();
+        });
+        proc.on('error', (err) => {
+            if (completed)
+                return;
+            completed = true;
+            clearTimeout(timeoutId);
+            clearInterval(activityInterval);
+            console.error(`[AudioExtractor] ✗ Chunk extraction spawn error: ${err.message}`);
+            reject(new Error(`Audio chunk extraction spawn error: ${err.message}`));
+        });
     });
+}
+/**
+ * Split audio file into smaller chunks for VAD processing
+ * Uses spawn directly for gVisor compatibility
+ */
+export async function splitAudioIntoChunks(audioPath, outputDir, audioDuration, config = DEFAULT_PRE_CHUNK_CONFIG) {
+    validateFilePath(audioPath);
+    validateFilePath(outputDir);
+    if (!config.enabled || audioDuration < config.minDurationForChunking) {
+        console.log(`[AudioExtractor] [PreChunk] Chunking not needed (duration: ${audioDuration.toFixed(1)}s, min: ${config.minDurationForChunking}s)`);
+        return [];
+    }
+    console.log(`[AudioExtractor] [PreChunk] ═══════════════════════════════════════`);
+    console.log(`[AudioExtractor] [PreChunk] Starting audio pre-chunking`);
+    console.log(`[AudioExtractor] [PreChunk] ═══════════════════════════════════════`);
+    console.log(`[AudioExtractor] [PreChunk] Audio duration: ${audioDuration.toFixed(1)}s (${(audioDuration / 60).toFixed(1)} minutes)`);
+    console.log(`[AudioExtractor] [PreChunk] Chunk duration: ${config.chunkDuration}s (${(config.chunkDuration / 60).toFixed(1)} minutes)`);
+    console.log(`[AudioExtractor] [PreChunk] Overlap: ${config.overlapDuration}s`);
+    await fs.mkdir(outputDir, { recursive: true });
+    const chunks = [];
+    let currentStart = 0;
+    let chunkIndex = 0;
+    while (currentStart < audioDuration) {
+        const chunkEnd = Math.min(currentStart + config.chunkDuration + config.overlapDuration, audioDuration);
+        const chunkDuration = chunkEnd - currentStart;
+        if (chunkDuration < 5) {
+            console.log(`[AudioExtractor] [PreChunk] Skipping short final chunk (${chunkDuration.toFixed(1)}s)`);
+            break;
+        }
+        const chunkPath = path.join(outputDir, `prechunk-${chunkIndex.toString().padStart(4, '0')}.mp3`);
+        chunks.push({
+            index: chunkIndex,
+            startTime: currentStart,
+            endTime: chunkEnd,
+            duration: chunkDuration,
+            filePath: chunkPath,
+        });
+        currentStart += config.chunkDuration;
+        chunkIndex++;
+    }
+    console.log(`[AudioExtractor] [PreChunk] Calculated ${chunks.length} chunks`);
+    const TIMEOUT_PER_CHUNK = 60000;
+    for (const chunk of chunks) {
+        console.log(`[AudioExtractor] [PreChunk] Extracting chunk ${chunk.index + 1}/${chunks.length}: ${chunk.startTime.toFixed(1)}s - ${chunk.endTime.toFixed(1)}s`);
+        await new Promise((resolve, reject) => {
+            let completed = false;
+            let lastActivityTime = Date.now();
+            const ffmpegArgs = [
+                '-nostdin',
+                '-y',
+                '-ss', chunk.startTime.toString(),
+                '-t', chunk.duration.toString(),
+                '-i', audioPath,
+                '-acodec', 'libmp3lame',
+                '-ar', '16000',
+                '-ac', '1',
+                '-b:a', '64k',
+                '-f', 'mp3',
+                chunk.filePath
+            ];
+            const proc = spawn('ffmpeg', ffmpegArgs, {
+                env: getGVisorEnv(),
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            const timeoutId = setTimeout(() => {
+                if (!completed) {
+                    completed = true;
+                    console.error(`[AudioExtractor] [PreChunk] ✗ Chunk ${chunk.index} timed out`);
+                    proc.kill('SIGKILL');
+                    reject(new Error(`Pre-chunk extraction timed out for chunk ${chunk.index}`));
+                }
+            }, TIMEOUT_PER_CHUNK);
+            const activityInterval = setInterval(() => {
+                const idleTime = Date.now() - lastActivityTime;
+                if (idleTime > 30000) {
+                    if (!completed) {
+                        completed = true;
+                        clearTimeout(timeoutId);
+                        clearInterval(activityInterval);
+                        proc.kill('SIGKILL');
+                        reject(new Error(`Pre-chunk extraction stalled for chunk ${chunk.index}`));
+                    }
+                }
+            }, 5000);
+            proc.stdout?.on('data', () => {
+                lastActivityTime = Date.now();
+            });
+            proc.stderr?.on('data', () => {
+                lastActivityTime = Date.now();
+            });
+            proc.on('close', (code) => {
+                if (completed)
+                    return;
+                completed = true;
+                clearTimeout(timeoutId);
+                clearInterval(activityInterval);
+                if (code === 0 || code === null) {
+                    resolve();
+                }
+                else {
+                    reject(new Error(`Pre-chunk extraction failed: code ${code}`));
+                }
+            });
+            proc.on('error', (err) => {
+                if (completed)
+                    return;
+                completed = true;
+                clearTimeout(timeoutId);
+                clearInterval(activityInterval);
+                reject(new Error(`Pre-chunk extraction spawn error: ${err.message}`));
+            });
+        });
+    }
+    console.log(`[AudioExtractor] [PreChunk] ✓ All ${chunks.length} chunks extracted`);
+    console.log(`[AudioExtractor] [PreChunk] ═══════════════════════════════════════`);
+    return chunks;
+}
+/**
+ * Cleanup pre-chunk temporary files
+ */
+export async function cleanupPreChunks(outputDir) {
+    try {
+        await fs.rm(outputDir, { recursive: true, force: true });
+        console.log(`[AudioExtractor] [PreChunk] ✓ Cleaned up temporary chunks: ${outputDir}`);
+    }
+    catch (error) {
+        console.error(`[AudioExtractor] [PreChunk] Failed to cleanup chunks:`, error);
+    }
 }
 //# sourceMappingURL=audioExtractor.js.map

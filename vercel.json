@@ -4,5 +4,29 @@
       "path": "/api/cron/cleanup-blobs",
       "schedule": "0 3 * * *"
     }
+  ],
+  "redirects": [
+    {
+      "source": "/:path*",
+      "has": [
+        {
+          "type": "host",
+          "value": "video-handoff.com"
+        }
+      ],
+      "destination": "https://video.function-eight.com/:path*",
+      "permanent": true
+    },
+    {
+      "source": "/:path*",
+      "has": [
+        {
+          "type": "host",
+          "value": "www.video-handoff.com"
+        }
+      ],
+      "destination": "https://video.function-eight.com/:path*",
+      "permanent": true
+    }
   ]
 }

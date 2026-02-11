@@ -142,17 +142,9 @@ export async function GET(
       const blob = await response.blob();
       const arrayBuffer = await blob.arrayBuffer();
 
-      // Delete result from R2 after downloading (async, don't block response)
-      console.log(`[${uploadId}] [PROD] Scheduling R2 object deletion...`);
-      setTimeout(async () => {
-        try {
-          await deleteObject(resultR2Key);
-          console.log(`[${uploadId}] [PROD] R2 object deleted successfully`);
-        } catch (error) {
-          console.error(`[${uploadId}] Failed to delete R2 object:`, error);
-          // Don't fail the download if cleanup fails
-        }
-      }, 5000); // Delete after 5 seconds
+      // Keep result for 7 days for re-download (don't delete immediately)
+      // Results are cleaned up by a scheduled job after 7 days
+      console.log(`[${uploadId}] [PROD] Result file preserved for 7 days (re-download enabled)`);
 
       console.log(`[${uploadId}] [PROD] Download complete (${blob.size} bytes)`);
 

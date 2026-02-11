@@ -7,6 +7,7 @@ import { CloudTasksClient } from '@google-cloud/tasks';
 import { processVideo } from './services/videoProcessor.js';
 import { getStatus, updateStatus } from './services/statusManager.js';
 import { cleanupExpiredCheckpoints } from './services/checkpointService.js';
+import { emergencySaveOcrProgress, markCheckpointInterrupted } from './services/emergencyCheckpoint.js';
 
 // Cloud Tasks client (initialized lazily)
 let tasksClient: CloudTasksClient | null = null;
@@ -28,6 +29,7 @@ const CLOUD_RUN_URL = process.env.CLOUD_RUN_SERVICE_URL ||
 dotenv.config();
 
 // Track currently processing upload for graceful shutdown
+// Version: 2026-02-11-v2 - Emergency checkpoint + improved retry
 let currentProcessingUploadId: string | null = null;
 export let isShuttingDown = false;
 
@@ -52,46 +54,67 @@ async function handleShutdown(signal: string): Promise<void> {
 
   if (currentProcessingUploadId) {
     const uploadId = currentProcessingUploadId;
-    console.log(`[${uploadId}] [Shutdown] Marking job as interrupted due to ${signal}`);
+    console.log(`[${uploadId}] [Shutdown] Saving checkpoint and marking job as interrupted due to ${signal}`);
+
+    // CRITICAL: Save in-progress OCR state before shutdown
+    // This allows Cloud Tasks to resume from the last saved checkpoint
+    try {
+      console.log(`[${uploadId}] [Shutdown] Emergency saving OCR progress...`);
+      const ocrSaved = await emergencySaveOcrProgress();
+      if (ocrSaved) {
+        console.log(`[${uploadId}] [Shutdown] OCR progress saved successfully`);
+      }
+
+      // Mark checkpoint as interrupted (increment retry count)
+      await markCheckpointInterrupted(uploadId);
+      console.log(`[${uploadId}] [Shutdown] Checkpoint marked as interrupted`);
+    } catch (checkpointErr) {
+      console.error(`[${uploadId}] [Shutdown] Failed to save checkpoint:`, checkpointErr);
+    }
 
     // Determine error message based on signal
+    // Note: Status is set to 'processing' (not 'error') to indicate resumable
+    // Cloud Tasks will retry and resume from checkpoint
     let errorMessage: string;
     let errorCode: string;
 
     switch (signal) {
       case 'SIGTERM':
         // SIGTERM = Cloud Run is shutting down (deployment, scale-down, timeout approaching)
-        errorMessage = 'Processing was interrupted due to server maintenance or scaling. Please try uploading again.';
-        errorCode = 'SERVER_SHUTDOWN';
+        errorMessage = 'Processing was interrupted due to server maintenance. Will resume automatically.';
+        errorCode = 'SERVER_SHUTDOWN_RESUMABLE';
         break;
       case 'SIGINT':
         // SIGINT = Manual interruption (Ctrl+C in dev)
-        errorMessage = 'Processing was manually stopped. Please try uploading again.';
+        errorMessage = 'Processing was manually stopped.';
         errorCode = 'MANUAL_STOP';
         break;
       case 'SIGKILL':
       case 'SIGBUS':
       case 'SIGSEGV':
         // These signals indicate memory/resource issues
-        errorMessage = 'Processing was stopped due to resource constraints (memory or CPU). Please try with a smaller video or wait a moment and try again.';
-        errorCode = 'RESOURCE_LIMIT';
+        errorMessage = 'Processing was stopped due to resource constraints. Will retry automatically.';
+        errorCode = 'RESOURCE_LIMIT_RESUMABLE';
         break;
       default:
-        errorMessage = `Processing was interrupted unexpectedly (${signal}). Please try uploading again.`;
-        errorCode = 'UNKNOWN_SIGNAL';
+        errorMessage = `Processing was interrupted unexpectedly (${signal}). Will retry automatically.`;
+        errorCode = 'UNKNOWN_SIGNAL_RESUMABLE';
     }
 
     try {
+      // Keep status as 'processing' so Cloud Tasks retry will resume
+      // Only update metadata to track the interruption
       await updateStatus(uploadId, {
-        status: 'error',
-        error: errorMessage,
+        status: 'processing',  // Keep as processing, not error
         metadata: {
           errorCode,
           signal,
           interruptedAt: new Date().toISOString(),
+          message: errorMessage,
+          willResume: true,
         } as any,
       });
-      console.log(`[${uploadId}] [Shutdown] Status updated to error: ${errorCode}`);
+      console.log(`[${uploadId}] [Shutdown] Status updated (will resume): ${errorCode}`);
     } catch (err) {
       console.error(`[${uploadId}] [Shutdown] Failed to update status:`, err);
     }
@@ -99,11 +122,11 @@ async function handleShutdown(signal: string): Promise<void> {
     console.log('[Shutdown] No active job to mark as interrupted');
   }
 
-  // Give some time for status update to complete
+  // Give more time for checkpoint save and status update to complete
   setTimeout(() => {
     console.log('[Shutdown] Exiting process');
     process.exit(0);
-  }, 1000);
+  }, 3000);  // Increased from 1s to 3s for checkpoint save
 }
 
 // Register signal handlers for graceful shutdown
@@ -601,6 +624,98 @@ app.post('/process-task', validateAuth, async (req: Request, res: Response): Pro
     res.status(500).json({
       error: 'Processing failed',
       message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// Process OCR batch endpoint - Called by Cloud Tasks for each batch
+// Each batch processes ~100 scenes with its own timeout
+app.post('/process-ocr-batch', validateAuth, async (req: Request, res: Response): Promise<void> => {
+  const { processSingleBatch } = await import('./services/batchProcessor.js');
+  const { queueNextBatch, markBatchCompleted, markBatchFailed } = await import('./services/batchQueueService.js');
+
+  try {
+    const payload = req.body as {
+      uploadId: string;
+      userId: string;
+      batchIndex: number;
+      totalBatches: number;
+      batchSize: number;
+      startSceneIndex: number;
+      endSceneIndex: number;
+      videoPath: string;
+      videoDuration: number;
+      isLastBatch: boolean;
+    };
+
+    const { uploadId, batchIndex, totalBatches, isLastBatch } = payload;
+
+    // Get retry count from Cloud Tasks header
+    const retryCount = parseInt(req.headers['x-cloudtasks-taskretrycount'] as string || '0', 10);
+
+    console.log(`[${uploadId}] [Batch ${batchIndex + 1}/${totalBatches}] Starting (retry: ${retryCount})`);
+
+    // Set current processing upload for graceful shutdown
+    setCurrentProcessingUpload(uploadId);
+
+    // Process this batch
+    const result = await processSingleBatch(payload);
+
+    // Mark batch as completed
+    await markBatchCompleted(
+      uploadId,
+      batchIndex,
+      totalBatches,
+      result.processedScenes,
+      result.totalScenes
+    );
+
+    // Queue next batch (if not last)
+    if (!isLastBatch) {
+      const hasNext = await queueNextBatch(uploadId, batchIndex, payload);
+      if (hasNext) {
+        console.log(`[${uploadId}] [Batch ${batchIndex + 1}] Queued next batch`);
+      }
+    } else {
+      // Last batch - trigger Excel generation
+      console.log(`[${uploadId}] [Batch ${batchIndex + 1}] Last batch completed, generating Excel...`);
+      // Excel generation will be triggered by the batch processor
+    }
+
+    // Clear current processing
+    setCurrentProcessingUpload(null);
+
+    res.json({
+      success: true,
+      uploadId,
+      batchIndex,
+      processedScenes: result.processedScenes,
+      isLastBatch,
+    });
+  } catch (error) {
+    const { uploadId, batchIndex, totalBatches } = req.body;
+    const retryCount = parseInt(req.headers['x-cloudtasks-taskretrycount'] as string || '0', 10);
+
+    console.error(`[${uploadId}] [Batch ${batchIndex + 1}/${totalBatches}] Failed:`, error);
+
+    // Mark batch as failed (will notify user if max retries reached)
+    await markBatchFailed(
+      uploadId,
+      batchIndex,
+      totalBatches,
+      error instanceof Error ? error : new Error('Unknown error'),
+      retryCount
+    );
+
+    // Clear current processing
+    setCurrentProcessingUpload(null);
+
+    // Return 500 to trigger Cloud Tasks retry
+    res.status(500).json({
+      error: 'Batch processing failed',
+      message: error instanceof Error ? error.message : 'Unknown error',
+      batchIndex,
+      retryCount,
     });
   }
 });

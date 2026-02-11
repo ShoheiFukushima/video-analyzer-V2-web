@@ -8,6 +8,7 @@ import {
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 // R2 client initialization
+// forcePathStyle is required for R2's S3-compatible API
 const r2Client = new S3Client({
   region: 'auto',
   endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -15,6 +16,7 @@ const r2Client = new S3Client({
     accessKeyId: process.env.R2_ACCESS_KEY_ID!,
     secretAccessKey: process.env.R2_SECRET_ACCESS_KEY!,
   },
+  forcePathStyle: true,
 });
 
 export const R2_BUCKET = process.env.R2_BUCKET_NAME!;
@@ -93,7 +95,7 @@ export async function objectExists(key: string): Promise<boolean> {
  * Expected format: uploads/{userId}/{uploadId}/{fileName} or results/{userId}/{uploadId}/{fileName}
  */
 export function isValidR2Key(key: string): boolean {
-  const pattern = /^(uploads|results)\/[a-zA-Z0-9_-]+\/upload_\d+_[a-zA-Z0-9]+\/.+$/;
+  const pattern = /^(uploads|results)\/[a-zA-Z0-9_-]+\/upload_\d+_[a-zA-Z0-9-]+\/.+$/;
   return pattern.test(key);
 }
 

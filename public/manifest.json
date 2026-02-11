@@ -1,7 +1,7 @@
 {
-  "name": "Video Analyzer V2",
-  "short_name": "VA V2",
-  "description": "AI-Powered Video Transcription & OCR using Whisper and Gemini Vision",
+  "name": "Video Handoff",
+  "short_name": "Handoff",
+  "description": "AI-powered video transcription and OCR tool using Whisper and Gemini Vision",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#ffffff",

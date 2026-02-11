@@ -45,9 +45,44 @@ export type ProcessingStage =
   | 'luminance_detection'
   | 'text_stabilization'
   | 'scene_ocr_excel'
+  | 'scene_detection'
+  | 'frame_extraction'
+  | 'ocr_processing'
+  | 'ocr_completed'
   | 'multi_frame_ocr'
+  | 'narration_mapping'
+  | 'excel_generation'
   | 'upload_result'
   | 'completed';
+
+// ========================================
+// 3-Phase Processing Types
+// ========================================
+
+/**
+ * Processing phase (1-3)
+ * Phase 1: Listening to narration (download → audio → Whisper)
+ * Phase 2: Reading on-screen text (scene detection → frame extraction → OCR)
+ * Phase 3: Creating report (narration mapping → Excel → upload)
+ */
+export type ProcessingPhase = 1 | 2 | 3;
+
+/**
+ * Phase status
+ */
+export type PhaseStatus = 'waiting' | 'in_progress' | 'completed' | 'skipped';
+
+/**
+ * Phase information for UI display
+ */
+export interface PhaseInfo {
+  phase: ProcessingPhase;
+  status: PhaseStatus;
+  progress: number;           // 0-100 within this phase
+  label: string;              // e.g., "Listening to narration..."
+  estimatedTime?: string;     // e.g., "About 2-3 min (estimate)"
+  subTask?: string;           // e.g., "Processing chunk 45/240"
+}
 
 export interface ProcessingMetadata {
   duration: number;
@@ -75,6 +110,12 @@ export interface ProcessingStatus {
   resultUrl?: string;
   metadata?: ProcessingMetadata;
   error?: string;
+  // 3-Phase UI support
+  phase?: ProcessingPhase;
+  phaseProgress?: number;      // 0-100 within current phase
+  phaseStatus?: PhaseStatus;
+  estimatedTimeRemaining?: string;  // e.g., "About 2-3 min (estimate)"
+  subTask?: string;            // e.g., "Processing chunk 45/240"
 }
 
 // ========================================

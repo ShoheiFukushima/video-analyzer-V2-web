@@ -37,7 +37,7 @@ export async function checkVideoUploadQuota(token?: string | null): Promise<Quot
   const response = await fetch(`${SAAS_PLATFORM_URL}/api/quota/check`, {
     method: 'GET',
     headers,
-    credentials: 'include', // バックアップとしてクッキーも送信
+    credentials: 'include',
   });
 
   if (!response.ok) {

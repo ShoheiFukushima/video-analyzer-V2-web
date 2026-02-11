@@ -1,5 +1,9 @@
+import { type PreChunkConfig } from '../config/vad.js';
 /**
  * Audio Extraction Service optimized for OpenAI Whisper API
+ *
+ * Rewritten to use spawn directly for Cloud Run gVisor compatibility.
+ * fluent-ffmpeg's .run() method can hang in gVisor environment.
  *
  * Follows OpenAI's recommendations:
  * https://platform.openai.com/docs/guides/speech-to-text
@@ -23,26 +27,17 @@ export interface AudioExtractionConfig {
 }
 /**
  * Extract audio from video file optimized for Whisper transcription
+ * Uses spawn directly for gVisor compatibility
  *
  * @param videoPath - Path to input video file
  * @param outputPath - Path to output MP3 file
  * @param config - Optional audio extraction configuration
  * @returns Promise resolving to output file path
- *
- * @example
- * ```typescript
- * const audioPath = await extractAudioForWhisper(
- *   '/tmp/video.mp4',
- *   '/tmp/audio.mp3'
- * );
- * ```
  */
 export declare function extractAudioForWhisper(videoPath: string, outputPath: string, config?: AudioExtractionConfig): Promise<string>;
 /**
- * Get audio metadata from video file
- *
- * @param videoPath - Path to video file
- * @returns Promise resolving to audio metadata
+ * Get audio metadata from video file using ffprobe
+ * Uses spawn directly for gVisor compatibility
  */
 export declare function getAudioMetadata(videoPath: string): Promise<{
     duration: number;
@@ -52,62 +47,37 @@ export declare function getAudioMetadata(videoPath: string): Promise<{
 }>;
 /**
  * Check if video file has audio stream
- *
- * @param videoPath - Path to video file
- * @returns Promise resolving to true if audio exists
  */
 export declare function hasAudioStream(videoPath: string): Promise<boolean>;
 /**
  * Preprocess audio for improved VAD detection
+ * Uses spawn directly for gVisor compatibility
  *
  * Applies FFmpeg filters to suppress background music (BGM) and enhance human voice.
- * This improves Voice Activity Detection (VAD) accuracy in videos with loud BGM.
- *
- * Filter chain:
- * 1. highpass=f=80: Remove sub-bass (<80Hz) - kick drums, rumble
- * 2. lowpass=f=8000: Remove high-frequency noise (>8kHz) - cymbals, hiss
- * 3. equalizer (60Hz, -15dB): Suppress BGM bass (40-80Hz)
- * 4. equalizer (160Hz, +10dB): Enhance voice fundamentals (80-240Hz)
- * 5. equalizer (3000Hz, +6dB): Enhance voice harmonics (2-4kHz)
- * 6. afftdn: FFT-based noise reduction
- * 7. dynaudnorm: Volume normalization
- *
- * @param audioPath - Path to input audio file (16kHz mono MP3)
- * @param uploadId - Upload ID for logging
- * @returns Promise<void> - Replaces original file with preprocessed audio
- * @throws Error - On preprocessing failure (caller should use original audio as fallback)
- *
- * @example
- * ```typescript
- * try {
- *   await preprocessAudioForVAD('/tmp/audio.mp3', 'upload_123');
- * } catch (error) {
- *   console.warn('Preprocessing failed, using original audio:', error);
- *   // Continue with original audio
- * }
- * ```
  */
 export declare function preprocessAudioForVAD(audioPath: string, uploadId: string): Promise<void>;
 /**
  * Extract a specific time range from audio file
- *
- * Used by VAD service to extract voice segments
- *
- * @param inputPath - Source audio file
- * @param outputPath - Destination chunk file
- * @param startTime - Start time in seconds
- * @param duration - Duration in seconds
- * @returns Promise resolving to output file path
- *
- * @example
- * ```typescript
- * await extractAudioChunk(
- *   '/tmp/audio.mp3',
- *   '/tmp/chunk-0001.mp3',
- *   5.2,   // Start at 5.2s
- *   10.0   // Extract 10 seconds
- * );
- * ```
+ * Uses spawn directly for gVisor compatibility
  */
 export declare function extractAudioChunk(inputPath: string, outputPath: string, startTime: number, duration: number): Promise<string>;
+/**
+ * Audio file chunk metadata for pre-chunking long audio files
+ */
+export interface AudioFileChunk {
+    index: number;
+    startTime: number;
+    endTime: number;
+    duration: number;
+    filePath: string;
+}
+/**
+ * Split audio file into smaller chunks for VAD processing
+ * Uses spawn directly for gVisor compatibility
+ */
+export declare function splitAudioIntoChunks(audioPath: string, outputDir: string, audioDuration: number, config?: PreChunkConfig): Promise<AudioFileChunk[]>;
+/**
+ * Cleanup pre-chunk temporary files
+ */
+export declare function cleanupPreChunks(outputDir: string): Promise<void>;
 //# sourceMappingURL=audioExtractor.d.ts.map
