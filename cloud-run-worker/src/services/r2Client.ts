@@ -160,8 +160,8 @@ function getDownloadSettings(fileSize: number): { chunkSize: number; concurrency
   } else if (fileSize < SIZE_THRESHOLDS.LARGE) {
     return { chunkSize: 50 * 1024 * 1024, concurrency: 3, description: 'standard-parallel (500MB-1GB)' };
   } else {
-    // 1GB+ files: larger chunks, lower concurrency for stability
-    return { chunkSize: 64 * 1024 * 1024, concurrency: 2, description: 'heavy-parallel (1GB+)' };
+    // 1GB+ files: larger chunks, moderate concurrency for stability
+    return { chunkSize: 64 * 1024 * 1024, concurrency: 4, description: 'heavy-parallel (1GB+)' };
   }
 }
 

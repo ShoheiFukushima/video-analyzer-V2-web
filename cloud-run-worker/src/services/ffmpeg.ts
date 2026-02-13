@@ -13,7 +13,7 @@ import { spawn, execSync } from 'child_process';
 import pLimit from 'p-limit';
 import { Scene, SceneCut, VideoMetadata, ROIConfig } from '../types/excel.js';
 import { formatTimecode } from '../utils/timecode.js';
-import { TIMEOUTS } from '../config/timeouts.js';
+import { TIMEOUTS, getSceneDetectionTimeout } from '../config/timeouts.js';
 
 // Concurrency limit for parallel frame extraction
 // Balanced for 4 vCPU Cloud Run instance
@@ -562,13 +562,13 @@ function runSceneDetection(
 ): Promise<SceneCut[]> {
   return new Promise((resolve, reject) => {
     const cuts: SceneCut[] = [];
-    const TIMEOUT_MS = TIMEOUTS.SCENE_DETECTION;
+    const TIMEOUT_MS = getSceneDetectionTimeout();
     let completed = false;
     let lastProgressTime = 0;
     const PROGRESS_INTERVAL_MS = 500; // Update progress every 0.5 seconds for more responsive UI
     let lastProgressUpdate = 0;
 
-    console.log(`    [SceneDetect] Starting FFmpeg spawn for threshold ${threshold}...`);
+    console.log(`    [SceneDetect] Starting FFmpeg spawn for threshold ${threshold} (timeout: ${TIMEOUT_MS / 60000}min)...`);
 
     // Set gVisor-compatible environment
     const ffmpegEnv = {
@@ -774,10 +774,10 @@ function runSceneDetectionWithCrop(
     }
 
     const cuts: SceneCut[] = [];
-    const TIMEOUT_MS = TIMEOUTS.SCENE_DETECTION;
+    const TIMEOUT_MS = getSceneDetectionTimeout();
     let completed = false;
 
-    console.log(`    [SceneDetect-ROI] Starting FFmpeg spawn (crop: ${cropFilter}, threshold: ${threshold})...`);
+    console.log(`    [SceneDetect-ROI] Starting FFmpeg spawn (crop: ${cropFilter}, threshold: ${threshold}, timeout: ${TIMEOUT_MS / 60000}min)...`);
 
     // Set gVisor-compatible environment
     const ffmpegEnv = {

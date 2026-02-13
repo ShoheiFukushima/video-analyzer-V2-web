@@ -76,7 +76,8 @@ export async function executeIdealPipeline(
   transcription: TranscriptionSegment[],
   uploadId?: string,
   detectionMode: DetectionMode = 'standard',
-  checkpoint?: ProcessingCheckpoint
+  checkpoint?: ProcessingCheckpoint,
+  preDetectedScenes?: Scene[]
 ): Promise<{ excelPath: string; stats: ProcessingStats }> {
   console.log('🎬 Starting Ideal Pipeline Execution');
   console.log(`  📹 Video: ${videoPath}`);
@@ -112,12 +113,34 @@ export async function executeIdealPipeline(
 
   // Phase 2 Step 2: Scene detection
   // Phase 2 progress: 5-25%
-  // Check if scenes are already cached in checkpoint
+  // Check if scenes are already available from parallel processing, checkpoint, or need detection
   let scenes: Scene[] = [];
   const cachedSceneCuts = checkpoint?.sceneCuts || [];
   const isSceneDetectionComplete = checkpoint?.currentStep === 'ocr' && cachedSceneCuts.length > 0;
 
-  if (isSceneDetectionComplete) {
+  if (preDetectedScenes && preDetectedScenes.length > 0) {
+    // Pre-detected scenes from parallel processing (Whisper + Scene Detection ran concurrently)
+    console.log('\n🎞️ Step 2: Scene detection (PRE-DETECTED from parallel processing)...');
+    console.log(`  ⚡ Using ${preDetectedScenes.length} pre-detected scenes (no additional detection needed)`);
+    scenes = preDetectedScenes;
+
+    // Save scene cuts to checkpoint for resume support
+    if (uploadId && checkpoint) {
+      try {
+        const sceneCuts: SceneCut[] = scenes.map(scene => ({
+          timestamp: scene.startTime,
+          confidence: 0.95,
+          source: 'ffmpeg_standard' as const,
+        }));
+        await setSceneCuts(uploadId, sceneCuts);
+        console.log(`  💾 Saved ${sceneCuts.length} pre-detected scene cuts to checkpoint`);
+      } catch (err) {
+        console.warn(`  ⚠️ Failed to save scene cuts checkpoint: ${err}`);
+      }
+    }
+
+    await safePhaseProgress(2, 25, `${scenes.length} scenes (pre-detected)`, 'frame_extraction');
+  } else if (isSceneDetectionComplete) {
     console.log('\n🎞️ Step 2: Scene detection (CACHED)...');
     console.log(`  ▶️ Using ${cachedSceneCuts.length} cached scene cuts from checkpoint`);
 

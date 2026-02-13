@@ -118,44 +118,17 @@ export async function GET(
         );
       }
 
-      console.log(`[${uploadId}] [PROD] Generating R2 download URL...`);
+      console.log(`[${uploadId}] [PROD] Generating R2 presigned download URL...`);
 
       // Generate presigned download URL from R2
+      // ResponseContentDisposition is already set in generateDownloadUrl (lib/r2-client.ts)
       const downloadUrl = await generateDownloadUrl(resultR2Key, 3600, `result_${uploadId}.xlsx`);
 
-      console.log(`[${uploadId}] [PROD] Downloading from R2...`);
+      console.log(`[${uploadId}] [PROD] Returning presigned URL for direct R2 download`);
 
-      // Download from R2
-      const response = await fetch(downloadUrl, {
-        signal: AbortSignal.timeout(60000), // 1 minute timeout
-      });
-
-      if (!response.ok) {
-        console.error(`[${uploadId}] R2 download failed: ${response.status}`);
-        return NextResponse.json(
-          { error: "Failed to download result from storage" },
-          { status: response.status }
-        );
-      }
-
-      // Stream file to client
-      const blob = await response.blob();
-      const arrayBuffer = await blob.arrayBuffer();
-
-      // Keep result for 7 days for re-download (don't delete immediately)
-      // Results are cleaned up by a scheduled job after 7 days
-      console.log(`[${uploadId}] [PROD] Result file preserved for 7 days (re-download enabled)`);
-
-      console.log(`[${uploadId}] [PROD] Download complete (${blob.size} bytes)`);
-
-      return new NextResponse(arrayBuffer, {
-        status: 200,
-        headers: {
-          'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-          'Content-Disposition': `attachment; filename="result_${uploadId}.xlsx"`,
-          'Content-Length': blob.size.toString(),
-        },
-      });
+      // Return presigned URL as JSON - client downloads directly from R2
+      // This eliminates Vercel memory buffering and 60s timeout for large files
+      return NextResponse.json({ downloadUrl });
     }
 
   } catch (error) {

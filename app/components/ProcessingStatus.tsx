@@ -59,15 +59,32 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
       setIsDownloading(true);
       const response = await fetch(`/api/download/${uploadId}`);
       if (!response.ok) throw new Error((await response.json()).error || 'Download failed');
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `result_${uploadId}.xlsx`;
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
+
+      const contentType = response.headers.get('content-type') || '';
+
+      if (contentType.includes('application/json')) {
+        // Production: API returns presigned URL for direct R2 download
+        const data = await response.json();
+        if (!data.downloadUrl) throw new Error('No download URL returned');
+
+        const a = document.createElement('a');
+        a.href = data.downloadUrl;
+        a.download = `result_${uploadId}.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      } else {
+        // Development / backward compatibility: API returns file directly
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `result_${uploadId}.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to download result');
       setIsError(true);
