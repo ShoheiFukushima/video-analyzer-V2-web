@@ -582,7 +582,10 @@ app.post('/process', validateAuth, async (req: Request, res: Response): Promise<
 });
 
 // Process task endpoint - Called by Cloud Tasks
-// This endpoint awaits the processing, ensuring Cloud Run keeps the instance alive
+// Fire-and-forget: Return 200 immediately, process in background.
+// Cloud Tasks dispatch deadline is max 1800s (30 min), but 2-hour videos
+// need 40-60+ minutes. By returning immediately, Cloud Run's own timeout
+// (3600s) governs the processing duration instead.
 app.post('/process-task', validateAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { uploadId, r2Key, fileName, userId, dataConsent, detectionMode } = req.body;
@@ -605,24 +608,30 @@ app.post('/process-task', validateAuth, async (req: Request, res: Response): Pro
       detectionMode: mode
     });
 
-    // AWAIT the processing - this keeps the HTTP connection open
-    // Cloud Tasks will wait for this to complete (up to 30 minutes)
-    await processVideo(uploadId, r2Key, fileName, userId, dataConsent, mode);
+    // Fire-and-forget: Start processing in background without awaiting.
+    // Cloud Run keeps the instance alive via --no-cpu-throttling + concurrency=1.
+    // Status updates go to Turso DB, so the frontend can track progress.
+    processVideo(uploadId, r2Key, fileName, userId, dataConsent, mode)
+      .then(() => {
+        console.log(`[${uploadId}] Processing completed successfully`);
+      })
+      .catch((error) => {
+        console.error(`[${uploadId}] Processing failed:`, error);
+        // Error status is already set by processVideo's catch block (failStatus)
+      });
 
-    console.log(`[${uploadId}] Processing completed successfully`);
-
+    // Return immediately to Cloud Tasks (acknowledge task receipt)
     res.json({
       success: true,
       uploadId,
-      message: 'Video processing completed',
-      status: 'completed',
+      message: 'Video processing started',
+      status: 'processing',
     });
   } catch (error) {
     console.error('[Process-task endpoint] Error:', error);
 
-    // Return 500 to signal Cloud Tasks to retry (if retries are configured)
     res.status(500).json({
-      error: 'Processing failed',
+      error: 'Failed to start processing',
       message: error instanceof Error ? error.message : 'Unknown error'
     });
   }

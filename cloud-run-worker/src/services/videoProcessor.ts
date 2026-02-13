@@ -594,16 +594,21 @@ async function performParallelProcessing(
   // Get video metadata for scene detection
   const videoMetadata = await getVideoMetadata(videoPath);
 
+  // Track whether Whisper has completed, so scene detection can update Phase 2 UI
+  let whisperCompleted = false;
+
   // Run Whisper and Scene Detection in parallel using Promise.allSettled
   const [whisperResult, sceneResult] = await Promise.allSettled([
     // Task 1: Whisper transcription (with checkpoint support)
     timeStep(uploadId, '[PARALLEL] Whisper Transcription', async () => {
-      return await performTranscriptionWithCheckpoint(
+      const result = await performTranscriptionWithCheckpoint(
         uploadId,
         audioPath,
         hasAudio,
         checkpoint
       );
+      whisperCompleted = true;
+      return result;
     }),
 
     // Task 2: Scene detection only (no frame extraction)
@@ -612,9 +617,21 @@ async function performParallelProcessing(
       const { scenes } = await detectScenesOnly(
         videoPath,
         videoMetadata,
-        // Progress callback for scene detection (logged but not sent to UI during parallel)
+        // Progress callback: update Phase 2 UI after Whisper completes
         async (currentTime, totalDuration, formattedProgress) => {
           console.log(`[${uploadId}] [PARALLEL] Scene detection progress: ${formattedProgress}`);
+
+          // After Whisper completes Phase 1, show scene detection progress on Phase 2
+          // This prevents the UI from appearing stuck between Phase 1 and Phase 2
+          if (whisperCompleted && totalDuration > 0) {
+            const scenePercent = currentTime / totalDuration;
+            const phaseProgress = Math.round(scenePercent * 25); // 0-25% of Phase 2
+            await updatePhaseProgress(uploadId, 2, phaseProgress, {
+              phaseStatus: 'in_progress',
+              subTask: `Detecting scenes: ${formattedProgress}`,
+              stage: 'scene_detection',
+            });
+          }
         }
       );
       console.log(`[${uploadId}] [PARALLEL] Scene detection complete: ${scenes.length} scenes`);

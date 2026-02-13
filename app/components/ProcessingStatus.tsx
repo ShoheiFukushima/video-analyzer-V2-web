@@ -43,9 +43,9 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
   const [isError, setIsError] = useState(false);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
 
-  // Stale detection: if status hasn't updated for 30 minutes, show error
-  // Long videos (2+ hours) can take 30-60 minutes for scene detection
-  const STALE_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+  // Stale detection: if status hasn't updated for 60 minutes, show error
+  // Long videos (2+ hours) can take 40-60 minutes for parallel scene detection + OCR
+  const STALE_THRESHOLD_MS = 60 * 60 * 1000; // 60 minutes
 
   // Phase state
   const [phases, setPhases] = useState<PhaseData[]>([
