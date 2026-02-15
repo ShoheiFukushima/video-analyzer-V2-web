@@ -556,8 +556,16 @@ app.post('/process', validateAuth, async (req: Request, res: Response): Promise<
         body: Buffer.from(JSON.stringify(taskPayload)).toString('base64'),
       },
       // Task dispatch deadline: 30 minutes (Cloud Tasks max is 30 mins)
-      // Cloud Run will handle the actual timeout (up to 60 mins)
+      // After 30 min, Cloud Tasks considers the task failed and closes the connection.
+      // But the Cloud Run handler continues running (Node.js doesn't abort on disconnect).
+      // Cloud Run's own timeout (3600s = 1 hour) governs the actual processing duration.
       dispatchDeadline: { seconds: 1800 },
+      // CRITICAL: Disable retries to prevent duplicate processing.
+      // Without this, Cloud Tasks would retry after dispatch deadline expiry,
+      // creating a second Cloud Run instance processing the same video.
+      taskRetryConfig: {
+        maxAttempts: 1,
+      },
     };
 
     const [response] = await client.createTask({ parent, task });
@@ -582,10 +590,12 @@ app.post('/process', validateAuth, async (req: Request, res: Response): Promise<
 });
 
 // Process task endpoint - Called by Cloud Tasks
-// Fire-and-forget: Return 200 immediately, process in background.
-// Cloud Tasks dispatch deadline is max 1800s (30 min), but 2-hour videos
-// need 40-60+ minutes. By returning immediately, Cloud Run's own timeout
-// (3600s) governs the processing duration instead.
+// IMPORTANT: We MUST await processVideo to keep the HTTP connection open.
+// Cloud Run terminates instances with no active requests (SIGTERM).
+// By awaiting, the instance stays alive for the full Cloud Run timeout (3600s).
+// Cloud Tasks dispatch deadline (1800s) may expire first, closing the connection,
+// but the Express handler continues running (Node.js doesn't abort on client disconnect).
+// Retries are disabled (maxAttempts=1) to prevent duplicate processing.
 app.post('/process-task', validateAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { uploadId, r2Key, fileName, userId, dataConsent, detectionMode } = req.body;
@@ -608,32 +618,37 @@ app.post('/process-task', validateAuth, async (req: Request, res: Response): Pro
       detectionMode: mode
     });
 
-    // Fire-and-forget: Start processing in background without awaiting.
-    // Cloud Run keeps the instance alive via --no-cpu-throttling + concurrency=1.
-    // Status updates go to Turso DB, so the frontend can track progress.
-    processVideo(uploadId, r2Key, fileName, userId, dataConsent, mode)
-      .then(() => {
-        console.log(`[${uploadId}] Processing completed successfully`);
-      })
-      .catch((error) => {
-        console.error(`[${uploadId}] Processing failed:`, error);
-        // Error status is already set by processVideo's catch block (failStatus)
-      });
+    // AWAIT processing: keeps HTTP connection open → Cloud Run keeps instance alive.
+    // If Cloud Tasks disconnects after 30 min, the handler continues running.
+    await processVideo(uploadId, r2Key, fileName, userId, dataConsent, mode);
 
-    // Return immediately to Cloud Tasks (acknowledge task receipt)
-    res.json({
-      success: true,
-      uploadId,
-      message: 'Video processing started',
-      status: 'processing',
-    });
+    console.log(`[${uploadId}] Processing completed successfully`);
+
+    // Try to send response (may fail if Cloud Tasks already closed connection)
+    try {
+      res.json({
+        success: true,
+        uploadId,
+        message: 'Video processing completed',
+        status: 'completed',
+      });
+    } catch {
+      // Cloud Tasks closed connection after dispatch deadline - this is expected
+      // for long-running videos. Processing already completed successfully.
+      console.log(`[${uploadId}] Response send failed (Cloud Tasks disconnected) - processing already complete`);
+    }
   } catch (error) {
     console.error('[Process-task endpoint] Error:', error);
 
-    res.status(500).json({
-      error: 'Failed to start processing',
-      message: error instanceof Error ? error.message : 'Unknown error'
-    });
+    try {
+      res.status(500).json({
+        error: 'Processing failed',
+        message: error instanceof Error ? error.message : 'Unknown error'
+      });
+    } catch {
+      // Connection already closed
+      console.log('[Process-task endpoint] Could not send error response (connection closed)');
+    }
   }
 });
 
