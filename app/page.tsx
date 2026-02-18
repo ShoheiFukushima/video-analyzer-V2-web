@@ -4,6 +4,7 @@ import { useState } from "react";
 import { SignInButton, SignedIn, SignedOut, UserButton } from "@clerk/nextjs";
 import { VideoUploader } from "./components/VideoUploader";
 import { ProcessingStatus } from "./components/ProcessingStatus";
+import { UploadHistory } from "./components/UploadHistory";
 import { QuotaDisplay } from "./components/QuotaDisplay";
 import { Brush, Sparkles } from "lucide-react";
 import { InteractiveDemo } from "./components/InteractiveDemo";
@@ -46,6 +47,11 @@ export default function Home() {
 
   const handleProcessingComplete = () => {
     setIsProcessing(false);
+  };
+
+  const handleResumeProcessing = (id: string) => {
+    setUploadId(id);
+    setIsProcessing(true);
   };
 
   return (
@@ -213,6 +219,13 @@ export default function Home() {
                 </div>
               </motion.div>
             )}
+
+            <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }}>
+              <UploadHistory
+                onResumeProcessing={handleResumeProcessing}
+                currentUploadId={uploadId}
+              />
+            </motion.div>
           </div>
         </SignedIn>
       </main>
