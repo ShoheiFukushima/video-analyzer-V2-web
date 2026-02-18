@@ -10,6 +10,7 @@ import {
   Eye,
   History,
   RefreshCw,
+  Trash2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -65,6 +66,7 @@ export function UploadHistory({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isDownloading, setIsDownloading] = useState<string | null>(null);
+  const [isDeleting, setIsDeleting] = useState<string | null>(null);
 
   const fetchUploads = useCallback(async () => {
     try {
@@ -130,6 +132,32 @@ export function UploadHistory({
     []
   );
 
+  const handleDelete = useCallback(
+    async (uploadId: string) => {
+      try {
+        setIsDeleting(uploadId);
+        // Optimistic UI: remove from list immediately
+        setUploads((prev) => prev.filter((u) => u.uploadId !== uploadId));
+
+        const response = await fetch(`/api/uploads/${uploadId}`, {
+          method: "DELETE",
+        });
+        if (!response.ok) {
+          // Revert on failure
+          fetchUploads();
+          console.error("Delete failed:", await response.text());
+        }
+      } catch (err) {
+        // Revert on error
+        fetchUploads();
+        console.error("Delete failed:", err);
+      } finally {
+        setIsDeleting(null);
+      }
+    },
+    [fetchUploads]
+  );
+
   // Don't show if no uploads and not loading
   const filteredUploads = uploads.filter(
     (u) => u.uploadId !== currentUploadId
@@ -169,8 +197,10 @@ export function UploadHistory({
             key={upload.uploadId}
             upload={upload}
             isDownloading={isDownloading === upload.uploadId}
+            isDeleting={isDeleting === upload.uploadId}
             onResume={() => onResumeProcessing(upload.uploadId)}
             onDownload={() => handleDownload(upload.uploadId)}
+            onDelete={() => handleDelete(upload.uploadId)}
           />
         ))}
       </div>
@@ -181,15 +211,19 @@ export function UploadHistory({
 interface UploadRowProps {
   upload: UploadRecord;
   isDownloading: boolean;
+  isDeleting: boolean;
   onResume: () => void;
   onDownload: () => void;
+  onDelete: () => void;
 }
 
 function UploadRow({
   upload,
   isDownloading,
+  isDeleting,
   onResume,
   onDownload,
+  onDelete,
 }: UploadRowProps) {
   const isProcessing =
     upload.status === "processing" || upload.status === "downloading" || upload.status === "pending";
@@ -252,7 +286,7 @@ function UploadRow({
       </div>
 
       {/* Action */}
-      <div className="flex-shrink-0">
+      <div className="flex-shrink-0 flex items-center gap-1">
         {isProcessing && (
           <button
             onClick={(e) => {
@@ -282,6 +316,21 @@ function UploadRow({
             Download
           </button>
         )}
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete();
+          }}
+          disabled={isDeleting}
+          className="text-xs text-muted-foreground hover:text-red-600 flex items-center gap-1 p-1 rounded-md hover:bg-red-600/10 transition-colors disabled:opacity-50"
+          title="Delete"
+        >
+          {isDeleting ? (
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          ) : (
+            <Trash2 className="w-3.5 h-3.5" />
+          )}
+        </button>
       </div>
     </div>
   );

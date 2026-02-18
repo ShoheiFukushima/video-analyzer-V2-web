@@ -80,6 +80,24 @@ export async function trackVideoUsage(data: UsageTrackData): Promise<void> {
 }
 
 /**
+ * リテンション設定（プランごとの保持期間・件数上限）
+ */
+export interface RetentionConfig {
+  maxItems: number;   // 最大保持件数
+  maxDays: number;    // 最大保持日数
+}
+
+export function getRetentionConfig(planType: string): RetentionConfig {
+  const configs: Record<string, RetentionConfig> = {
+    free: { maxItems: 3, maxDays: 2 },
+    basic: { maxItems: 5, maxDays: 5 },
+    pro: { maxItems: 10, maxDays: 10 },
+    teacher: { maxItems: 5, maxDays: 15 },
+  };
+  return configs[planType] || configs.free;
+}
+
+/**
  * 動画長制限チェック（クライアント側）
  */
 export function checkVideoDuration(

@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
-import { isValidR2Key } from "@/lib/r2-client";
+import { isValidR2Key, deleteObject } from "@/lib/r2-client";
+import { getRetentionConfig } from "@/lib/quota";
+import { createClient } from "@libsql/client";
 
 export const runtime = "nodejs";
 export const maxDuration = 30; // 30 second timeout for processing request
@@ -62,7 +64,7 @@ async function callCloudRunWithFailover(
 export async function POST(request: NextRequest) {
   try {
     // Check authentication - Required for all environments
-    const { userId } = await auth();
+    const { userId, getToken } = await auth();
     if (!userId) {
       return NextResponse.json(
         { error: "Unauthorized", message: "You must be logged in to process videos" },
@@ -95,7 +97,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Validate detectionMode (default to 'standard' if not provided or invalid)
-    const validModes = ['standard', 'enhanced'];
+    const validModes = ['standard', 'enhanced', 'reverse_engineer'];
     const mode = validModes.includes(detectionMode) ? detectionMode : 'standard';
 
     // Security: Validate R2 key format (SSRF protection)
@@ -160,6 +162,84 @@ export async function POST(request: NextRequest) {
       console.log(`[${uploadId}] Fallback URLs: ${fallbackUrls.join(', ')}`);
     }
     console.log(`[${uploadId}] Detection mode: ${mode}`);
+
+    // Enforce retention count limit: auto-delete oldest uploads if over quota
+    try {
+      const tursoUrl = process.env.TURSO_DATABASE_URL;
+      const tursoToken = process.env.TURSO_AUTH_TOKEN;
+
+      if (tursoUrl && tursoToken) {
+        // Get plan type from quota API
+        let planType = 'free';
+        try {
+          const token = await getToken();
+          if (token) {
+            const saasUrl = process.env.NEXT_PUBLIC_SAAS_PLATFORM_URL || 'http://localhost:3000';
+            const quotaRes = await fetch(`${saasUrl}/api/quota/check`, {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            if (quotaRes.ok) {
+              const quotaData = await quotaRes.json();
+              planType = quotaData.plan_type || 'free';
+            }
+          }
+        } catch {
+          // Default to free plan
+        }
+
+        const retention = getRetentionConfig(planType);
+        const dbClient = createClient({ url: tursoUrl, authToken: tursoToken });
+
+        // Count current uploads for this user
+        const countResult = await dbClient.execute({
+          sql: 'SELECT COUNT(*) as cnt FROM processing_status WHERE user_id = ?',
+          args: [userId],
+        });
+        const currentCount = (countResult.rows[0]?.cnt as number) || 0;
+
+        // If at or over limit, delete oldest records to make room
+        if (currentCount >= retention.maxItems) {
+          const deleteCount = currentCount - retention.maxItems + 1;
+          const oldestResult = await dbClient.execute({
+            sql: `
+              SELECT upload_id, metadata
+              FROM processing_status
+              WHERE user_id = ?
+              ORDER BY created_at ASC
+              LIMIT ?
+            `,
+            args: [userId, deleteCount],
+          });
+
+          for (const row of oldestResult.rows) {
+            const oldUploadId = row.upload_id as string;
+            const metadataStr = row.metadata as string | null;
+            const metadata = metadataStr ? JSON.parse(metadataStr) : null;
+            const r2Key = metadata?.resultR2Key;
+
+            // Delete R2 file
+            if (r2Key) {
+              try {
+                await deleteObject(r2Key);
+                console.log(`[${uploadId}] Auto-deleted R2 file for oldest upload ${oldUploadId}`);
+              } catch {
+                console.warn(`[${uploadId}] R2 delete failed for ${oldUploadId}`);
+              }
+            }
+
+            // Delete DB record
+            await dbClient.execute({
+              sql: 'DELETE FROM processing_status WHERE upload_id = ? AND user_id = ?',
+              args: [oldUploadId, userId],
+            });
+            console.log(`[${uploadId}] Auto-deleted oldest upload ${oldUploadId} (retention: ${retention.maxItems} items)`);
+          }
+        }
+      }
+    } catch (retentionError) {
+      // Don't block processing if retention cleanup fails
+      console.warn(`[${uploadId}] Retention cleanup failed (non-blocking):`, retentionError);
+    }
 
     // Prepare payload
     const payload = {

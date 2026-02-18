@@ -6,6 +6,7 @@
 
 import { NextResponse } from 'next/server';
 import { getTursoClient } from '@/lib/turso';
+import { getRetentionConfig } from '@/lib/quota';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -34,8 +35,7 @@ export async function GET() {
           status,
           progress,
           current_step,
-          file_name,
-          result_r2_key,
+          result_url,
           metadata,
           created_at,
           updated_at,
@@ -49,16 +49,16 @@ export async function GET() {
     });
 
     const uploads: UploadRecord[] = result.rows.map((row) => {
-      // Parse metadata to get resultR2Key if not in dedicated column
+      // Parse metadata to get additional info
       const metadata = row.metadata ? JSON.parse(row.metadata as string) : null;
-      const resultR2Key = (row.result_r2_key as string | null) || metadata?.resultR2Key || null;
+      const resultR2Key = metadata?.resultR2Key || null;
 
       return {
         uploadId: row.upload_id as string,
         status: row.status as string,
         progress: (row.progress as number) || 0,
         stage: row.current_step as string | null,
-        fileName: (row.file_name as string | null) || metadata?.fileName || null,
+        fileName: metadata?.fileName || null,
         resultR2Key,
         createdAt: row.created_at as string,
         updatedAt: row.updated_at as string,
@@ -66,9 +66,35 @@ export async function GET() {
       };
     });
 
+    // Attempt to get user's plan type for retention info
+    let planType = 'free';
+    try {
+      const saasUrl = process.env.NEXT_PUBLIC_SAAS_PLATFORM_URL || 'http://localhost:3000';
+      const { getToken } = await (await import('@clerk/nextjs/server')).auth();
+      const token = await getToken();
+      if (token) {
+        const quotaRes = await fetch(`${saasUrl}/api/quota/check`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (quotaRes.ok) {
+          const quotaData = await quotaRes.json();
+          planType = quotaData.plan_type || 'free';
+        }
+      }
+    } catch {
+      // Fallback to free plan retention if quota check fails
+    }
+
+    const retention = getRetentionConfig(planType);
+
     return NextResponse.json({
       uploads,
       count: uploads.length,
+      retention: {
+        maxItems: retention.maxItems,
+        maxDays: retention.maxDays,
+        planType,
+      },
     });
   } catch (error) {
     // Handle authentication errors
