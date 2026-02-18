@@ -82,6 +82,15 @@ export const processVideo = async (
   let tempDir: string | null = null;
   let checkpoint: ProcessingCheckpoint | null = null;
 
+  // Heartbeat: update status every 60s to prevent stale detection on frontend
+  const heartbeatInterval = setInterval(async () => {
+    try {
+      await updateStatus(uploadId, { status: 'processing' });
+    } catch (err) {
+      console.warn(`[${uploadId}] Heartbeat update failed (non-fatal):`, err);
+    }
+  }, 60_000);
+
   try {
     // Track current processing for graceful shutdown handling
     setCurrentProcessingUpload(uploadId);
@@ -152,7 +161,7 @@ export const processVideo = async (
           console.error(`[${uploadId}] ❌ Failed to download video for resume: ${downloadErr}`);
           throw new Error(`Cannot resume: video file not available. Please re-upload.`);
         }
-        r2Deleted = true; // Assume already deleted on first run
+        // R2 source is still available for retry — don't assume deleted
       }
 
       // Step 2-3: Extract metadata and audio
@@ -188,7 +197,8 @@ export const processVideo = async (
           videoPath,
           audioPath,
           hasAudio,
-          cp
+          cp,
+          videoMetadata
         );
         transcription = result.transcription;
         vadStats = result.vadStats;
@@ -225,7 +235,8 @@ export const processVideo = async (
         transcription,
         detectionMode,
         cp,
-        preDetectedScenes
+        preDetectedScenes,
+        videoMetadata
       );
 
       // Step 6: Upload result and complete processing
@@ -256,6 +267,8 @@ export const processVideo = async (
     const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
     await failStatus(uploadId, errorMessage);
   } finally {
+    clearInterval(heartbeatInterval);
+
     // CRITICAL: Always delete the source R2 object, even on error
     // This prevents storage quota exhaustion
     if (!r2Deleted) {
@@ -335,20 +348,13 @@ async function downloadAndPrepareVideo(
     });
   });
 
-  // Delete source video from R2 after successful download (early cleanup)
-  try {
-    await timeStep(uploadId, 'Delete Source from R2', async () => {
-      await deleteFromR2(r2Key);
-      r2Deleted.value = true;
-    });
-  } catch (deleteError) {
-    console.warn(`[${uploadId}] ⚠️  Failed to delete R2 object (will retry in finally):`, deleteError);
-  }
+  // R2 source video deletion happens in the finally block of processVideo()
+  // after processing completes or fails.
 
   // Phase 1 Step 2: Compress video if needed
   // Phase 1 progress: 20-30%
   await updatePhaseProgress(uploadId, 1, 20, {
-    subTask: 'Preparing video...',
+    subTask: 'Checking resolution...',
     stage: 'compressing',
   });
 
@@ -363,7 +369,7 @@ async function downloadAndPrepareVideo(
       console.log(`[${uploadId}] ✅ Compressed: ${originalMB}MB → ${newMB}MB (${reductionPercent}% reduction)`);
     } else {
       const sizeMB = (compressionResult.originalSize / 1024 / 1024).toFixed(1);
-      console.log(`[${uploadId}] ℹ️  Compression skipped: ${sizeMB}MB (under 200MB threshold)`);
+      console.log(`[${uploadId}] ℹ️  Compression skipped: ${sizeMB}MB (below 4K resolution)`);
     }
   } catch (compressionError) {
     console.warn(`[${uploadId}] ⚠️  Compression failed, continuing with original file:`, compressionError);
@@ -463,55 +469,6 @@ async function extractMetadataAndAudio(
 }
 
 /**
- * Perform VAD + Whisper transcription (if audio exists)
- * Phase 1 progress: 50-100% (Whisper transcription is the main work)
- *
- * @param uploadId - Upload ID for logging
- * @param audioPath - Path to audio file
- * @param hasAudio - Whether audio stream exists
- * @returns Object containing transcription segments and VAD statistics
- */
-async function performTranscription(
-  uploadId: string,
-  audioPath: string,
-  hasAudio: boolean
-): Promise<{ transcription: TranscriptionSegment[]; vadStats: VADStats | null }> {
-  let transcription: TranscriptionSegment[] = [];
-  let vadStats: VADStats | null = null;
-
-  if (hasAudio) {
-    // Phase 1 Step 5: VAD + Whisper pipeline (optimized processing)
-    // Phase 1 progress: 50-95% (main transcription work)
-    await updatePhaseProgress(uploadId, 1, 50, {
-      subTask: 'Starting voice detection...',
-      stage: 'vad_whisper',
-      estimatedTimeRemaining: 'About 2-5 min (estimate)',
-    });
-
-    const pipelineResult = await timeStep(uploadId, 'VAD + Whisper Pipeline', async () => {
-      return await processAudioWithVADAndWhisper(audioPath, uploadId);
-    });
-    transcription = pipelineResult.segments;
-    vadStats = pipelineResult.vadStats;
-
-    console.log(`[${uploadId}] VAD + Whisper complete: ${transcription.length} segments`);
-    console.log(`[${uploadId}]   Voice ratio: ${(vadStats.voiceRatio * 100).toFixed(1)}%`);
-    console.log(`[${uploadId}]   Cost savings: ${vadStats.estimatedSavings.toFixed(1)}%`);
-
-    // Phase 1 complete
-    await completePhase(uploadId, 1);
-    console.log(`[${uploadId}] ✅ Phase 1 complete: Listening to narration`);
-  } else {
-    // No audio: Skip Phase 1 (show "No audio detected")
-    console.log(`[${uploadId}] ⚠️ No audio stream detected, skipping transcription`);
-    await skipPhase(uploadId, 1, 'No audio detected');
-    console.log(`[${uploadId}] ⏭️ Phase 1 skipped: No audio detected`);
-  }
-
-  return { transcription, vadStats };
-}
-
-/**
  * Perform VAD + Whisper transcription with checkpoint support
  * Resumes from partially completed audio chunks
  *
@@ -579,7 +536,8 @@ async function performParallelProcessing(
   videoPath: string,
   audioPath: string,
   hasAudio: boolean,
-  checkpoint: ProcessingCheckpoint
+  checkpoint: ProcessingCheckpoint,
+  videoMetadata: any
 ): Promise<{
   transcription: TranscriptionSegment[];
   vadStats: VADStats | null;
@@ -590,9 +548,6 @@ async function performParallelProcessing(
   console.log(`[${uploadId}] ═══════════════════════════════════════════════`);
 
   const parallelStartTime = Date.now();
-
-  // Get video metadata for scene detection
-  const videoMetadata = await getVideoMetadata(videoPath);
 
   // Track whether Whisper has completed, so scene detection can update Phase 2 UI
   let whisperCompleted = false;
@@ -692,7 +647,8 @@ async function executeSceneDetectionAndOCRWithCheckpoint(
   transcription: TranscriptionSegment[],
   detectionMode: DetectionMode = 'standard',
   checkpoint: ProcessingCheckpoint,
-  preDetectedScenes?: Scene[]
+  preDetectedScenes?: Scene[],
+  videoMetadata?: any
 ): Promise<{ excelPath: string; stats: any }> {
   // Phase 2 starts: Scene detection + OCR
   await updatePhaseProgress(uploadId, 2, 0, {
@@ -709,51 +665,9 @@ async function executeSceneDetectionAndOCRWithCheckpoint(
       transcription,
       uploadId,
       detectionMode,
-      checkpoint, // Pass checkpoint for OCR resume
-      preDetectedScenes // Pass pre-detected scenes from parallel processing
-    );
-  });
-
-  return {
-    excelPath: pipelineResult.excelPath,
-    stats: pipelineResult.stats
-  };
-}
-
-/**
- * Execute scene detection, OCR, and Excel generation pipeline
- * Phase 2 (0-100%) and Phase 3 (0-100%) are managed within executeIdealPipeline
- *
- * @param uploadId - Upload ID for logging
- * @param videoPath - Path to video file
- * @param fileName - Original file name
- * @param transcription - Transcription segments
- * @param detectionMode - Detection mode ('standard' or 'enhanced')
- * @returns Object containing Excel path and pipeline statistics
- */
-async function executeSceneDetectionAndOCR(
-  uploadId: string,
-  videoPath: string,
-  fileName: string,
-  transcription: TranscriptionSegment[],
-  detectionMode: DetectionMode = 'standard'
-): Promise<{ excelPath: string; stats: any }> {
-  // Phase 2 starts: Scene detection + OCR
-  // Phase 2 and Phase 3 progress are managed within executeIdealPipeline
-  await updatePhaseProgress(uploadId, 2, 0, {
-    phaseStatus: 'in_progress',
-    subTask: 'Starting scene detection...',
-    stage: 'scene_detection',
-    estimatedTimeRemaining: 'About 3-8 min (estimate)',
-  });
-
-  const pipelineResult = await timeStep(uploadId, 'Scene Detection + OCR + Excel Generation', async () => {
-    return await executeIdealPipeline(
-      videoPath,
-      fileName,
-      transcription,
-      uploadId,
-      detectionMode
+      checkpoint,
+      preDetectedScenes,
+      videoMetadata
     );
   });
 
@@ -870,8 +784,8 @@ async function uploadResultAndComplete(
 }
 
 /**
- * Compress video if file size exceeds 200MB
- * Uses ffmpeg with CRF 28 and fast preset for optimal compression
+ * Compress video if resolution is 4K or higher
+ * Downscales to 1080p with CRF 28 and fast preset
  *
  * @param inputPath - Path to the input video file
  * @param uploadId - Upload ID for logging
@@ -881,26 +795,21 @@ async function compressVideoIfNeeded(
   inputPath: string,
   uploadId: string
 ): Promise<CompressionResult> {
-  const COMPRESSION_THRESHOLD = 200 * 1024 * 1024; // 200MB in bytes
-  const COMPRESSION_MAX_SIZE = 800 * 1024 * 1024; // 800MB - skip compression for very large files (2GB support)
-  const COMPRESSION_TIMEOUT_MS = 1200000; // 20 minutes timeout (for 800MB files)
+  const COMPRESSION_TIMEOUT_MS = 1200000; // 20 minutes timeout
 
-  // Check file size
   const stats = fs.statSync(inputPath);
   const originalSize = stats.size;
 
-  if (originalSize < COMPRESSION_THRESHOLD) {
-    console.log(`[${uploadId}] File size ${(originalSize / 1024 / 1024).toFixed(1)}MB is under ${COMPRESSION_THRESHOLD / 1024 / 1024}MB threshold, skipping compression`);
+  // Check resolution to determine if compression is needed
+  const metadata = await getVideoMetadata(inputPath);
+  const is4KOrHigher = Math.max(metadata.width, metadata.height) >= 3840;
+
+  if (!is4KOrHigher) {
+    console.log(`[${uploadId}] Resolution ${metadata.width}x${metadata.height} is below 4K, skipping compression`);
     return { compressed: false, originalSize, newSize: originalSize };
   }
 
-  // Skip compression for very large files to avoid timeout
-  if (originalSize > COMPRESSION_MAX_SIZE) {
-    console.log(`[${uploadId}] ⚠️  File size ${(originalSize / 1024 / 1024).toFixed(1)}MB exceeds ${COMPRESSION_MAX_SIZE / 1024 / 1024}MB, skipping compression to avoid timeout`);
-    return { compressed: false, originalSize, newSize: originalSize };
-  }
-
-  console.log(`[${uploadId}] File size ${(originalSize / 1024 / 1024).toFixed(1)}MB exceeds threshold, starting compression...`);
+  console.log(`[${uploadId}] 4K+ detected (${metadata.width}x${metadata.height}), compressing to 1080p...`);
 
   // Create temporary output path
   const outputPath = inputPath.replace('.mp4', '_compressed.mp4');
@@ -908,16 +817,9 @@ async function compressVideoIfNeeded(
   try {
     const startTime = Date.now();
 
-    // Execute ffmpeg compression
-    // -vcodec libx264: H.264 video codec (widely compatible)
-    // -crf 28: Constant Rate Factor (quality), 28 = good balance of quality/size
-    // -preset fast: Encoding speed preset (faster encoding, slightly larger file)
-    // -acodec aac: AAC audio codec (widely compatible)
-    // -b:a 96k: Audio bitrate 96kbps (sufficient for speech)
-    // -movflags +faststart: Optimize for web streaming
-    // -y: Overwrite output file without asking
     const ffmpegArgs = [
       '-i', inputPath,
+      '-vf', 'scale=-2:1080',   // 4K → 1080p (aspect ratio preserved)
       '-vcodec', 'libx264',
       '-crf', '28',
       '-preset', 'fast',
@@ -928,11 +830,11 @@ async function compressVideoIfNeeded(
       outputPath
     ];
 
-    console.log(`[${uploadId}] Running ffmpeg compression (CRF 28, fast preset, timeout: ${COMPRESSION_TIMEOUT_MS / 1000}s)...`);
+    console.log(`[${uploadId}] Running ffmpeg compression (1080p, CRF 28, fast preset, timeout: ${COMPRESSION_TIMEOUT_MS / 1000}s)...`);
 
-    const { stdout, stderr } = await execFileAsync('ffmpeg', ffmpegArgs, {
-      maxBuffer: 10 * 1024 * 1024, // 10MB buffer for ffmpeg output
-      timeout: COMPRESSION_TIMEOUT_MS // 10 minutes timeout
+    await execFileAsync('ffmpeg', ffmpegArgs, {
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: COMPRESSION_TIMEOUT_MS
     });
 
     const endTime = Date.now();

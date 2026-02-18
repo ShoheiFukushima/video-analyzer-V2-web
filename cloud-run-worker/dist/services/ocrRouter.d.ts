@@ -64,7 +64,8 @@ export declare class OCRRouter {
     constructor(config?: Partial<OCRRouterConfig>);
     /**
      * Initialize available providers
-     * Priority order: Gemini (1) > Mistral (2) > GLM (3) > OpenAI (4)
+     * Priority order: Gemini (1) > Mistral (2) > GLM (3)
+     * Note: OpenAI excluded — unreliable for OCR (rate limits, empty responses)
      */
     private initializeProviders;
     /**

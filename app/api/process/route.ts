@@ -33,10 +33,10 @@ async function callCloudRunWithFailover(
           Authorization: `Bearer ${workerSecret}`,
         },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(10000), // 10 second timeout for failover speed
+        signal: AbortSignal.timeout(25000), // 25s timeout (Cloud Run cold start can take 10-20s)
       });
 
-      if (response.ok) {
+      if (response.ok || response.status === 202) {
         if (!isPrimary) {
           console.log(`[${uploadId}] Failover successful: ${url} (failed: ${failedUrls.join(', ')})`);
         }
@@ -172,6 +172,8 @@ export async function POST(request: NextRequest) {
     };
 
     // Call worker with failover support
+    // Worker returns 202 immediately; do NOT await response.json()
+    // because the response body stream stays open for keep-alive.
     const { response: workerResponse, usedUrl, failedUrls } = await callCloudRunWithFailover(
       primaryCloudRunUrl,
       fallbackUrls,
@@ -180,10 +182,9 @@ export async function POST(request: NextRequest) {
       uploadId
     );
 
-    const workerData = await workerResponse.json().catch(() => ({}));
-    console.log(`[${uploadId}] Worker accepted request from ${usedUrl}:`, workerData);
+    console.log(`[${uploadId}] Worker accepted request (${workerResponse.status}) from ${usedUrl}`);
 
-    // Return immediately - processing happens in background
+    // Return immediately - processing happens in background on Cloud Run
     return NextResponse.json({
       success: true,
       uploadId,

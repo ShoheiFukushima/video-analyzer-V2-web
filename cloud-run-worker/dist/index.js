@@ -2,26 +2,10 @@ import express from 'express';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
-import { execSync, spawn } from 'child_process';
-import { CloudTasksClient } from '@google-cloud/tasks';
 import { processVideo } from './services/videoProcessor.js';
 import { getStatus, updateStatus } from './services/statusManager.js';
 import { cleanupExpiredCheckpoints } from './services/checkpointService.js';
 import { emergencySaveOcrProgress, markCheckpointInterrupted } from './services/emergencyCheckpoint.js';
-// Cloud Tasks client (initialized lazily)
-let tasksClient = null;
-function getTasksClient() {
-    if (!tasksClient) {
-        tasksClient = new CloudTasksClient();
-    }
-    return tasksClient;
-}
-// Cloud Tasks configuration
-const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || 'video-analyzer-worker';
-const LOCATION = 'us-central1';
-const QUEUE_NAME = 'video-processing-queue';
-const CLOUD_RUN_URL = process.env.CLOUD_RUN_SERVICE_URL ||
-    `https://video-analyzer-worker-820467345033.${LOCATION}.run.app`;
 dotenv.config();
 // Track currently processing upload for graceful shutdown
 // Version: 2026-02-11-v2 - Emergency checkpoint + improved retry
@@ -61,47 +45,20 @@ async function handleShutdown(signal) {
         catch (checkpointErr) {
             console.error(`[${uploadId}] [Shutdown] Failed to save checkpoint:`, checkpointErr);
         }
-        // Determine error message based on signal
-        // Note: Status is set to 'processing' (not 'error') to indicate resumable
-        // Cloud Tasks will retry and resume from checkpoint
-        let errorMessage;
-        let errorCode;
-        switch (signal) {
-            case 'SIGTERM':
-                // SIGTERM = Cloud Run is shutting down (deployment, scale-down, timeout approaching)
-                errorMessage = 'Processing was interrupted due to server maintenance. Will resume automatically.';
-                errorCode = 'SERVER_SHUTDOWN_RESUMABLE';
-                break;
-            case 'SIGINT':
-                // SIGINT = Manual interruption (Ctrl+C in dev)
-                errorMessage = 'Processing was manually stopped.';
-                errorCode = 'MANUAL_STOP';
-                break;
-            case 'SIGKILL':
-            case 'SIGBUS':
-            case 'SIGSEGV':
-                // These signals indicate memory/resource issues
-                errorMessage = 'Processing was stopped due to resource constraints. Will retry automatically.';
-                errorCode = 'RESOURCE_LIMIT_RESUMABLE';
-                break;
-            default:
-                errorMessage = `Processing was interrupted unexpectedly (${signal}). Will retry automatically.`;
-                errorCode = 'UNKNOWN_SIGNAL_RESUMABLE';
-        }
+        // Mark as error — no automatic retry without Cloud Tasks
+        const errorMessage = 'Processing was interrupted. Please try uploading again.';
+        const errorCode = 'SERVER_SHUTDOWN';
         try {
-            // Keep status as 'processing' so Cloud Tasks retry will resume
-            // Only update metadata to track the interruption
             await updateStatus(uploadId, {
-                status: 'processing', // Keep as processing, not error
+                status: 'error',
+                error: errorMessage,
                 metadata: {
                     errorCode,
                     signal,
                     interruptedAt: new Date().toISOString(),
-                    message: errorMessage,
-                    willResume: true,
                 },
             });
-            console.log(`[${uploadId}] [Shutdown] Status updated (will resume): ${errorCode}`);
+            console.log(`[${uploadId}] [Shutdown] Status set to error: ${errorCode}`);
         }
         catch (err) {
             console.error(`[${uploadId}] [Shutdown] Failed to update status:`, err);
@@ -147,115 +104,6 @@ process.on('uncaughtException', async (error) => {
 });
 const app = express();
 const port = process.env.PORT || 8080;
-// Startup diagnostics for ffprobe
-async function diagnoseFFprobe() {
-    console.log('═══════════════════════════════════════════════');
-    console.log('🔍 FFprobe Startup Diagnostics');
-    console.log('═══════════════════════════════════════════════');
-    try {
-        // Check which ffprobe
-        const whichResult = execSync('which ffprobe 2>&1 || echo "not found"', { encoding: 'utf8' }).trim();
-        console.log(`[Diag] which ffprobe: ${whichResult}`);
-        if (whichResult === 'not found') {
-            console.error('[Diag] ❌ ffprobe not found in PATH!');
-            return;
-        }
-        // Check if file exists and is a symlink
-        const lsResult = execSync(`ls -la ${whichResult} 2>&1 || echo "file not found"`, { encoding: 'utf8' }).trim();
-        console.log(`[Diag] ls -la ffprobe: ${lsResult}`);
-        // Check symlink target if it's a symlink
-        const readlinkResult = execSync(`readlink -f ${whichResult} 2>&1 || echo "not a symlink"`, { encoding: 'utf8' }).trim();
-        console.log(`[Diag] readlink -f: ${readlinkResult}`);
-        // Check if the resolved path exists
-        const resolvedExists = execSync(`ls -la ${readlinkResult} 2>&1 || echo "resolved path not found"`, { encoding: 'utf8' }).trim();
-        console.log(`[Diag] resolved file: ${resolvedExists}`);
-        // Check file type of resolved path (file command may not be installed)
-        try {
-            const fileResult = execSync(`file ${readlinkResult} 2>&1`, { encoding: 'utf8' }).trim();
-            console.log(`[Diag] file type: ${fileResult}`);
-        }
-        catch (e) {
-            console.log(`[Diag] file command failed (may not be installed)`);
-        }
-        // Check shared library dependencies
-        try {
-            const lddResult = execSync(`ldd ${whichResult} 2>&1 | head -30`, { encoding: 'utf8' }).trim();
-            console.log(`[Diag] ldd (dependencies):\n${lddResult}`);
-            // Check for missing libraries
-            if (lddResult.includes('not found')) {
-                console.error('[Diag] ❌ Missing shared libraries detected!');
-            }
-        }
-        catch (e) {
-            console.log(`[Diag] ldd command failed: ${e}`);
-        }
-        // Try running with strace to see what's happening
-        try {
-            console.log('[Diag] Attempting strace on ffprobe...');
-            const straceResult = execSync('timeout 3 strace -f ffprobe -version 2>&1 | tail -50 || echo "strace timeout or not available"', { encoding: 'utf8' }).trim();
-            console.log(`[Diag] strace output:\n${straceResult}`);
-        }
-        catch (e) {
-            console.log(`[Diag] strace failed (may not be installed)`);
-        }
-        // Try running ffprobe -version with timeout
-        console.log('[Diag] Testing ffprobe -version...');
-        const startTime = Date.now();
-        const result = await new Promise((resolve, reject) => {
-            const proc = spawn('ffprobe', ['-version'], {
-                stdio: ['ignore', 'pipe', 'pipe'],
-            });
-            let stdout = '';
-            let stderr = '';
-            proc.stdout?.on('data', (data) => {
-                stdout += data.toString();
-            });
-            proc.stderr?.on('data', (data) => {
-                stderr += data.toString();
-            });
-            const timeout = setTimeout(() => {
-                proc.kill('SIGKILL');
-                reject(new Error('timeout'));
-            }, 5000);
-            proc.on('close', (code) => {
-                clearTimeout(timeout);
-                if (code === 0) {
-                    resolve(stdout);
-                }
-                else {
-                    reject(new Error(`exit code ${code}: ${stderr}`));
-                }
-            });
-            proc.on('error', (err) => {
-                clearTimeout(timeout);
-                reject(err);
-            });
-        });
-        const duration = Date.now() - startTime;
-        const version = result.split('\n')[0];
-        console.log(`[Diag] ✅ ffprobe works: ${version} (${duration}ms)`);
-    }
-    catch (error) {
-        console.error(`[Diag] ❌ ffprobe test failed:`, error);
-        // Additional diagnostics on failure
-        try {
-            console.log('[Diag] Checking /usr/bin contents...');
-            const binList = execSync('ls -la /usr/bin/ff* 2>&1 || echo "no ff* files"', { encoding: 'utf8' }).trim();
-            console.log(`[Diag] /usr/bin/ff*:\n${binList}`);
-            console.log('[Diag] Checking PATH...');
-            console.log(`[Diag] PATH: ${process.env.PATH}`);
-            console.log('[Diag] Checking dpkg for ffmpeg...');
-            const dpkgResult = execSync('dpkg -l | grep -i ffmpeg 2>&1 || echo "ffmpeg not in dpkg"', { encoding: 'utf8' }).trim();
-            console.log(`[Diag] dpkg ffmpeg: ${dpkgResult}`);
-        }
-        catch (diagError) {
-            console.error('[Diag] Additional diagnostics failed:', diagError);
-        }
-    }
-    console.log('═══════════════════════════════════════════════');
-}
-// Run diagnostics at startup
-diagnoseFFprobe().catch(console.error);
 const workerSecret = process.env.WORKER_SECRET;
 // In-memory storage for result file paths (development only)
 export const resultFileMap = new Map();
@@ -440,168 +288,57 @@ app.get('/diag/scene-detection-test', async (req, res) => {
         });
     }
 });
-// Process video endpoint - Creates a Cloud Task for reliable processing
-// This ensures the processing request is durable and will be retried if needed
+// Process video endpoint - Direct processing with keep-alive pattern
+// Returns 202 immediately, then processes video while keeping connection open.
+// The open connection prevents Cloud Run from terminating the instance.
 app.post('/process', validateAuth, async (req, res) => {
-    try {
-        const { uploadId, r2Key, fileName, userId, dataConsent, detectionMode } = req.body;
-        // Security: Validate required fields including userId for IDOR protection
-        if (!uploadId || !r2Key || !userId) {
-            res.status(400).json({
-                error: 'Invalid request',
-                message: 'Missing uploadId, r2Key, or userId'
-            });
-            return;
-        }
-        // Validate detectionMode (default to 'standard' if not provided or invalid)
-        const validModes = ['standard', 'enhanced'];
-        const mode = validModes.includes(detectionMode) ? detectionMode : 'standard';
-        console.log(`[${uploadId}] Creating Cloud Task for video processing`, {
-            fileName,
-            userId,
-            r2Key,
-            detectionMode: mode
+    const { uploadId, r2Key, fileName, userId, dataConsent, detectionMode } = req.body;
+    // Security: Validate required fields including userId for IDOR protection
+    if (!uploadId || !r2Key || !userId) {
+        res.status(400).json({
+            error: 'Invalid request',
+            message: 'Missing uploadId, r2Key, or userId'
         });
-        // Create a Cloud Task to process the video
-        // This ensures the processing is durable and will be retried if the instance is terminated
-        const client = getTasksClient();
-        const parent = client.queuePath(PROJECT_ID, LOCATION, QUEUE_NAME);
-        const taskPayload = {
-            uploadId,
-            r2Key,
-            fileName,
-            userId,
-            dataConsent: dataConsent || false,
-            detectionMode: mode,
-        };
-        const task = {
-            httpRequest: {
-                httpMethod: 'POST',
-                url: `${CLOUD_RUN_URL}/process-task`,
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${process.env.WORKER_SECRET}`,
-                },
-                body: Buffer.from(JSON.stringify(taskPayload)).toString('base64'),
-            },
-            // Task dispatch deadline: 30 minutes (Cloud Tasks max is 30 mins)
-            // Cloud Run will handle the actual timeout (up to 60 mins)
-            dispatchDeadline: { seconds: 1800 },
-        };
-        const [response] = await client.createTask({ parent, task });
-        console.log(`[${uploadId}] Cloud Task created: ${response.name}`);
-        // Return immediately - Cloud Tasks will handle the processing
-        res.json({
-            success: true,
-            uploadId,
-            message: 'Video processing task created',
-            status: 'processing',
-            detectionMode: mode,
-            taskName: response.name,
-        });
+        return;
     }
-    catch (error) {
-        console.error('[Process endpoint] Error:', error);
-        res.status(500).json({
-            error: 'Server error',
-            message: error instanceof Error ? error.message : 'Unknown error'
-        });
-    }
-});
-// Process task endpoint - Called by Cloud Tasks
-// This endpoint awaits the processing, ensuring Cloud Run keeps the instance alive
-app.post('/process-task', validateAuth, async (req, res) => {
+    // Validate detectionMode (default to 'standard' if not provided or invalid)
+    const validModes = ['standard', 'enhanced'];
+    const mode = validModes.includes(detectionMode) ? detectionMode : 'standard';
+    console.log(`[${uploadId}] Starting video processing`, {
+        fileName,
+        userId,
+        r2Key,
+        detectionMode: mode
+    });
+    // Send 202 Accepted immediately via chunked response.
+    // Keep the connection open (don't call res.end()) so Cloud Run
+    // sees an active request and keeps the instance alive.
+    res.writeHead(202, {
+        'Content-Type': 'application/json',
+        'Transfer-Encoding': 'chunked',
+    });
+    res.write(JSON.stringify({
+        success: true,
+        uploadId,
+        message: 'Video processing started',
+        status: 'processing',
+        detectionMode: mode,
+    }));
     try {
-        const { uploadId, r2Key, fileName, userId, dataConsent, detectionMode } = req.body;
-        // Security: Validate required fields
-        if (!uploadId || !r2Key || !userId) {
-            res.status(400).json({
-                error: 'Invalid request',
-                message: 'Missing uploadId, r2Key, or userId'
-            });
-            return;
-        }
-        const mode = detectionMode || 'standard';
-        console.log(`[${uploadId}] Processing video (Cloud Task)`, {
-            fileName,
-            userId,
-            r2Key,
-            detectionMode: mode
-        });
-        // AWAIT the processing - this keeps the HTTP connection open
-        // Cloud Tasks will wait for this to complete (up to 30 minutes)
-        await processVideo(uploadId, r2Key, fileName, userId, dataConsent, mode);
+        // Process video — can take up to 60 minutes
+        await processVideo(uploadId, r2Key, fileName, userId, dataConsent || false, mode);
         console.log(`[${uploadId}] Processing completed successfully`);
-        res.json({
-            success: true,
-            uploadId,
-            message: 'Video processing completed',
-            status: 'completed',
-        });
     }
     catch (error) {
-        console.error('[Process-task endpoint] Error:', error);
-        // Return 500 to signal Cloud Tasks to retry (if retries are configured)
-        res.status(500).json({
-            error: 'Processing failed',
-            message: error instanceof Error ? error.message : 'Unknown error'
-        });
+        // processVideo handles its own error status updates via failStatus()
+        console.error(`[${uploadId}] Processing failed:`, error);
     }
-});
-// Process OCR batch endpoint - Called by Cloud Tasks for each batch
-// Each batch processes ~100 scenes with its own timeout
-app.post('/process-ocr-batch', validateAuth, async (req, res) => {
-    const { processSingleBatch } = await import('./services/batchProcessor.js');
-    const { queueNextBatch, markBatchCompleted, markBatchFailed } = await import('./services/batchQueueService.js');
-    try {
-        const payload = req.body;
-        const { uploadId, batchIndex, totalBatches, isLastBatch } = payload;
-        // Get retry count from Cloud Tasks header
-        const retryCount = parseInt(req.headers['x-cloudtasks-taskretrycount'] || '0', 10);
-        console.log(`[${uploadId}] [Batch ${batchIndex + 1}/${totalBatches}] Starting (retry: ${retryCount})`);
-        // Set current processing upload for graceful shutdown
-        setCurrentProcessingUpload(uploadId);
-        // Process this batch
-        const result = await processSingleBatch(payload);
-        // Mark batch as completed
-        await markBatchCompleted(uploadId, batchIndex, totalBatches, result.processedScenes, result.totalScenes);
-        // Queue next batch (if not last)
-        if (!isLastBatch) {
-            const hasNext = await queueNextBatch(uploadId, batchIndex, payload);
-            if (hasNext) {
-                console.log(`[${uploadId}] [Batch ${batchIndex + 1}] Queued next batch`);
-            }
+    finally {
+        // Close the connection (regardless of success/failure)
+        try {
+            res.end();
         }
-        else {
-            // Last batch - trigger Excel generation
-            console.log(`[${uploadId}] [Batch ${batchIndex + 1}] Last batch completed, generating Excel...`);
-            // Excel generation will be triggered by the batch processor
-        }
-        // Clear current processing
-        setCurrentProcessingUpload(null);
-        res.json({
-            success: true,
-            uploadId,
-            batchIndex,
-            processedScenes: result.processedScenes,
-            isLastBatch,
-        });
-    }
-    catch (error) {
-        const { uploadId, batchIndex, totalBatches } = req.body;
-        const retryCount = parseInt(req.headers['x-cloudtasks-taskretrycount'] || '0', 10);
-        console.error(`[${uploadId}] [Batch ${batchIndex + 1}/${totalBatches}] Failed:`, error);
-        // Mark batch as failed (will notify user if max retries reached)
-        await markBatchFailed(uploadId, batchIndex, totalBatches, error instanceof Error ? error : new Error('Unknown error'), retryCount);
-        // Clear current processing
-        setCurrentProcessingUpload(null);
-        // Return 500 to trigger Cloud Tasks retry
-        res.status(500).json({
-            error: 'Batch processing failed',
-            message: error instanceof Error ? error.message : 'Unknown error',
-            batchIndex,
-            retryCount,
-        });
+        catch { /* connection may already be closed */ }
     }
 });
 // Get status endpoint

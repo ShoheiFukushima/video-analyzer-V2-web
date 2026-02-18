@@ -116,6 +116,13 @@ export declare const TIMEOUTS: {
     readonly R2_KEEP_ALIVE: 120000;
 };
 /**
+ * Get dynamic scene detection timeout based on ROI configuration
+ * ROI detection runs multiple passes (full-frame + 4 regions), requiring more time.
+ *
+ * @returns Timeout in milliseconds
+ */
+export declare function getSceneDetectionTimeout(): number;
+/**
  * Get timeout value in seconds (for logging)
  *
  * @param timeoutMs - Timeout in milliseconds

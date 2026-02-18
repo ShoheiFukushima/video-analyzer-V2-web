@@ -43,9 +43,9 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
   const [isError, setIsError] = useState(false);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
 
-  // Stale detection: if status hasn't updated for 60 minutes, show error
-  // Long videos (2+ hours) can take 40-60 minutes for parallel scene detection + OCR
-  const STALE_THRESHOLD_MS = 60 * 60 * 1000; // 60 minutes
+  // Stale detection: if status hasn't updated for 5 minutes, show error
+  // Heartbeat updates every 60s, so 5 min means ~5 missed heartbeats
+  const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 
   // Phase state
   const [phases, setPhases] = useState<PhaseData[]>([

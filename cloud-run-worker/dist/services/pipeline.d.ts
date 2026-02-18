@@ -8,7 +8,7 @@
  * 3. Map narration to scenes based on timestamps
  * 4. Generate Excel with ideal format (Scene # | Timecode | Screenshot | OCR | NA Text)
  */
-import { ProcessingStats } from '../types/excel.js';
+import { Scene, VideoMetadata, ProcessingStats } from '../types/excel.js';
 import type { TranscriptionSegment, DetectionMode } from '../types/shared.js';
 import { type ProcessingCheckpoint } from './checkpointService.js';
 /**
@@ -21,7 +21,7 @@ import { type ProcessingCheckpoint } from './checkpointService.js';
  * @param checkpoint - Optional checkpoint for resumable processing
  * @returns Path to generated Excel file
  */
-export declare function executeIdealPipeline(videoPath: string, projectTitle: string, transcription: TranscriptionSegment[], uploadId?: string, detectionMode?: DetectionMode, checkpoint?: ProcessingCheckpoint): Promise<{
+export declare function executeIdealPipeline(videoPath: string, projectTitle: string, transcription: TranscriptionSegment[], uploadId?: string, detectionMode?: DetectionMode, checkpoint?: ProcessingCheckpoint, preDetectedScenes?: Scene[], videoMetadata?: VideoMetadata): Promise<{
     excelPath: string;
     stats: ProcessingStats;
 }>;

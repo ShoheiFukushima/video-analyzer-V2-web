@@ -11,7 +11,7 @@ import path from 'path';
 import { spawn, execSync } from 'child_process';
 import pLimit from 'p-limit';
 import { formatTimecode } from '../utils/timecode.js';
-import { TIMEOUTS } from '../config/timeouts.js';
+import { TIMEOUTS, getSceneDetectionTimeout } from '../config/timeouts.js';
 // Concurrency limit for parallel frame extraction
 // Balanced for 4 vCPU Cloud Run instance
 const FRAME_EXTRACTION_CONCURRENCY = 10;
@@ -445,12 +445,12 @@ function filterCloseScenes(cuts, minInterval) {
 function runSceneDetection(videoPath, threshold, videoDuration, onProgress) {
     return new Promise((resolve, reject) => {
         const cuts = [];
-        const TIMEOUT_MS = TIMEOUTS.SCENE_DETECTION;
+        const TIMEOUT_MS = getSceneDetectionTimeout();
         let completed = false;
         let lastProgressTime = 0;
         const PROGRESS_INTERVAL_MS = 500; // Update progress every 0.5 seconds for more responsive UI
         let lastProgressUpdate = 0;
-        console.log(`    [SceneDetect] Starting FFmpeg spawn for threshold ${threshold}...`);
+        console.log(`    [SceneDetect] Starting FFmpeg spawn for threshold ${threshold} (timeout: ${TIMEOUT_MS / 60000}min)...`);
         // Set gVisor-compatible environment
         const ffmpegEnv = {
             ...process.env,
@@ -637,9 +637,9 @@ function runSceneDetectionWithCrop(videoPath, cropFilter, threshold) {
             return;
         }
         const cuts = [];
-        const TIMEOUT_MS = TIMEOUTS.SCENE_DETECTION;
+        const TIMEOUT_MS = getSceneDetectionTimeout();
         let completed = false;
-        console.log(`    [SceneDetect-ROI] Starting FFmpeg spawn (crop: ${cropFilter}, threshold: ${threshold})...`);
+        console.log(`    [SceneDetect-ROI] Starting FFmpeg spawn (crop: ${cropFilter}, threshold: ${threshold}, timeout: ${TIMEOUT_MS / 60000}min)...`);
         // Set gVisor-compatible environment
         const ffmpegEnv = {
             ...process.env,
@@ -796,20 +796,26 @@ async function generateSceneRanges(cuts, videoDuration, config = DEFAULT_CONFIG)
  * @param outputPath - Output file path for frame
  * @param videoMetadata - Optional video metadata for adaptive resizing
  */
-export async function extractFrameAtTime(videoPath, timestamp, outputPath, videoMetadata) {
+export async function extractFrameAtTime(videoPath, timestamp, outputPath, videoMetadata, targetWidth) {
     return new Promise((resolve, reject) => {
         const TIMEOUT_MS = 60000; // 60 seconds for frame extraction
         let completed = false;
-        // Adaptive resolution: maintain original if <= 1920x1080, otherwise resize
-        const shouldResize = videoMetadata &&
-            (videoMetadata.width > 1920 || videoMetadata.height > 1080);
         // Build filter chain
         const filters = [];
-        if (shouldResize) {
-            filters.push('scale=1920:1080:force_original_aspect_ratio=decrease');
+        if (targetWidth) {
+            // Reduced resolution for Excel embedding (e.g., 320px wide)
+            filters.push(`scale=${targetWidth}:-1`);
         }
-        // Sharpness filter for OCR clarity
-        filters.push('unsharp=5:5:1.0:5:5:0.0');
+        else {
+            // Adaptive resolution: maintain original if <= 1920x1080, otherwise resize
+            const shouldResize = videoMetadata &&
+                (videoMetadata.width > 1920 || videoMetadata.height > 1080);
+            if (shouldResize) {
+                filters.push('scale=1920:1080:force_original_aspect_ratio=decrease');
+            }
+            // Sharpness filter for OCR clarity (not needed for Excel display)
+            filters.push('unsharp=5:5:1.0:5:5:0.0');
+        }
         // Set gVisor-compatible environment
         const ffmpegEnv = {
             ...process.env,

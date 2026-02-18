@@ -17,6 +17,7 @@ import fs from 'fs';
 import { promises as fsPromises } from 'fs';
 import path from 'path';
 import os from 'os';
+import pLimit from 'p-limit';
 import { getOCRRouter } from './ocrRouter.js';
 import { runLuminanceDetection } from './luminanceDetector.js';
 import { processStabilizationPoints } from './textStabilityDetector.js';
@@ -36,7 +37,7 @@ import { registerOcrProgress, clearOcrProgress } from './emergencyCheckpoint.js'
  * @param checkpoint - Optional checkpoint for resumable processing
  * @returns Path to generated Excel file
  */
-export async function executeIdealPipeline(videoPath, projectTitle, transcription, uploadId, detectionMode = 'standard', checkpoint) {
+export async function executeIdealPipeline(videoPath, projectTitle, transcription, uploadId, detectionMode = 'standard', checkpoint, preDetectedScenes, videoMetadata) {
     console.log('🎬 Starting Ideal Pipeline Execution');
     console.log(`  📹 Video: ${videoPath}`);
     console.log(`  🎙️ Transcription: ${transcription.length} segments`);
@@ -56,19 +57,46 @@ export async function executeIdealPipeline(videoPath, projectTitle, transcriptio
             console.warn(`Failed to update phase progress: ${err}`);
         }
     };
-    // Phase 2 Step 1: Extract video metadata
+    // Phase 2 Step 1: Use provided metadata or extract it
     // Phase 2 progress: 0-5%
     await safePhaseProgress(2, 0, 'Reading video metadata...', 'scene_detection');
-    console.log('\n📐 Step 1: Extracting video metadata...');
-    const videoMetadata = await getVideoMetadata(videoPath);
+    console.log('\n📐 Step 1: Video metadata...');
+    if (!videoMetadata) {
+        videoMetadata = await getVideoMetadata(videoPath);
+    }
+    else {
+        console.log('  ⚡ Using pre-extracted metadata');
+    }
     await safePhaseProgress(2, 5, 'Starting scene detection...', 'scene_detection', 'About 2-5 min (estimate)');
     // Phase 2 Step 2: Scene detection
     // Phase 2 progress: 5-25%
-    // Check if scenes are already cached in checkpoint
+    // Check if scenes are already available from parallel processing, checkpoint, or need detection
     let scenes = [];
     const cachedSceneCuts = checkpoint?.sceneCuts || [];
     const isSceneDetectionComplete = checkpoint?.currentStep === 'ocr' && cachedSceneCuts.length > 0;
-    if (isSceneDetectionComplete) {
+    if (preDetectedScenes && preDetectedScenes.length > 0) {
+        // Pre-detected scenes from parallel processing (Whisper + Scene Detection ran concurrently)
+        console.log('\n🎞️ Step 2: Scene detection (PRE-DETECTED from parallel processing)...');
+        console.log(`  ⚡ Using ${preDetectedScenes.length} pre-detected scenes (no additional detection needed)`);
+        scenes = preDetectedScenes;
+        // Save scene cuts to checkpoint for resume support
+        if (uploadId && checkpoint) {
+            try {
+                const sceneCuts = scenes.map(scene => ({
+                    timestamp: scene.startTime,
+                    confidence: 0.95,
+                    source: 'ffmpeg_standard',
+                }));
+                await setSceneCuts(uploadId, sceneCuts);
+                console.log(`  💾 Saved ${sceneCuts.length} pre-detected scene cuts to checkpoint`);
+            }
+            catch (err) {
+                console.warn(`  ⚠️ Failed to save scene cuts checkpoint: ${err}`);
+            }
+        }
+        await safePhaseProgress(2, 25, `${scenes.length} scenes (pre-detected)`, 'frame_extraction');
+    }
+    else if (isSceneDetectionComplete) {
         console.log('\n🎞️ Step 2: Scene detection (CACHED)...');
         console.log(`  ▶️ Using ${cachedSceneCuts.length} cached scene cuts from checkpoint`);
         // Convert cached scene cuts to Scene objects
@@ -282,12 +310,15 @@ export async function executeIdealPipeline(videoPath, projectTitle, transcriptio
     // Phase 2 Step 3: Perform OCR on each scene frame
     // Phase 2 progress: 25-90% (batch processing) or 40-90% (traditional)
     let scenesWithRawOCR;
+    let batchFramesDir; // For short video batch processing (frames kept for Excel)
     if (useBatchProcessing) {
         // Batch processing: extract frames → OCR → cleanup in batches
         // This keeps peak memory under control for long videos
         console.log('\n🔍 Step 3: Batch Processing (Frame Extraction + OCR + Cleanup)...');
         await safePhaseProgress(2, 25, `Starting batch processing on ${scenes.length} scenes...`, 'batch_processing', 'Processing in batches for memory optimization');
-        scenesWithRawOCR = await processScenesInBatches(videoPath, scenes, videoMetadata, uploadId, DEFAULT_BATCH_SIZE, checkpoint);
+        const batchResult = await processScenesInBatches(videoPath, scenes, videoMetadata, uploadId, DEFAULT_BATCH_SIZE, checkpoint);
+        scenesWithRawOCR = batchResult.results;
+        batchFramesDir = batchResult.framesDir; // undefined for long videos (frames already cleaned)
     }
     else {
         // Traditional processing: OCR on already-extracted frames
@@ -321,13 +352,32 @@ export async function executeIdealPipeline(videoPath, projectTitle, transcriptio
     // Step 5: Convert to Excel rows
     console.log('\n📝 Step 5: Converting to Excel rows...');
     const excelRows = convertScenesToExcelRows(scenesWithNarration);
+    // Step 5.5: Re-extract frames for Excel (long video batch processing only)
+    // Long videos (> 15 min) clean up full-res frames during batch OCR to save memory.
+    // Re-extract at Excel resolution (320px wide, ~30KB/frame) before embedding.
+    let excelFramesDir;
+    const EXCEL_IMAGE_WIDTH = 320;
+    if (useBatchProcessing && !batchFramesDir) {
+        // Long video: frames were cleaned during batch processing, re-extract at low res
+        console.log('\n📸 Step 5.5: Re-extracting frames for Excel (320px wide)...');
+        await safePhaseProgress(3, 30, `Re-extracting ${excelRows.length} frames for Excel...`, 'frame_reextraction');
+        excelFramesDir = await extractFramesForExcel(videoPath, scenesWithNarration, videoMetadata, EXCEL_IMAGE_WIDTH);
+        // Update screenshotPath on excelRows to point to the new frames
+        for (const row of excelRows) {
+            const scene = scenesWithNarration.find(s => s.sceneNumber === row.sceneNumber);
+            if (scene) {
+                row.screenshotPath = scene.screenshotPath;
+            }
+        }
+        console.log(`  ✓ Re-extracted ${excelRows.length} frames for Excel embedding`);
+    }
     // Phase 3 Step 2: Generate Excel file
     // Phase 3 progress: 30-70%
-    await safePhaseProgress(3, 30, 'Generating Excel file...', 'excel_generation');
+    await safePhaseProgress(3, 40, 'Generating Excel file...', 'excel_generation');
     console.log('\n📊 Step 6: Generating Excel file...');
     const excelFilename = generateExcelFilename(projectTitle);
     const excelPath = path.join('/tmp', excelFilename);
-    await safePhaseProgress(3, 40, 'Creating workbook...', 'excel_generation');
+    await safePhaseProgress(3, 50, 'Creating workbook...', 'excel_generation');
     const excelBuffer = await generateExcel({
         projectTitle,
         rows: excelRows,
@@ -352,9 +402,30 @@ export async function executeIdealPipeline(videoPath, projectTitle, transcriptio
     console.log('\n✅ Ideal Pipeline Execution Complete');
     console.log(`  📊 Excel file: ${excelPath}`);
     console.log(`  📈 Statistics:`, stats);
-    // Cleanup frames (only for traditional processing - batch processing cleans up automatically)
+    // Cleanup frames after Excel generation
     if (!useBatchProcessing) {
+        // Traditional processing: clean up full-res frames
         await cleanupFrames(scenes);
+    }
+    else if (batchFramesDir) {
+        // Short video batch processing: clean up kept frames
+        try {
+            await fsPromises.rm(batchFramesDir, { recursive: true, force: true });
+            console.log(`  🧹 Cleaned up batch frames directory: ${batchFramesDir}`);
+        }
+        catch (e) {
+            console.warn(`  ⚠️ Failed to cleanup batch frames directory: ${e}`);
+        }
+    }
+    if (excelFramesDir) {
+        // Long video: clean up re-extracted Excel frames
+        try {
+            await fsPromises.rm(excelFramesDir, { recursive: true, force: true });
+            console.log(`  🧹 Cleaned up Excel frames directory: ${excelFramesDir}`);
+        }
+        catch (e) {
+            console.warn(`  ⚠️ Failed to cleanup Excel frames directory: ${e}`);
+        }
     }
     return { excelPath, stats };
 }
@@ -375,7 +446,7 @@ export async function executeIdealPipeline(videoPath, projectTitle, transcriptio
  * @param checkpoint - Optional checkpoint for resumable processing
  * @returns Array of scenes with OCR results
  */
-async function performSceneBasedOCR(scenes, uploadId, videoDuration, checkpoint) {
+async function performSceneBasedOCR(scenes, uploadId, videoDuration, checkpoint, globalOffset = 0) {
     // Get OCR router singleton
     const ocrRouter = getOCRRouter();
     // Set video duration for automatic parallel boost (1h+ videos)
@@ -405,8 +476,9 @@ async function performSceneBasedOCR(scenes, uploadId, videoDuration, checkpoint)
     const sceneIndices = [];
     for (let i = 0; i < scenes.length; i++) {
         const scene = scenes[i];
+        const globalIndex = globalOffset + i;
         // Skip scenes that already have cached OCR results
-        if (completedOcrScenes.has(i)) {
+        if (completedOcrScenes.has(globalIndex)) {
             continue; // Will be populated from cache later
         }
         if (scene.screenshotPath) {
@@ -415,9 +487,9 @@ async function performSceneBasedOCR(scenes, uploadId, videoDuration, checkpoint)
                 tasks.push({
                     id: scene.sceneNumber,
                     imageBuffer,
-                    metadata: { sceneIndex: i },
+                    metadata: { sceneIndex: globalIndex },
                 });
-                sceneIndices.push(i);
+                sceneIndices.push(globalIndex);
             }
             catch (err) {
                 console.warn(`  ⚠️ Scene ${scene.sceneNumber}: Failed to read screenshot: ${err}`);
@@ -434,8 +506,8 @@ async function performSceneBasedOCR(scenes, uploadId, videoDuration, checkpoint)
         console.log(`  ✓ All OCR results loaded from cache`);
         const scenesWithOCR = scenes.map((scene, i) => ({
             ...scene,
-            ocrText: cachedOcrResults[i] || '',
-            ocrConfidence: cachedOcrResults[i] ? 0.95 : 0,
+            ocrText: cachedOcrResults[globalOffset + i] || '',
+            ocrConfidence: cachedOcrResults[globalOffset + i] ? 0.95 : 0,
         }));
         return scenesWithOCR;
     }
@@ -453,11 +525,11 @@ async function performSceneBasedOCR(scenes, uploadId, videoDuration, checkpoint)
     }
     // Process all images in parallel using OCR router
     const batchResult = await ocrRouter.processParallel(tasks);
-    // Map results back to scenes (initialize with cached results)
+    // Map results back to scenes (initialize with cached results using global indices)
     const scenesWithOCR = scenes.map((scene, i) => ({
         ...scene,
-        ocrText: cachedOcrResults[i] || '',
-        ocrConfidence: cachedOcrResults[i] ? 0.95 : 0,
+        ocrText: cachedOcrResults[globalOffset + i] || '',
+        ocrConfidence: cachedOcrResults[globalOffset + i] ? 0.95 : 0,
     }));
     // Populate OCR results from new processing
     const newOcrResults = {};
@@ -465,11 +537,12 @@ async function performSceneBasedOCR(scenes, uploadId, videoDuration, checkpoint)
     let lastSavedIndex = -1; // Track last checkpoint-saved index for emergency save
     for (let i = 0; i < batchResult.results.length; i++) {
         const result = batchResult.results[i];
-        const sceneIndex = sceneIndices[i];
+        const sceneIndex = sceneIndices[i]; // Global index
         if (sceneIndex !== undefined) {
-            scenesWithOCR[sceneIndex].ocrText = result.text;
-            scenesWithOCR[sceneIndex].ocrConfidence = result.confidence;
-            // Track for checkpoint
+            const localIndex = sceneIndex - globalOffset;
+            scenesWithOCR[localIndex].ocrText = result.text;
+            scenesWithOCR[localIndex].ocrConfidence = result.confidence;
+            // Track for checkpoint (use global index)
             newOcrResults[sceneIndex] = result.text;
             newCompletedScenes.push(sceneIndex);
             // Register progress for emergency save on SIGTERM
@@ -477,7 +550,7 @@ async function performSceneBasedOCR(scenes, uploadId, videoDuration, checkpoint)
                 registerOcrProgress(uploadId, newCompletedScenes, newOcrResults, lastSavedIndex);
             }
             // Log result
-            const scene = scenesWithOCR[sceneIndex];
+            const scene = scenesWithOCR[localIndex];
             const textPreview = result.text.length > 0
                 ? result.text.substring(0, 50).replace(/\n/g, ' ')
                 : '(no text)';
@@ -555,10 +628,15 @@ async function performSceneBasedOCR(scenes, uploadId, videoDuration, checkpoint)
  * @returns Scenes with OCR results
  */
 async function processScenesInBatches(videoPath, scenes, videoMetadata, uploadId, batchSize = DEFAULT_BATCH_SIZE, checkpoint) {
+    // Videos <= 15 min: keep frames for Excel (fits in /tmp memory)
+    // Videos > 15 min: clean up frames per batch, re-extract for Excel later
+    const LONG_VIDEO_THRESHOLD = 15 * 60; // 15 minutes in seconds
+    const isLongVideo = videoMetadata.duration > LONG_VIDEO_THRESHOLD;
     console.log('\n📦 Starting Batch Processing (Memory Optimized)');
     console.log(`  📊 Total scenes: ${scenes.length}`);
     console.log(`  📦 Batch size: ${batchSize}`);
     console.log(`  🔢 Total batches: ${Math.ceil(scenes.length / batchSize)}`);
+    console.log(`  🎬 Video duration: ${(videoMetadata.duration / 60).toFixed(1)} min → ${isLongVideo ? 'Long video mode (re-extract for Excel)' : 'Short video mode (keep frames)'}`);
     logMemoryUsage('Before batch processing');
     const allResults = [];
     const framesDir = path.join(os.tmpdir(), `batch-frames-${Date.now()}`);
@@ -629,11 +707,16 @@ async function processScenesInBatches(videoPath, scenes, videoMetadata, uploadId
         logMemoryUsage(`Batch ${batchNumber} after frame extraction`);
         // Step 2: Run OCR for this batch (pass video duration for long video optimization)
         console.log(`  [2/3] Running OCR on ${batchScenes.length} frames...`);
-        const batchOCRResults = await performSceneBasedOCR(batchScenesWithFrames, uploadId, videoMetadata.duration, checkpoint);
+        const batchOCRResults = await performSceneBasedOCR(batchScenesWithFrames, uploadId, videoMetadata.duration, checkpoint, batchStart);
         logMemoryUsage(`Batch ${batchNumber} after OCR`);
-        // Step 3: Cleanup frames immediately to free memory
-        console.log(`  [3/3] Cleaning up batch frames...`);
-        await cleanupBatchFrames(batchScenesWithFrames);
+        // Step 3: Cleanup frames (only for long videos to save /tmp memory)
+        if (isLongVideo) {
+            console.log(`  [3/3] Cleaning up batch frames (long video mode)...`);
+            await cleanupBatchFrames(batchScenesWithFrames);
+        }
+        else {
+            console.log(`  [3/3] Keeping batch frames for Excel (short video mode)`);
+        }
         // Force garbage collection hint (Node.js may or may not honor this)
         if (global.gc) {
             global.gc();
@@ -650,13 +733,16 @@ async function processScenesInBatches(videoPath, scenes, videoMetadata, uploadId
         console.log(`  ✓ Batch ${batchNumber} complete: ${allResults.length}/${scenes.length} scenes processed`);
         console.log(`    Batch time: ${batchDurationSec}s | Total: ${batchElapsed}s | Avg: ${avgPerScene}s/scene`);
     }
-    // Cleanup frames directory
-    try {
-        await fsPromises.rm(framesDir, { recursive: true, force: true });
-        console.log(`  🧹 Cleaned up batch frames directory`);
-    }
-    catch (e) {
-        console.warn(`  ⚠️ Failed to cleanup frames directory: ${e}`);
+    // For long videos, clean up frames directory (frames already cleaned per batch)
+    // For short videos, keep frames directory for Excel generation
+    if (isLongVideo) {
+        try {
+            await fsPromises.rm(framesDir, { recursive: true, force: true });
+            console.log(`  🧹 Cleaned up batch frames directory`);
+        }
+        catch (e) {
+            console.warn(`  ⚠️ Failed to cleanup frames directory: ${e}`);
+        }
     }
     const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`\n✅ Batch Processing Complete`);
@@ -664,7 +750,33 @@ async function processScenesInBatches(videoPath, scenes, videoMetadata, uploadId
     console.log(`  ⏱️ Total time: ${totalElapsed}s`);
     console.log(`  📈 Average: ${(parseFloat(totalElapsed) / allResults.length).toFixed(2)}s/scene`);
     logMemoryUsage('After batch processing');
-    return allResults;
+    return { results: allResults, framesDir: isLongVideo ? undefined : framesDir };
+}
+/**
+ * Re-extract frames at reduced resolution for Excel embedding
+ * Used for long videos (> 15 min) where full-res frames were cleaned during batch OCR.
+ * Extracts at target width (e.g., 320px) — ~30KB/frame, ~93MB total for 3106 scenes.
+ *
+ * @param videoPath - Path to video file
+ * @param scenes - Scenes with midTime for frame extraction
+ * @param videoMetadata - Video metadata for aspect ratio
+ * @param targetWidth - Target frame width in pixels (default: 320)
+ * @returns Path to frames directory (caller must clean up)
+ */
+async function extractFramesForExcel(videoPath, scenes, videoMetadata, targetWidth = 320) {
+    const framesDir = path.join(os.tmpdir(), `excel-frames-${Date.now()}`);
+    await fsPromises.mkdir(framesDir, { recursive: true });
+    const limit = pLimit(20); // Higher concurrency for small frames
+    const startTime = Date.now();
+    console.log(`  📸 Extracting ${scenes.length} frames at ${targetWidth}px width for Excel...`);
+    await Promise.all(scenes.map((scene) => limit(async () => {
+        const filename = path.join(framesDir, `scene-${scene.sceneNumber.toString().padStart(4, '0')}.png`);
+        await extractFrameAtTime(videoPath, scene.midTime, filename, videoMetadata, targetWidth);
+        scene.screenshotPath = filename;
+    })));
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`  ⚡ Excel frame extraction: ${scenes.length} frames in ${elapsed}s`);
+    return framesDir;
 }
 /**
  * Determine if batch processing should be used based on scene count

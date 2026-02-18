@@ -119,6 +119,18 @@ export const TIMEOUTS = {
     R2_KEEP_ALIVE: 120000, // 2 minutes
 };
 /**
+ * Get dynamic scene detection timeout based on ROI configuration
+ * ROI detection runs multiple passes (full-frame + 4 regions), requiring more time.
+ *
+ * @returns Timeout in milliseconds
+ */
+export function getSceneDetectionTimeout() {
+    if (process.env.ROI_DETECTION_ENABLED === 'true') {
+        return 3600000; // 60 minutes for ROI (full-frame + up to 4 region passes)
+    }
+    return TIMEOUTS.SCENE_DETECTION; // 45 minutes default
+}
+/**
  * Get timeout value in seconds (for logging)
  *
  * @param timeoutMs - Timeout in milliseconds

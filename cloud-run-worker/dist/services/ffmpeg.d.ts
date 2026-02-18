@@ -21,7 +21,7 @@ export type SceneDetectionProgressCallback = (currentTime: number, totalDuration
  * @param outputPath - Output file path for frame
  * @param videoMetadata - Optional video metadata for adaptive resizing
  */
-export declare function extractFrameAtTime(videoPath: string, timestamp: number, outputPath: string, videoMetadata?: VideoMetadata): Promise<void>;
+export declare function extractFrameAtTime(videoPath: string, timestamp: number, outputPath: string, videoMetadata?: VideoMetadata, targetWidth?: number): Promise<void>;
 /**
  * Get video metadata (duration, width, height, aspect ratio)
  * Uses fluent-ffmpeg's ffprobe with gVisor-compatible environment settings

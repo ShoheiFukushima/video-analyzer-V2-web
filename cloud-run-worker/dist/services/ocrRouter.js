@@ -18,7 +18,6 @@ import pLimit from 'p-limit';
 import { createGeminiProvider } from './providers/geminiProvider.js';
 import { createMistralProvider } from './providers/mistralProvider.js';
 import { createGLMProvider } from './providers/glmProvider.js';
-import { createOpenAIProvider } from './providers/openaiProvider.js';
 // ============================================================
 // Default Configuration
 // ============================================================
@@ -52,14 +51,14 @@ export class OCRRouter {
     }
     /**
      * Initialize available providers
-     * Priority order: Gemini (1) > Mistral (2) > GLM (3) > OpenAI (4)
+     * Priority order: Gemini (1) > Mistral (2) > GLM (3)
+     * Note: OpenAI excluded — unreliable for OCR (rate limits, empty responses)
      */
     initializeProviders() {
-        // Try to create each provider
+        // Try to create each provider (OpenAI excluded from OCR)
         const gemini = createGeminiProvider();
         const mistral = createMistralProvider();
         const glm = createGLMProvider();
-        const openai = createOpenAIProvider();
         // Collect all non-null providers
         const candidates = [];
         if (gemini)
@@ -68,8 +67,6 @@ export class OCRRouter {
             candidates.push(mistral);
         if (glm)
             candidates.push(glm);
-        if (openai)
-            candidates.push(openai);
         // Filter enabled providers and sort by priority
         const enabledProviders = candidates.filter((p) => p.enabled);
         enabledProviders.sort((a, b) => a.priority - b.priority);
