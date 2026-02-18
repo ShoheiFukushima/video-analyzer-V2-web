@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect } from "react";
 import { useAuth } from "@clerk/nextjs";
-import { UploadCloud, X, Film, AlertTriangle, Settings2, Zap, Sparkles } from "lucide-react";
+import { UploadCloud, X, Film, AlertTriangle, Settings2, Zap, Sparkles, Bot } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { checkVideoUploadQuota } from "@/lib/quota";
 import type { DetectionMode } from "@/types/shared";
@@ -329,7 +329,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
           {showAdvanced && (
             <div className="bg-secondary/30 border rounded-lg p-4 space-y-3">
               <p className="text-sm font-medium text-foreground">Detection Mode</p>
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-3 gap-3">
                 {/* Standard Mode */}
                 <button
                   onClick={() => setDetectionMode('standard')}
@@ -365,6 +365,25 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
                   </div>
                   <p className="text-xs text-muted-foreground">
                     AIを用いた高精度シーン検出
+                  </p>
+                </button>
+
+                {/* Opus 4.6 Mode */}
+                <button
+                  onClick={() => setDetectionMode('opus46')}
+                  className={cn(
+                    "p-4 rounded-lg border-2 text-left transition-all",
+                    detectionMode === 'opus46'
+                      ? "border-primary bg-primary/10"
+                      : "border-border hover:border-primary/50 hover:bg-secondary/50"
+                  )}
+                >
+                  <div className="flex items-center gap-2 mb-2">
+                    <Bot className={cn("w-5 h-5", detectionMode === 'opus46' ? "text-primary" : "text-muted-foreground")} />
+                    <span className="font-semibold text-foreground">Opus 4.6</span>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    次世代アルゴリズム（単一プロセス・高効率）
                   </p>
                 </button>
               </div>
