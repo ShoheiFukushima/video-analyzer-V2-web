@@ -5,11 +5,11 @@ import { getRetentionConfig } from "@/lib/quota";
 import { createClient } from "@libsql/client";
 
 export const runtime = "nodejs";
-export const maxDuration = 30; // 30 second timeout for processing request
+export const maxDuration = 60;
 
 /**
- * Call Cloud Run worker with automatic failover to backup regions
- * Tries primary URL first, then falls back to other regions on failure
+ * Call Cloud Run worker with automatic failover to backup regions.
+ * Tries primary URL first, then falls back to other regions on failure.
  */
 async function callCloudRunWithFailover(
   primaryUrl: string,
@@ -17,7 +17,7 @@ async function callCloudRunWithFailover(
   payload: object,
   workerSecret: string,
   uploadId: string
-): Promise<{ response: Response; usedUrl: string; failedUrls: string[] }> {
+): Promise<{ usedUrl: string; failedUrls: string[] }> {
   const allUrls = [primaryUrl, ...fallbackUrls];
   const failedUrls: string[] = [];
 
@@ -35,17 +35,16 @@ async function callCloudRunWithFailover(
           Authorization: `Bearer ${workerSecret}`,
         },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(25000), // 25s timeout (Cloud Run cold start can take 10-20s)
+        signal: AbortSignal.timeout(25000),
       });
 
       if (response.ok || response.status === 202) {
         if (!isPrimary) {
           console.log(`[${uploadId}] Failover successful: ${url} (failed: ${failedUrls.join(', ')})`);
         }
-        return { response, usedUrl: url, failedUrls };
+        return { usedUrl: url, failedUrls };
       }
 
-      // Non-OK response - try next URL
       const status = response.status;
       console.warn(`[${uploadId}] ${url} returned ${status}, trying next...`);
       failedUrls.push(`${url}:${status}`);
@@ -57,13 +56,67 @@ async function callCloudRunWithFailover(
     }
   }
 
-  // All URLs failed
   throw new Error(`All Cloud Run regions failed: ${failedUrls.join(', ')}`);
+}
+
+/**
+ * Run retention cleanup in the background.
+ * Deletes oldest uploads when user exceeds quota. Failures are logged but not propagated.
+ */
+async function runRetentionCleanup(
+  uploadId: string,
+  userId: string,
+  tursoUrl: string,
+  tursoToken: string
+): Promise<void> {
+  const retention = getRetentionConfig('free');
+  const dbClient = createClient({ url: tursoUrl, authToken: tursoToken });
+
+  const countResult = await dbClient.execute({
+    sql: 'SELECT COUNT(*) as cnt FROM processing_status WHERE user_id = ?',
+    args: [userId],
+  });
+  const currentCount = (countResult.rows[0]?.cnt as number) || 0;
+
+  if (currentCount >= retention.maxItems) {
+    const deleteCount = currentCount - retention.maxItems + 1;
+    const oldestResult = await dbClient.execute({
+      sql: `
+        SELECT upload_id, metadata
+        FROM processing_status
+        WHERE user_id = ?
+        ORDER BY created_at ASC
+        LIMIT ?
+      `,
+      args: [userId, deleteCount],
+    });
+
+    for (const row of oldestResult.rows) {
+      const oldUploadId = row.upload_id as string;
+      const metadataStr = row.metadata as string | null;
+      const metadata = metadataStr ? JSON.parse(metadataStr) : null;
+      const oldR2Key = metadata?.resultR2Key;
+
+      if (oldR2Key) {
+        try {
+          await deleteObject(oldR2Key);
+        } catch {
+          // R2 file may already be gone
+        }
+      }
+
+      await dbClient.execute({
+        sql: 'DELETE FROM processing_status WHERE upload_id = ? AND user_id = ?',
+        args: [oldUploadId, userId],
+      });
+      console.log(`[${uploadId}] Auto-deleted oldest upload ${oldUploadId}`);
+    }
+  }
 }
 
 export async function POST(request: NextRequest) {
   try {
-    // Check authentication - Required for all environments
+    // --- Phase 1: Authentication ---
     const { userId } = await auth();
     if (!userId) {
       return NextResponse.json(
@@ -72,7 +125,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Validate request body
+    // --- Phase 2: Validate request body ---
     let body;
     try {
       body = await request.json();
@@ -85,7 +138,6 @@ export async function POST(request: NextRequest) {
 
     const { uploadId, r2Key, fileName, dataConsent, detectionMode } = body;
 
-    // Validate required fields
     if (!uploadId || !r2Key) {
       return NextResponse.json(
         {
@@ -96,48 +148,35 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Validate detectionMode (default to 'standard' if not provided or invalid)
     const validModes = ['standard', 'enhanced', 'reverse_engineer'];
     const mode = validModes.includes(detectionMode) ? detectionMode : 'standard';
 
-    // Security: Validate R2 key format (SSRF protection)
     if (!isValidR2Key(r2Key)) {
       return NextResponse.json(
-        {
-          error: "Invalid request",
-          message: "Invalid R2 key format"
-        },
+        { error: "Invalid request", message: "Invalid R2 key format" },
         { status: 400 }
       );
     }
 
-    // Security: Verify that the R2 key belongs to this user
     if (!r2Key.includes(`/${userId}/`)) {
       console.warn(`[${uploadId}] User ${userId} attempted to use r2Key: ${r2Key}`);
       return NextResponse.json(
-        {
-          error: "Forbidden",
-          message: "You do not have permission to process this file"
-        },
+        { error: "Forbidden", message: "You do not have permission to process this file" },
         { status: 403 }
       );
     }
 
-    // Always require WORKER_SECRET from environment (no defaults for security)
+    // --- Phase 3: Validate server configuration ---
     const workerSecret = process.env.WORKER_SECRET?.trim();
-
-    // Get Cloud Run URL - prioritize geo-routed URL from middleware
     const geoRoutedUrl = request.headers.get('x-target-cloud-run');
     const fallbackUrlsHeader = request.headers.get('x-fallback-cloud-run');
     const geoCountry = request.headers.get('x-geo-country');
     const geoRegion = request.headers.get('x-geo-region');
 
-    // Fallback to environment variable if geo-routing not available
     const primaryCloudRunUrl = process.env.NODE_ENV === 'development'
       ? process.env.CLOUD_RUN_URL?.trim() || 'http://localhost:8080'
       : geoRoutedUrl || process.env.CLOUD_RUN_URL?.trim();
 
-    // Parse fallback URLs
     const fallbackUrls = fallbackUrlsHeader
       ? fallbackUrlsHeader.split(',').filter(Boolean)
       : [];
@@ -153,7 +192,47 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Log geo-routing info
+    // --- Phase 4: Initialize status in Turso (synchronous, must succeed) ---
+    const tursoUrl = process.env.TURSO_DATABASE_URL;
+    const tursoToken = process.env.TURSO_AUTH_TOKEN;
+
+    if (!tursoUrl || !tursoToken) {
+      console.error("Missing Turso environment variables");
+      return NextResponse.json(
+        {
+          error: "Server configuration error",
+          message: "Database is not properly configured",
+        },
+        { status: 500 }
+      );
+    }
+
+    try {
+      const dbClient = createClient({ url: tursoUrl, authToken: tursoToken });
+      await dbClient.execute({
+        sql: `INSERT INTO processing_status (upload_id, user_id, status, progress, current_step, created_at, updated_at, metadata)
+              VALUES (?, ?, 'processing', 0, 'Initiating...', datetime('now'), datetime('now'), ?)
+              ON CONFLICT(upload_id) DO UPDATE SET
+                status = 'processing',
+                progress = 0,
+                current_step = 'Initiating...',
+                error_message = NULL,
+                updated_at = datetime('now')`,
+        args: [uploadId, userId, JSON.stringify({ fileName, detectionMode: mode })],
+      });
+    } catch (initError) {
+      console.error(`[${uploadId}] Failed to initialize status in Turso:`, initError);
+      return NextResponse.json(
+        {
+          error: "Internal server error",
+          message: "Failed to initialize processing status. Please try again.",
+        },
+        { status: 500 }
+      );
+    }
+
+    // --- Phase 5: Return response immediately (fire-and-forget) ---
+    // Log routing info
     if (geoCountry) {
       console.log(`[${uploadId}] Geo-routing: country=${geoCountry}, region=${geoRegion}`);
     }
@@ -163,85 +242,43 @@ export async function POST(request: NextRequest) {
     }
     console.log(`[${uploadId}] Detection mode: ${mode}`);
 
-    // Enforce retention count limit: auto-delete oldest uploads if over quota
-    // Uses free plan limit as default to avoid slow external API calls that cause 504
-    try {
-      const tursoUrl = process.env.TURSO_DATABASE_URL;
-      const tursoToken = process.env.TURSO_AUTH_TOKEN;
-
-      if (tursoUrl && tursoToken) {
-        const retention = getRetentionConfig('free');
-        const dbClient = createClient({ url: tursoUrl, authToken: tursoToken });
-
-        const countResult = await dbClient.execute({
-          sql: 'SELECT COUNT(*) as cnt FROM processing_status WHERE user_id = ?',
-          args: [userId],
-        });
-        const currentCount = (countResult.rows[0]?.cnt as number) || 0;
-
-        if (currentCount >= retention.maxItems) {
-          const deleteCount = currentCount - retention.maxItems + 1;
-          const oldestResult = await dbClient.execute({
-            sql: `
-              SELECT upload_id, metadata
-              FROM processing_status
-              WHERE user_id = ?
-              ORDER BY created_at ASC
-              LIMIT ?
-            `,
-            args: [userId, deleteCount],
-          });
-
-          for (const row of oldestResult.rows) {
-            const oldUploadId = row.upload_id as string;
-            const metadataStr = row.metadata as string | null;
-            const metadata = metadataStr ? JSON.parse(metadataStr) : null;
-            const r2Key = metadata?.resultR2Key;
-
-            if (r2Key) {
-              try {
-                await deleteObject(r2Key);
-              } catch {
-                // R2 file may already be gone
-              }
-            }
-
-            await dbClient.execute({
-              sql: 'DELETE FROM processing_status WHERE upload_id = ? AND user_id = ?',
-              args: [oldUploadId, userId],
-            });
-            console.log(`[${uploadId}] Auto-deleted oldest upload ${oldUploadId}`);
-          }
-        }
-      }
-    } catch (retentionError) {
-      console.warn(`[${uploadId}] Retention cleanup failed (non-blocking):`, retentionError);
-    }
-
-    // Prepare payload
     const payload = {
       uploadId,
       r2Key,
       fileName,
-      userId, // Security: Pass userId to Worker for IDOR protection
+      userId,
       dataConsent: dataConsent || false,
-      detectionMode: mode, // Detection mode: 'standard' or 'enhanced'
+      detectionMode: mode,
     };
 
-    // Call worker with failover support
-    // Worker returns 202 immediately; do NOT await response.json()
-    // because the response body stream stays open for keep-alive.
-    const { response: workerResponse, usedUrl, failedUrls } = await callCloudRunWithFailover(
-      primaryCloudRunUrl,
-      fallbackUrls,
-      payload,
-      workerSecret,
-      uploadId
-    );
+    // Fire-and-forget: Cloud Run call (background)
+    // On failure, update Turso status to 'error' so frontend detects it via polling
+    callCloudRunWithFailover(primaryCloudRunUrl, fallbackUrls, payload, workerSecret, uploadId)
+      .then(({ usedUrl }) => {
+        console.log(`[${uploadId}] Worker accepted request from ${usedUrl}`);
+      })
+      .catch(async (error) => {
+        const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+        console.error(`[${uploadId}] Background Cloud Run call failed:`, errorMsg);
+        try {
+          const dbClient = createClient({ url: tursoUrl, authToken: tursoToken });
+          await dbClient.execute({
+            sql: `UPDATE processing_status
+                  SET status = 'error', error_message = ?, updated_at = datetime('now')
+                  WHERE upload_id = ?`,
+            args: [errorMsg, uploadId],
+          });
+        } catch (dbError) {
+          console.error(`[${uploadId}] Failed to update error status in Turso:`, dbError);
+        }
+      });
 
-    console.log(`[${uploadId}] Worker accepted request (${workerResponse.status}) from ${usedUrl}`);
+    // Fire-and-forget: Retention cleanup (background)
+    runRetentionCleanup(uploadId, userId, tursoUrl, tursoToken)
+      .catch((retentionError) => {
+        console.warn(`[${uploadId}] Retention cleanup failed (non-blocking):`, retentionError);
+      });
 
-    // Return immediately - processing happens in background on Cloud Run
     return NextResponse.json({
       success: true,
       uploadId,
@@ -249,7 +286,6 @@ export async function POST(request: NextRequest) {
       status: "processing",
       detectionMode: mode,
       region: geoRegion || 'default',
-      failedRegions: failedUrls.length > 0 ? failedUrls : undefined,
     });
   } catch (error) {
     console.error("Process endpoint error:", error);
