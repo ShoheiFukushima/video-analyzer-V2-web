@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { Loader2, CheckCircle2, Download, AlertCircle, Volume2, Eye, FileSpreadsheet, SkipForward } from "lucide-react";
+import { Loader2, CheckCircle2, Download, AlertCircle, RefreshCw, Volume2, Eye, FileSpreadsheet, SkipForward } from "lucide-react";
 import type { ProcessingMetadata, ProcessingPhase, PhaseStatus } from "@/types/shared";
 import { cn } from "@/lib/utils";
 
@@ -41,6 +41,7 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
   const [isDownloading, setIsDownloading] = useState(false);
   const [isCompleted, setIsCompleted] = useState(false);
   const [isError, setIsError] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
 
   // Stale detection: if status hasn't updated for 5 minutes, show error
@@ -55,42 +56,64 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
   ]);
 
   const downloadResult = useCallback(async () => {
-    try {
-      setIsDownloading(true);
-      const response = await fetch(`/api/download/${uploadId}`);
-      if (!response.ok) throw new Error((await response.json()).error || 'Download failed');
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 2000;
 
-      const contentType = response.headers.get('content-type') || '';
+    setIsDownloading(true);
+    setDownloadError(null);
 
-      if (contentType.includes('application/json')) {
-        // Production: API returns presigned URL for direct R2 download
-        const data = await response.json();
-        if (!data.downloadUrl) throw new Error('No download URL returned');
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const response = await fetch(`/api/download/${uploadId}`);
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.error || `Download failed (${response.status})`);
+        }
 
-        const a = document.createElement('a');
-        a.href = data.downloadUrl;
-        a.download = `result_${uploadId}.xlsx`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-      } else {
-        // Development / backward compatibility: API returns file directly
-        const blob = await response.blob();
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `result_${uploadId}.xlsx`;
-        document.body.appendChild(a);
-        a.click();
-        window.URL.revokeObjectURL(url);
-        document.body.removeChild(a);
+        const contentType = response.headers.get('content-type') || '';
+
+        if (contentType.includes('application/json')) {
+          // Production: API returns presigned URL for direct R2 download
+          const data = await response.json();
+          if (!data.downloadUrl) throw new Error('No download URL returned');
+
+          const a = document.createElement('a');
+          a.href = data.downloadUrl;
+          a.download = `result_${uploadId}.xlsx`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        } else {
+          // Development / backward compatibility: API returns file directly
+          const blob = await response.blob();
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `result_${uploadId}.xlsx`;
+          document.body.appendChild(a);
+          a.click();
+          window.URL.revokeObjectURL(url);
+          document.body.removeChild(a);
+        }
+
+        // Success - clear any previous download error
+        setDownloadError(null);
+        setIsDownloading(false);
+        return;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Download failed';
+        console.warn(`[${uploadId}] Download attempt ${attempt}/${MAX_RETRIES} failed: ${msg}`);
+
+        if (attempt < MAX_RETRIES) {
+          await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        } else {
+          // All retries exhausted - show download error (not processing error)
+          setDownloadError(msg);
+        }
       }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to download result');
-      setIsError(true);
-    } finally {
-      setIsDownloading(false);
     }
+
+    setIsDownloading(false);
   }, [uploadId]);
 
   useEffect(() => {
@@ -240,21 +263,6 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
 
         {metadata && (
           <div className="space-y-4">
-            {/* Detection Mode Badge */}
-            {metadata.detectionMode && (
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-muted-foreground">Mode:</span>
-                <span className={cn(
-                  "px-2 py-0.5 rounded-full text-xs font-medium",
-                  metadata.detectionMode === 'enhanced'
-                    ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400"
-                    : "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400"
-                )}>
-                  {metadata.detectionMode === 'enhanced' ? 'Enhanced' : 'Standard'}
-                </span>
-              </div>
-            )}
-
             {/* Main Stats */}
             <div className="grid md:grid-cols-3 gap-4">
               {(['duration', 'segmentCount', 'ocrResultCount'] as const).map(key => (
@@ -267,32 +275,22 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
               ))}
             </div>
 
-            {/* Enhanced Mode Stats */}
-            {metadata.detectionMode === 'enhanced' && (metadata.luminanceTransitionsDetected || metadata.textStabilizationPoints) && (
-              <div className="bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 rounded-lg p-4">
-                <p className="text-sm font-medium text-purple-700 dark:text-purple-400 mb-2">Enhanced Detection Results</p>
-                <div className="grid grid-cols-2 gap-4 text-sm">
-                  {metadata.luminanceTransitionsDetected !== undefined && (
-                    <div>
-                      <span className="text-purple-600/70 dark:text-purple-400/70">Transitions Detected:</span>
-                      <span className="ml-2 font-semibold text-purple-700 dark:text-purple-300">{metadata.luminanceTransitionsDetected}</span>
-                    </div>
-                  )}
-                  {metadata.textStabilizationPoints !== undefined && (
-                    <div>
-                      <span className="text-purple-600/70 dark:text-purple-400/70">Text Points:</span>
-                      <span className="ml-2 font-semibold text-purple-700 dark:text-purple-300">{metadata.textStabilizationPoints}</span>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
+          </div>
+        )}
+
+        {downloadError && (
+          <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg p-4 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <p className="text-sm font-medium text-amber-700 dark:text-amber-400">Download failed</p>
+              <p className="text-xs text-amber-600/80 dark:text-amber-400/70 mt-1">{downloadError}</p>
+            </div>
           </div>
         )}
 
         <button onClick={downloadResult} disabled={isDownloading} className="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-full text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-primary text-primary-foreground hover:bg-primary/90 h-11 px-8 w-full">
-          {isDownloading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Download className="w-5 h-5" />}
-          <span>{autoDownloadTriggered ? 'Download Again' : 'Download Artwork'}</span>
+          {isDownloading ? <Loader2 className="w-5 h-5 animate-spin" /> : downloadError ? <RefreshCw className="w-5 h-5" /> : <Download className="w-5 h-5" />}
+          <span>{isDownloading ? 'Retrying...' : downloadError ? 'Retry Download' : autoDownloadTriggered ? 'Download Again' : 'Download Artwork'}</span>
         </button>
       </div>
     );

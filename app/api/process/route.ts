@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { waitUntil } from "@vercel/functions";
 import { auth } from "@clerk/nextjs/server";
 import { isValidR2Key, deleteObject } from "@/lib/r2-client";
 import { getRetentionConfig } from "@/lib/quota";
@@ -149,7 +150,7 @@ export async function POST(request: NextRequest) {
     }
 
     const validModes = ['standard', 'enhanced', 'reverse_engineer'];
-    const mode = validModes.includes(detectionMode) ? detectionMode : 'standard';
+    const mode = validModes.includes(detectionMode) ? detectionMode : 'reverse_engineer';
 
     if (!isValidR2Key(r2Key)) {
       return NextResponse.json(
@@ -251,33 +252,37 @@ export async function POST(request: NextRequest) {
       detectionMode: mode,
     };
 
-    // Fire-and-forget: Cloud Run call (background)
-    // On failure, update Turso status to 'error' so frontend detects it via polling
-    callCloudRunWithFailover(primaryCloudRunUrl, fallbackUrls, payload, workerSecret, uploadId)
-      .then(({ usedUrl }) => {
-        console.log(`[${uploadId}] Worker accepted request from ${usedUrl}`);
-      })
-      .catch(async (error) => {
-        const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-        console.error(`[${uploadId}] Background Cloud Run call failed:`, errorMsg);
-        try {
-          const dbClient = createClient({ url: tursoUrl, authToken: tursoToken });
-          await dbClient.execute({
-            sql: `UPDATE processing_status
-                  SET status = 'error', error_message = ?, updated_at = datetime('now')
-                  WHERE upload_id = ?`,
-            args: [errorMsg, uploadId],
-          });
-        } catch (dbError) {
-          console.error(`[${uploadId}] Failed to update error status in Turso:`, dbError);
-        }
-      });
+    // Background: Cloud Run call (kept alive via waitUntil)
+    // waitUntil ensures Vercel doesn't kill the function before this completes
+    waitUntil(
+      callCloudRunWithFailover(primaryCloudRunUrl, fallbackUrls, payload, workerSecret, uploadId)
+        .then(({ usedUrl }) => {
+          console.log(`[${uploadId}] Worker accepted request from ${usedUrl}`);
+        })
+        .catch(async (error) => {
+          const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+          console.error(`[${uploadId}] Background Cloud Run call failed:`, errorMsg);
+          try {
+            const dbClient = createClient({ url: tursoUrl, authToken: tursoToken });
+            await dbClient.execute({
+              sql: `UPDATE processing_status
+                    SET status = 'error', error_message = ?, updated_at = datetime('now')
+                    WHERE upload_id = ?`,
+              args: [errorMsg, uploadId],
+            });
+          } catch (dbError) {
+            console.error(`[${uploadId}] Failed to update error status in Turso:`, dbError);
+          }
+        })
+    );
 
-    // Fire-and-forget: Retention cleanup (background)
-    runRetentionCleanup(uploadId, userId, tursoUrl, tursoToken)
-      .catch((retentionError) => {
-        console.warn(`[${uploadId}] Retention cleanup failed (non-blocking):`, retentionError);
-      });
+    // Background: Retention cleanup (kept alive via waitUntil)
+    waitUntil(
+      runRetentionCleanup(uploadId, userId, tursoUrl, tursoToken)
+        .catch((retentionError) => {
+          console.warn(`[${uploadId}] Retention cleanup failed (non-blocking):`, retentionError);
+        })
+    );
 
     return NextResponse.json({
       success: true,

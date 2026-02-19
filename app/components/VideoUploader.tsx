@@ -2,10 +2,9 @@
 
 import { useState, useRef, useEffect } from "react";
 import { useAuth } from "@clerk/nextjs";
-import { UploadCloud, X, Film, AlertTriangle, Settings2, Zap, Sparkles, Bot } from "lucide-react";
+import { UploadCloud, X, Film, AlertTriangle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { checkVideoUploadQuota } from "@/lib/quota";
-import type { DetectionMode } from "@/types/shared";
 
 interface VideoUploaderProps {
   onUploadSuccess: (uploadId: string) => void;
@@ -51,8 +50,6 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [detectionMode, setDetectionMode] = useState<DetectionMode>('standard');
-  const [showAdvanced, setShowAdvanced] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -222,7 +219,7 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
           r2Key,
           fileName: fileToUpload.name,
           dataConsent: true,
-          detectionMode,
+          detectionMode: 'reverse_engineer',
         }),
         signal: controller.signal,
       });
@@ -311,90 +308,6 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
             >
                 <X className="w-4 h-4 text-destructive" />
             </button>
-        </div>
-      )}
-
-      {/* Advanced Options - Detection Mode Selection */}
-      {!uploading && (
-        <div className="space-y-3">
-          <button
-            onClick={() => setShowAdvanced(!showAdvanced)}
-            className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors"
-          >
-            <Settings2 className="w-4 h-4" />
-            <span>Advanced Options</span>
-            <span className={cn("text-xs transition-transform", showAdvanced && "rotate-180")}>▼</span>
-          </button>
-
-          {showAdvanced && (
-            <div className="bg-secondary/30 border rounded-lg p-4 space-y-3">
-              <p className="text-sm font-medium text-foreground">Detection Mode</p>
-              <div className="grid grid-cols-3 gap-3">
-                {/* Standard Mode */}
-                <button
-                  onClick={() => setDetectionMode('standard')}
-                  className={cn(
-                    "p-4 rounded-lg border-2 text-left transition-all",
-                    detectionMode === 'standard'
-                      ? "border-primary bg-primary/10"
-                      : "border-border hover:border-primary/50 hover:bg-secondary/50"
-                  )}
-                >
-                  <div className="flex items-center gap-2 mb-2">
-                    <Zap className={cn("w-5 h-5", detectionMode === 'standard' ? "text-primary" : "text-muted-foreground")} />
-                    <span className="font-semibold text-foreground">Standard</span>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    カット編集中心の動画向け（ディゾルブなし）
-                  </p>
-                </button>
-
-                {/* Enhanced Mode */}
-                <button
-                  onClick={() => setDetectionMode('enhanced')}
-                  className={cn(
-                    "p-4 rounded-lg border-2 text-left transition-all",
-                    detectionMode === 'enhanced'
-                      ? "border-primary bg-primary/10"
-                      : "border-border hover:border-primary/50 hover:bg-secondary/50"
-                  )}
-                >
-                  <div className="flex items-center gap-2 mb-2">
-                    <Sparkles className={cn("w-5 h-5", detectionMode === 'enhanced' ? "text-primary" : "text-muted-foreground")} />
-                    <span className="font-semibold text-foreground">Enhanced</span>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    AIを用いた高精度シーン検出
-                  </p>
-                </button>
-
-                {/* Opus 4.6 Mode */}
-                <button
-                  onClick={() => setDetectionMode('opus46')}
-                  className={cn(
-                    "p-4 rounded-lg border-2 text-left transition-all",
-                    detectionMode === 'opus46'
-                      ? "border-primary bg-primary/10"
-                      : "border-border hover:border-primary/50 hover:bg-secondary/50"
-                  )}
-                >
-                  <div className="flex items-center gap-2 mb-2">
-                    <Bot className={cn("w-5 h-5", detectionMode === 'opus46' ? "text-primary" : "text-muted-foreground")} />
-                    <span className="font-semibold text-foreground">Opus 4.6</span>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    次世代アルゴリズム（単一プロセス・高効率）
-                  </p>
-                </button>
-              </div>
-              {detectionMode === 'enhanced' && (
-                <p className="text-xs text-amber-600 dark:text-amber-400 flex items-center gap-1">
-                  <AlertTriangle className="w-3 h-3" />
-                  AI処理のため処理時間が長くなります
-                </p>
-              )}
-            </div>
-          )}
         </div>
       )}
 
