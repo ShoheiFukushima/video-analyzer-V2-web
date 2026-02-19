@@ -10,6 +10,7 @@
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { OCRProvider, OCRResult, OCRProviderConfig, OCR_PROMPT } from '../ocrProviderInterface.js';
+import { extractRetryAfter } from '../rateLimiter.js';
 
 // ============================================================
 // Gemini Provider Implementation
@@ -93,13 +94,14 @@ export class GeminiOCRProvider extends OCRProvider {
 
       this.updateStats(false, processingTimeMs, errorMessage);
 
-      // Mark unavailable on repeated failures
+      // Mark unavailable on repeated failures with adaptive cooldown
       if (
         errorMessage.includes('503') ||
         errorMessage.includes('429') ||
         errorMessage.includes('quota')
       ) {
-        this.markUnavailable(60000); // 1 minute cooldown
+        const retryAfterMs = extractRetryAfter(error) ?? undefined;
+        this.markUnavailable(retryAfterMs);
       }
 
       throw error;

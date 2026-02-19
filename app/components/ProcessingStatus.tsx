@@ -278,6 +278,22 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
           </div>
         )}
 
+        {metadata?.warnings && metadata.warnings.length > 0 && (
+          <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg p-4 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
+                Processing completed with {metadata.warnings.length} warning{metadata.warnings.length > 1 ? 's' : ''}
+              </p>
+              <ul className="text-xs text-amber-600/80 dark:text-amber-400/70 mt-1 space-y-1 list-disc list-inside">
+                {metadata.warnings.map((warning, i) => (
+                  <li key={i}>{warning}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+
         {downloadError && (
           <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg p-4 flex items-start gap-3">
             <AlertCircle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />

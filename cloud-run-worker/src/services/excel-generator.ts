@@ -8,7 +8,7 @@
 
 import ExcelJS from 'exceljs';
 import { promises as fs } from 'fs';
-import { ExcelRow, ExcelGenerationOptions, ProcessingStats, VideoMetadata } from '../types/excel.js';
+import { ExcelRow, ExcelGenerationOptions, ProcessingStats, VideoMetadata, TopicGroup } from '../types/excel.js';
 
 // Excel layout constants
 const EXCEL_IMAGE_WIDTH_PX = 320; // Target image width in pixels
@@ -26,7 +26,7 @@ const POINTS_PER_PIXEL = 0.75; // 96 DPI: 1px = 0.75pt
  * @returns Excel file as Buffer
  */
 export async function generateExcel(options: ExcelGenerationOptions): Promise<Buffer> {
-  const { projectTitle, rows, videoMetadata, includeStatistics = false } = options;
+  const { projectTitle, rows, videoMetadata, includeStatistics = false, topicGroups, warnings } = options;
 
   console.log(`📊 Generating Excel file: ${projectTitle} (${rows.length} scenes)`);
 
@@ -176,9 +176,14 @@ export async function generateExcel(options: ExcelGenerationOptions): Promise<Bu
     });
   });
 
+  // Add Topics sheet if topic groups are provided
+  if (topicGroups && topicGroups.length > 0) {
+    addTopicsSheet(workbook, topicGroups);
+  }
+
   // Add statistics sheet if requested
   if (includeStatistics) {
-    await addStatisticsSheet(workbook, rows, videoMetadata);
+    await addStatisticsSheet(workbook, rows, videoMetadata, warnings);
   }
 
   // Generate Excel file buffer
@@ -191,12 +196,104 @@ export async function generateExcel(options: ExcelGenerationOptions): Promise<Bu
 }
 
 /**
+ * Add Topics worksheet to workbook
+ * Groups consecutive scenes with similar OCR text
+ */
+function addTopicsSheet(
+  workbook: ExcelJS.Workbook,
+  topicGroups: TopicGroup[]
+): void {
+  const topicsSheet = workbook.addWorksheet('Topics', {
+    views: [{ state: 'frozen', xSplit: 0, ySplit: 1 }]
+  });
+
+  topicsSheet.columns = [
+    { header: 'Topic #', key: 'topic', width: 10 },
+    { header: 'Scenes', key: 'scenes', width: 12 },
+    { header: 'Time Range', key: 'timeRange', width: 24 },
+    { header: 'Count', key: 'count', width: 8 },
+    { header: 'OCR Text', key: 'ocr', width: 50 },
+    { header: 'Narration', key: 'narration', width: 50 },
+  ];
+
+  // Style header
+  const headerRow = topicsSheet.getRow(1);
+  headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 12 };
+  headerRow.fill = {
+    type: 'pattern',
+    pattern: 'solid',
+    fgColor: { argb: 'FF8E44AD' } // Purple
+  };
+  headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
+  headerRow.height = 25;
+
+  // Add data rows
+  for (const group of topicGroups) {
+    const row = topicsSheet.addRow({
+      topic: group.groupNumber,
+      scenes: group.sceneRange,
+      timeRange: group.timeRange,
+      count: group.count,
+      ocr: group.ocr || '(no text)',
+      narration: group.narration || '(no narration)',
+    });
+
+    // Alternate row colors
+    if ((group.groupNumber - 1) % 2 === 0) {
+      row.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FFF5F0FF' } // Light purple tint
+      };
+    }
+
+    // Center align topic number, scenes, time range, count
+    row.getCell('topic').alignment = { horizontal: 'center', vertical: 'middle' };
+    row.getCell('scenes').alignment = { horizontal: 'center', vertical: 'middle' };
+    row.getCell('timeRange').alignment = { horizontal: 'center', vertical: 'middle' };
+    row.getCell('count').alignment = { horizontal: 'center', vertical: 'middle' };
+
+    // Wrap text in OCR and narration columns
+    row.getCell('ocr').alignment = { wrapText: true, vertical: 'top' };
+    row.getCell('narration').alignment = { wrapText: true, vertical: 'top' };
+
+    // Style empty text
+    if (!group.ocr) {
+      row.getCell('ocr').font = { italic: true, color: { argb: 'FF999999' } };
+    }
+    if (!group.narration) {
+      row.getCell('narration').font = { italic: true, color: { argb: 'FF999999' } };
+    }
+
+    // Highlight multi-scene groups
+    if (group.count > 1) {
+      row.getCell('count').font = { bold: true, color: { argb: 'FF27AE60' } }; // Green
+    }
+  }
+
+  // Add borders
+  topicsSheet.eachRow({ includeEmpty: false }, (row) => {
+    row.eachCell((cell) => {
+      cell.border = {
+        top: { style: 'thin', color: { argb: 'FFD3D3D3' } },
+        left: { style: 'thin', color: { argb: 'FFD3D3D3' } },
+        bottom: { style: 'thin', color: { argb: 'FFD3D3D3' } },
+        right: { style: 'thin', color: { argb: 'FFD3D3D3' } },
+      };
+    });
+  });
+
+  console.log(`  ✓ Added Topics sheet (${topicGroups.length} topics)`);
+}
+
+/**
  * Add statistics worksheet to workbook
  */
 async function addStatisticsSheet(
   workbook: ExcelJS.Workbook,
   rows: ExcelRow[],
-  videoMetadata: VideoMetadata
+  videoMetadata: VideoMetadata,
+  warnings?: string[]
 ): Promise<void> {
   const statsSheet = workbook.addWorksheet('Statistics');
 
@@ -244,12 +341,35 @@ async function addStatisticsSheet(
     fgColor: { argb: 'FFFFE4B5' } // Light orange
   };
 
-  statsSheet.addRow({ metric: 'Scene Detection Thresholds', value: '0.025, 0.055, 0.085' });
-  statsSheet.addRow({ metric: 'Min Scene Interval', value: '1.0s' });
-  statsSheet.addRow({ metric: 'Min Scene Duration', value: '0.5s' });
+  statsSheet.addRow({ metric: 'Scene Detection Thresholds', value: '0.08, 0.15, 0.30' });
+  statsSheet.addRow({ metric: 'Min Scene Interval', value: '3.0s' });
+  statsSheet.addRow({ metric: 'Min Scene Duration', value: '2.0s' });
   statsSheet.addRow({ metric: 'Screenshot Capture Position', value: '50% (mid-point)' });
   statsSheet.addRow({ metric: 'ROI Detection', value: 'Disabled (default)' });
   statsSheet.addRow({ metric: '', value: '' }); // Separator
+
+  // Processing Warnings section (if any)
+  if (warnings && warnings.length > 0) {
+    const warningsHeader = statsSheet.addRow({ metric: 'Processing Warnings', value: `${warnings.length} warning(s)` });
+    warningsHeader.font = { bold: true };
+    warningsHeader.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFFFD700' } // Amber/Gold
+    };
+
+    for (const warning of warnings) {
+      const warningRow = statsSheet.addRow({ metric: '⚠️ Warning', value: warning });
+      warningRow.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FFFFFACD' } // Light amber
+      };
+      warningRow.getCell('value').alignment = { wrapText: true };
+    }
+
+    statsSheet.addRow({ metric: '', value: '' }); // Separator
+  }
 
   // Contact developer section
   const contactHeader = statsSheet.addRow({ metric: 'Need Adjustment?', value: '' });
@@ -277,9 +397,9 @@ async function addStatisticsSheet(
     `Video Duration: ${videoMetadata.duration}s`,
     '',
     '=== DETECTION PARAMETERS ===',
-    `Scene Detection Thresholds: 0.025, 0.055, 0.085`,
-    `Min Scene Interval: 1.0s`,
-    `Min Scene Duration: 0.5s`,
+    `Scene Detection Thresholds: 0.08, 0.15, 0.30`,
+    `Min Scene Interval: 3.0s`,
+    `Min Scene Duration: 2.0s`,
     `Screenshot Capture Position: 50% (mid-point)`,
     `ROI Detection: Disabled (default)`,
     '',

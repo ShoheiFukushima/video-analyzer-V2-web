@@ -12,6 +12,7 @@ import {
   WHISPER_CHECKPOINT_INTERVAL,
   type ProcessingCheckpoint,
 } from './checkpointService.js';
+import { getWhisperRateLimiter, isRetryableError } from './rateLimiter.js';
 
 /**
  * VAD + Whisper Integration Pipeline
@@ -723,7 +724,10 @@ function shouldRetry(error: Error): boolean {
 }
 
 /**
- * Transcribe a single audio chunk with Whisper (with retry logic)
+ * Transcribe a single audio chunk with Whisper (rate-limited with retry)
+ *
+ * Uses the Whisper rate limiter singleton for concurrency control,
+ * sliding window rate limiting, and exponential backoff with jitter.
  *
  * @param chunk - Audio chunk metadata
  * @param uploadId - Upload ID for logging
@@ -733,52 +737,35 @@ async function transcribeAudioChunk(
   chunk: AudioChunk,
   uploadId: string
 ): Promise<TranscriptionSegment[]> {
-  const maxRetries = 3;
-  const baseDelay = 1000; // 1 second
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      // 1. Validate chunk file exists
-      if (!validateChunkFile(chunk, uploadId)) {
-        return []; // Abort, no retry for missing files
-      }
-
-      // 2. Prepare Whisper API request
-      const params = prepareWhisperRequest(chunk);
-
-      // 3. Call Whisper API
-      const responseData = await callWhisperAPI(params);
-
-      // 4. Parse response into transcription segments
-      return parseWhisperResponse(responseData, chunk);
-
-    } catch (error) {
-      const err = error as Error;
-
-      // Check if it's a fatal error (don't retry)
-      if (!shouldRetry(err)) {
-        console.error(`[${uploadId}] Fatal Whisper error (no retry): ${err.message}`);
-        return []; // Abort
-      }
-
-      // Retry on temporary errors
-      console.warn(`[${uploadId}] Whisper API attempt ${attempt}/${maxRetries} failed for chunk ${chunk.chunkIndex}:`, err.message);
-
-      if (attempt < maxRetries) {
-        // Exponential backoff: 1s, 2s, 4s
-        const delay = baseDelay * Math.pow(2, attempt - 1);
-        console.log(`[${uploadId}] Retrying in ${delay}ms...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      } else {
-        // Final attempt failed
-        console.error(`[${uploadId}] All ${maxRetries} attempts failed for chunk ${chunk.chunkIndex}`);
-        return [];
-      }
-    }
+  // 1. Validate chunk file exists (no retry for missing files)
+  if (!validateChunkFile(chunk, uploadId)) {
+    return [];
   }
 
-  // Should never reach here, but TypeScript requires it
-  return [];
+  try {
+    const rateLimiter = getWhisperRateLimiter();
+
+    const responseData = await rateLimiter.executeWithRetry(
+      async () => {
+        const params = prepareWhisperRequest(chunk);
+        return await callWhisperAPI(params);
+      },
+      (error) => {
+        const err = error as Error;
+        // Don't retry fatal errors (API key issues, invalid requests)
+        if (!shouldRetry(err)) {
+          return false;
+        }
+        return isRetryableError(error);
+      }
+    );
+
+    return parseWhisperResponse(responseData, chunk);
+  } catch (error) {
+    const err = error as Error;
+    console.error(`[${uploadId}] Whisper API failed for chunk ${chunk.chunkIndex} after all retries: ${err.message}`);
+    return [];
+  }
 }
 
 /**

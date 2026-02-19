@@ -8,7 +8,7 @@
  * @since 2026-02-08
  */
 
-import { RateLimiter } from './rateLimiter.js';
+import { RateLimiter, extractRetryAfter } from './rateLimiter.js';
 
 // ============================================================
 // Types and Interfaces
@@ -128,12 +128,16 @@ EXAMPLE BAD OUTPUT (DO NOT DO THIS):
 /**
  * Abstract base class for OCR providers
  */
+/** Cooldown schedule for consecutive failures (30s → 1m → 2m → 5m) */
+const COOLDOWN_SCHEDULE_MS = [30000, 60000, 120000, 300000];
+
 export abstract class OCRProvider {
   protected readonly config: OCRProviderConfig;
   protected readonly rateLimiter: RateLimiter;
   protected stats: OCRProviderStats;
   protected _isAvailable: boolean = true;
   protected unavailableUntil: number = 0;
+  protected consecutiveFailures: number = 0;
 
   constructor(config: OCRProviderConfig) {
     this.config = config;
@@ -190,14 +194,19 @@ export abstract class OCRProvider {
   }
 
   /**
-   * Mark provider as temporarily unavailable
-   * @param durationMs - Cooldown duration in milliseconds
+   * Mark provider as temporarily unavailable with adaptive cooldown
+   * @param retryAfterMs - Optional Retry-After value from server (overrides schedule if larger)
    */
-  protected markUnavailable(durationMs: number = 30000): void {
+  protected markUnavailable(retryAfterMs?: number): void {
+    this.consecutiveFailures++;
+    const scheduleIndex = Math.min(this.consecutiveFailures - 1, COOLDOWN_SCHEDULE_MS.length - 1);
+    const scheduledCooldown = COOLDOWN_SCHEDULE_MS[scheduleIndex];
+    const durationMs = retryAfterMs ? Math.max(retryAfterMs, scheduledCooldown) : scheduledCooldown;
+
     this._isAvailable = false;
     this.unavailableUntil = Date.now() + durationMs;
     this.stats.isAvailable = false;
-    console.warn(`[${this.name}] Marked as unavailable for ${durationMs}ms`);
+    console.warn(`[${this.name}] Marked as unavailable for ${durationMs}ms (consecutive failures: ${this.consecutiveFailures})`);
   }
 
   /**
@@ -214,6 +223,7 @@ export abstract class OCRProvider {
     this.stats.totalRequests++;
     if (success) {
       this.stats.successfulRequests++;
+      this.consecutiveFailures = 0; // Reset on success
       // Update average processing time (exponential moving average)
       if (this.stats.avgProcessingTimeMs === 0) {
         this.stats.avgProcessingTimeMs = processingTimeMs;

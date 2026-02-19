@@ -2,7 +2,7 @@ import { initStatus, updateStatus, completeStatus, failStatus, updatePhaseProgre
 import { executeIdealPipeline } from './pipeline.js';
 import { getVideoMetadata, detectScenesOnly } from './ffmpeg.js';
 import { uploadResultFile } from './blobUploader.js';
-import { extractAudioForWhisper, hasAudioStream, preprocessAudioForVAD } from './audioExtractor.js';
+import { extractAudioForWhisper, hasAudioStream } from './audioExtractor.js';
 import { processAudioWithVADAndWhisper } from './audioWhisperPipeline.js';
 import { downloadFromR2Parallel, deleteFromR2, uploadToR2 } from './r2Client.js';
 import { logCriticalError } from './errorTracking.js';
@@ -29,6 +29,7 @@ import type {
   DetectionMode
 } from '../types/shared.js';
 import type { Scene } from '../types/excel.js';
+import { WarningCollector } from './warningCollector.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -112,6 +113,10 @@ export const processVideo = async (
     // Security: Initialize status with userId for access control
     try {
       await initStatus(uploadId, userId);
+      // Store fileName in metadata for upload history display
+      await updateStatus(uploadId, {
+        metadata: { fileName } as any,
+      });
     } catch (statusError) {
       console.warn(`[${uploadId}] Failed to initialize Supabase status (continuing):`, statusError);
       if (process.env.NODE_ENV === 'production') {
@@ -184,6 +189,9 @@ export const processVideo = async (
         hasAudio = await hasAudioStream(videoPath);
       }
 
+      // Warning collector for non-fatal issues
+      const warningCollector = new WarningCollector();
+
       // Step 4: Perform VAD + Whisper transcription AND scene detection in parallel
       // These are independent operations that can run concurrently to save time
       let transcription: TranscriptionSegment[];
@@ -198,7 +206,9 @@ export const processVideo = async (
           audioPath,
           hasAudio,
           cp,
-          videoMetadata
+          videoMetadata,
+          detectionMode,
+          warningCollector
         );
         transcription = result.transcription;
         vadStats = result.vadStats;
@@ -236,7 +246,8 @@ export const processVideo = async (
         detectionMode,
         cp,
         preDetectedScenes,
-        videoMetadata
+        videoMetadata,
+        warningCollector
       );
 
       // Step 6: Upload result and complete processing
@@ -248,7 +259,9 @@ export const processVideo = async (
         stats,
         overallStartTime,
         detectionMode,
-        userId
+        userId,
+        fileName,
+        warningCollector
       );
 
       // Cleanup checkpoint on successful completion
@@ -426,30 +439,21 @@ async function extractMetadataAndAudio(
 
   if (hasAudio) {
     await updatePhaseProgress(uploadId, 1, 40, {
-      subTask: 'Extracting audio...',
+      subTask: 'Extracting & enhancing audio...',
       stage: 'audio',
     });
 
-    await timeStep(uploadId, 'Extract Audio (16kHz mono)', async () => {
-      await extractAudioForWhisper(videoPath, audioPath);
-    });
-
-    // Audio preprocessing for improved VAD detection (BGM suppression + voice enhancement)
-    // Re-enabled after baseline test completion (2025-11-12)
-    await updatePhaseProgress(uploadId, 1, 45, {
-      subTask: 'Enhancing audio quality...',
-      stage: 'audio',
-    });
-
-    await timeStep(uploadId, 'Preprocess Audio (BGM suppression)', async () => {
+    // Single FFmpeg pass: extract audio + VAD preprocessing (BGM suppression + voice enhancement)
+    // Previously this was 2 separate FFmpeg calls; now combined for speed
+    await timeStep(uploadId, 'Extract & Preprocess Audio (single pass)', async () => {
       try {
-        await preprocessAudioForVAD(audioPath, uploadId);
-        console.log(`[${uploadId}] ✓ Audio preprocessing successful - VAD detection should improve`);
+        await extractAudioForWhisper(videoPath, audioPath, { withVADPreprocessing: true });
+        console.log(`[${uploadId}] ✓ Audio extraction + preprocessing successful (single pass)`);
       } catch (preprocessError) {
-        // Non-fatal error: Continue with original audio (fallback)
-        console.warn(`[${uploadId}] ⚠️ Audio preprocessing failed, using original audio:`, preprocessError);
-        console.warn(`[${uploadId}]    VAD detection may be less accurate without preprocessing`);
-        // Do not throw - processing continues with original audio
+        // Fallback: retry without VAD preprocessing filters
+        console.warn(`[${uploadId}] ⚠️ Combined extraction failed, retrying basic extraction:`, preprocessError);
+        await extractAudioForWhisper(videoPath, audioPath);
+        console.log(`[${uploadId}] ✓ Basic audio extraction successful (VAD preprocessing skipped)`);
       }
     });
 
@@ -537,7 +541,9 @@ async function performParallelProcessing(
   audioPath: string,
   hasAudio: boolean,
   checkpoint: ProcessingCheckpoint,
-  videoMetadata: any
+  videoMetadata: any,
+  detectionMode?: DetectionMode,
+  warningCollector?: WarningCollector
 ): Promise<{
   transcription: TranscriptionSegment[];
   vadStats: VADStats | null;
@@ -568,7 +574,7 @@ async function performParallelProcessing(
 
     // Task 2: Scene detection only (no frame extraction)
     timeStep(uploadId, '[PARALLEL] Scene Detection', async () => {
-      console.log(`[${uploadId}] [PARALLEL] Starting scene detection...`);
+      console.log(`[${uploadId}] [PARALLEL] Starting scene detection (mode: ${detectionMode || 'standard'})...`);
       const { scenes } = await detectScenesOnly(
         videoPath,
         videoMetadata,
@@ -587,7 +593,8 @@ async function performParallelProcessing(
               stage: 'scene_detection',
             });
           }
-        }
+        },
+        detectionMode
       );
       console.log(`[${uploadId}] [PARALLEL] Scene detection complete: ${scenes.length} scenes`);
       return scenes;
@@ -607,10 +614,20 @@ async function performParallelProcessing(
     transcription = whisperResult.value.transcription;
     vadStats = whisperResult.value.vadStats;
     console.log(`[${uploadId}] [PARALLEL] ✅ Whisper succeeded: ${transcription.length} segments`);
+
+    // Check for empty transcription despite having audio
+    if (transcription.length === 0 && hasAudio) {
+      warningCollector?.add(
+        'ナレーション文字起こしの結果が0件でした。APIレートリミットまたは音声品質の問題の可能性があります。'
+      );
+    }
   } else {
     // Whisper failure is non-fatal: proceed with empty transcription
     console.warn(`[${uploadId}] [PARALLEL] ⚠️ Whisper failed (non-fatal): ${whisperResult.reason}`);
     console.warn(`[${uploadId}] [PARALLEL] Continuing with empty transcription (OCR-only Excel)`);
+    warningCollector?.add(
+      'ナレーション文字起こしが完全に失敗しました。Excelにナレーションテキストが含まれていません。'
+    );
   }
 
   // Handle Scene Detection result
@@ -648,7 +665,8 @@ async function executeSceneDetectionAndOCRWithCheckpoint(
   detectionMode: DetectionMode = 'standard',
   checkpoint: ProcessingCheckpoint,
   preDetectedScenes?: Scene[],
-  videoMetadata?: any
+  videoMetadata?: any,
+  warningCollector?: WarningCollector
 ): Promise<{ excelPath: string; stats: any }> {
   // Phase 2 starts: Scene detection + OCR
   await updatePhaseProgress(uploadId, 2, 0, {
@@ -667,7 +685,8 @@ async function executeSceneDetectionAndOCRWithCheckpoint(
       detectionMode,
       checkpoint,
       preDetectedScenes,
-      videoMetadata
+      videoMetadata,
+      warningCollector
     );
   });
 
@@ -699,7 +718,9 @@ async function uploadResultAndComplete(
   stats: any,
   overallStartTime: number,
   detectionMode: DetectionMode = 'standard',
-  userId: string = 'system'
+  userId: string = 'system',
+  fileName: string = 'unknown',
+  warningCollector?: WarningCollector
 ): Promise<{ resultUrl: string; resultR2Key: string | null }> {
   // Phase 3 Step 3: Upload result file or store locally for development
   // Phase 3 progress: 70-95%
@@ -733,6 +754,7 @@ async function uploadResultAndComplete(
   // Complete with metadata (including resultR2Key for production downloads)
   console.log(`[${uploadId}] Processing completed!`);
 
+  const warnings = warningCollector?.getWarnings();
   const completionMetadata: ProcessingMetadata = {
     duration: videoMetadata.duration,
     segmentCount: transcription.length,
@@ -745,9 +767,18 @@ async function uploadResultAndComplete(
     // Enhanced mode metadata (populated by pipeline if enhanced mode was used)
     luminanceTransitionsDetected: stats.luminanceTransitionsDetected,
     textStabilizationPoints: stats.textStabilizationPoints,
+    // Processing warnings (non-fatal issues)
+    warnings: warnings && warnings.length > 0 ? warnings : undefined,
   };
 
-  // Store resultR2Key in metadata for production downloads
+  // Log warning summary
+  if (warnings && warnings.length > 0) {
+    console.warn(`[${uploadId}] ⚠️ Processing completed with ${warnings.length} warning(s):`);
+    warnings.forEach((w, i) => console.warn(`[${uploadId}]   ${i + 1}. ${w}`));
+  }
+
+  // Store resultR2Key and fileName in metadata for production downloads and upload history
+  (completionMetadata as any).fileName = fileName;
   if (resultR2Key) {
     completionMetadata.resultR2Key = resultR2Key;
   }

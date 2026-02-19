@@ -84,6 +84,7 @@ export interface ProcessingMetadata {
   detectionMode?: DetectionMode;
   luminanceTransitionsDetected?: number;
   textStabilizationPoints?: number;
+  warnings?: string[]; // Non-fatal issues encountered during processing
 }
 
 export interface ProcessingStatus {

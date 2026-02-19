@@ -12,8 +12,9 @@
  * Video detection mode
  * - standard: Fast processing, detects hard cuts only
  * - enhanced: Better for fades, dissolves, text animations (slower)
+ * - reverse_engineer: PySceneDetect ContentDetector — adaptive threshold, works on all videos
  */
-export type DetectionMode = 'standard' | 'enhanced';
+export type DetectionMode = 'standard' | 'enhanced' | 'reverse_engineer';
 
 /**
  * Detection mode descriptions for UI
@@ -26,6 +27,10 @@ export const DETECTION_MODE_INFO: Record<DetectionMode, { label: string; descrip
   enhanced: {
     label: 'Enhanced',
     description: 'Better for fades, dissolves, text animations (2-3x processing time)'
+  },
+  reverse_engineer: {
+    label: 'Reverse Engineer',
+    description: 'PySceneDetect ContentDetector — adaptive threshold, works on all videos'
   }
 };
 
@@ -98,6 +103,7 @@ export interface ProcessingMetadata {
   detectionMode?: DetectionMode;
   luminanceTransitionsDetected?: number;
   textStabilizationPoints?: number;
+  warnings?: string[]; // Non-fatal issues encountered during processing
 }
 
 export interface ProcessingStatus {
