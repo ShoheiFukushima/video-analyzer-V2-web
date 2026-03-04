@@ -460,20 +460,21 @@ def detect_telop_animations(
     """
     Detect telop/subtitle animation periods from ROI edge count time series.
 
-    Algorithm (run independently per ROI region):
-      1. Compute frame-to-frame absolute difference of edge counts (velocity)
-      2. Normalize velocity by mean edge count (to make threshold scale-invariant)
-      3. Smooth with rolling mean (window=3) for noise reduction
-      4. velocity > threshold → frame is "animating"
-      5. velocity <= threshold for settling_frames consecutive frames → settled
-      6. Output: [{region, start, settling}]
+    Two complementary detection methods (per ROI region):
 
-    Regions: full, bottom, lower_third, center_text, top_left, top_right
-    The "full" region catches full-screen wipe transitions.
+    Method 1 - Velocity: Detects sudden changes (hard text appear/disappear)
+      Frame-to-frame edge count velocity > threshold → animating
+
+    Method 2 - Variability: Detects gradual animations (slide-in, wipe, fade)
+      Sliding window std of edge counts > threshold → content is changing
+      This catches slow animations where per-frame velocity is below threshold
+      but the region is clearly not stable over a ~1s window.
+
+    Results from both methods are merged and overlapping periods are unified.
     """
     import numpy as np
 
-    # Per-region threshold multipliers (full frame needs higher threshold to avoid false positives)
+    # Per-region threshold multipliers
     region_threshold_scale = {
         "full": 1.5,         # Full frame: higher threshold (more noise)
         "bottom": 1.0,
@@ -483,38 +484,67 @@ def detect_telop_animations(
         "top_right": 1.2,
     }
 
+    # Variability detection window size (in sampled frames)
+    # At 30fps/step=2 → 15 frames ≈ 1.0s
+    variability_window = int(float(os.environ.get('TELOP_VARIABILITY_WINDOW', '15')))
+    variability_threshold = float(os.environ.get('TELOP_VARIABILITY_THRESHOLD', '0.04'))
+
     results: List[Dict[str, Any]] = []
 
     for region, edge_counts_list in roi_edge_series.items():
-        if len(edge_counts_list) < 10:
+        if len(edge_counts_list) < max(10, variability_window + 2):
             continue
 
         arr = np.array(edge_counts_list, dtype=np.float64)
-
-        # Normalize: divide by mean edge count to make threshold scale-invariant
         mean_ec = arr.mean()
         if mean_ec < 1.0:
-            continue  # Region has almost no edges, skip
+            continue
 
-        # Frame-to-frame absolute velocity (normalized)
+        n = len(arr)
+        region_scale = region_threshold_scale.get(region, 1.0)
+
+        # ==============================================================
+        # Method 1: Velocity-based detection (sudden changes)
+        # ==============================================================
         velocity = np.abs(np.diff(arr)) / mean_ec
-
-        # Rolling mean smoothing (window=3)
         if len(velocity) >= 3:
             kernel = np.ones(3) / 3.0
             velocity = np.convolve(velocity, kernel, mode='same')
 
-        # Apply per-region threshold
-        region_scale = region_threshold_scale.get(region, 1.0)
-        effective_threshold = velocity_threshold * region_scale
+        effective_vel_threshold = velocity_threshold * region_scale
+        is_velocity_animating = np.zeros(n, dtype=bool)
+        is_velocity_animating[1:] = velocity > effective_vel_threshold
 
-        # Detect animation periods
-        is_animating = velocity > effective_threshold
+        # ==============================================================
+        # Method 2: Variability-based detection (gradual animations)
+        # Sliding window standard deviation of edge counts
+        # A stable region has low std; an animating region has high std
+        # ==============================================================
+        half_w = variability_window // 2
+        rolling_std = np.zeros(n, dtype=np.float64)
+        for i in range(n):
+            lo = max(0, i - half_w)
+            hi = min(n, i + half_w + 1)
+            rolling_std[i] = np.std(arr[lo:hi])
+
+        # Normalize by mean edge count
+        normalized_std = rolling_std / mean_ec
+        effective_var_threshold = variability_threshold * region_scale
+        is_variability_animating = normalized_std > effective_var_threshold
+
+        # ==============================================================
+        # Combine both methods (OR logic)
+        # ==============================================================
+        is_animating = is_velocity_animating | is_variability_animating
+
+        # ==============================================================
+        # Extract animation periods with settling
+        # ==============================================================
         in_animation = False
         anim_start_idx = 0
         stable_count = 0
 
-        for i in range(len(is_animating)):
+        for i in range(n):
             if is_animating[i]:
                 if not in_animation:
                     anim_start_idx = i
@@ -524,13 +554,11 @@ def detect_telop_animations(
                 if in_animation:
                     stable_count += 1
                     if stable_count >= settling_frames:
-                        # Animation settled
                         settling_idx = i - settling_frames + 1
                         start_time = frame_indices[anim_start_idx] / fps
                         settling_time = frame_indices[min(settling_idx + 1, len(frame_indices) - 1)] / fps
 
-                        # Only report animations longer than 0.1s
-                        if settling_time - start_time > 0.1:
+                        if settling_time - start_time > 0.2:
                             results.append({
                                 "region": region,
                                 "start": round(start_time, 3),
@@ -539,19 +567,43 @@ def detect_telop_animations(
                         in_animation = False
                         stable_count = 0
 
-        # Close any open animation at end of video
         if in_animation:
-            settling_idx = len(is_animating) - 1
+            settling_idx = n - 1
             start_time = frame_indices[anim_start_idx] / fps
-            settling_time = frame_indices[min(settling_idx + 1, len(frame_indices) - 1)] / fps
-            if settling_time - start_time > 0.1:
+            settling_time = frame_indices[min(settling_idx, len(frame_indices) - 1)] / fps
+            if settling_time - start_time > 0.2:
                 results.append({
                     "region": region,
                     "start": round(start_time, 3),
                     "settling": round(settling_time, 3),
                 })
 
-    # Sort by start time
+        # Log per-region stats for debugging
+        vel_count = int(np.sum(is_velocity_animating))
+        var_count = int(np.sum(is_variability_animating))
+        combined_count = int(np.sum(is_animating))
+        if combined_count > 0:
+            print(f"[Telop] {region}: velocity={vel_count}, variability={var_count}, "
+                  f"combined={combined_count} animating frames (out of {n})",
+                  file=sys.stderr)
+
+    # ==============================================================
+    # Merge overlapping/nearby animations in the same region
+    # ==============================================================
+    merge_gap = float(os.environ.get('TELOP_MERGE_GAP', '2.0'))  # seconds
+    results.sort(key=lambda x: (x["region"], x["start"]))
+
+    merged_results: List[Dict[str, Any]] = []
+    for r in results:
+        if (merged_results
+                and merged_results[-1]["region"] == r["region"]
+                and r["start"] - merged_results[-1]["settling"] <= merge_gap):
+            # Extend the previous animation
+            merged_results[-1]["settling"] = max(merged_results[-1]["settling"], r["settling"])
+        else:
+            merged_results.append(dict(r))
+
+    results = merged_results
     results.sort(key=lambda x: x["start"])
 
     if results:
