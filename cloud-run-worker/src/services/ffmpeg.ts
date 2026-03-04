@@ -293,13 +293,15 @@ const BLUR_RETRY_OFFSETS = [0.25, 0.90, 0.15, 0.75]; // ratios within scene dura
 async function measureFrameSharpness(imagePath: string): Promise<number> {
   return new Promise((resolve, reject) => {
     const pythonPath = process.env.PYSCENE_PYTHON_PATH || '/opt/venv/bin/python3';
-    const script = [
-      'import cv2, sys',
-      'img = cv2.imread(sys.argv[1])',
-      'if img is None: print("0.0"); sys.exit(0)',
-      'gray = cv2.cvtColor(cv2.resize(img, (160, 120)), cv2.COLOR_BGR2GRAY)',
-      'print(f"{cv2.Laplacian(gray, cv2.CV_64F).var():.2f}")',
-    ].join('; ');
+    const script = `
+import cv2, sys
+img = cv2.imread(sys.argv[1])
+if img is None:
+    print("0.0")
+    sys.exit(0)
+gray = cv2.cvtColor(cv2.resize(img, (160, 120)), cv2.COLOR_BGR2GRAY)
+print(f"{cv2.Laplacian(gray, cv2.CV_64F).var():.2f}")
+`.trim();
 
     const proc = spawn(pythonPath, ['-c', script, imagePath], {
       timeout: 10000,
