@@ -57,9 +57,13 @@ def _compute_frame_signals(frame_bgr, cv2, np):
     lap_var_center = float(cv2.Laplacian(center, cv2.CV_64F).var())
     edges_center = cv2.Canny(center, 50, 150)
     edge_count_center = int(np.count_nonzero(edges_center))
-    # 4 ROI regions for telop animation detection
+    # ROI regions for telop animation detection (6 regions)
+    # Full frame catches full-screen wipe transitions
+    # lower_third covers the gap between center_text and bottom
     roi_edge_counts = {
+        "full": edge_count_full,
         "bottom": int(np.count_nonzero(cv2.Canny(gray[102:120, :], 50, 150))),
+        "lower_third": int(np.count_nonzero(cv2.Canny(gray[69:102, :], 50, 150))),
         "center_text": int(np.count_nonzero(cv2.Canny(gray[51:69, :], 50, 150))),
         "top_left": int(np.count_nonzero(cv2.Canny(gray[0:12, 0:40], 50, 150))),
         "top_right": int(np.count_nonzero(cv2.Canny(gray[0:12, 120:160], 50, 150))),
@@ -122,9 +126,9 @@ def detect_dissolves(
     edge_counts: List[float] = []
     lap_vars_center: List[float] = []
     edge_counts_center: List[float] = []
-    # ROI edge counts for telop animation detection (collected in same pass)
+    # ROI edge counts for telop animation detection (collected in same pass, 6 regions)
     roi_edge_series: Dict[str, List[int]] = {
-        "bottom": [], "center_text": [], "top_left": [], "top_right": []
+        "full": [], "bottom": [], "lower_third": [], "center_text": [], "top_left": [], "top_right": []
     }
     frame_indices: List[int] = []  # actual frame numbers
     frame_num = 0
@@ -449,7 +453,7 @@ def detect_telop_animations(
     roi_edge_series: Dict[str, List[int]],
     frame_indices: List[int],
     fps: float,
-    velocity_threshold: float = 0.15,
+    velocity_threshold: float = 0.10,
     settling_frames: int = 5,
     frame_step: int = 2,
 ) -> List[Dict[str, Any]]:
@@ -463,8 +467,21 @@ def detect_telop_animations(
       4. velocity > threshold → frame is "animating"
       5. velocity <= threshold for settling_frames consecutive frames → settled
       6. Output: [{region, start, settling}]
+
+    Regions: full, bottom, lower_third, center_text, top_left, top_right
+    The "full" region catches full-screen wipe transitions.
     """
     import numpy as np
+
+    # Per-region threshold multipliers (full frame needs higher threshold to avoid false positives)
+    region_threshold_scale = {
+        "full": 1.5,         # Full frame: higher threshold (more noise)
+        "bottom": 1.0,
+        "lower_third": 1.0,
+        "center_text": 1.0,
+        "top_left": 1.2,     # Small regions: slightly higher (more noise)
+        "top_right": 1.2,
+    }
 
     results: List[Dict[str, Any]] = []
 
@@ -487,8 +504,12 @@ def detect_telop_animations(
             kernel = np.ones(3) / 3.0
             velocity = np.convolve(velocity, kernel, mode='same')
 
+        # Apply per-region threshold
+        region_scale = region_threshold_scale.get(region, 1.0)
+        effective_threshold = velocity_threshold * region_scale
+
         # Detect animation periods
-        is_animating = velocity > velocity_threshold
+        is_animating = velocity > effective_threshold
         in_animation = False
         anim_start_idx = 0
         stable_count = 0
@@ -748,7 +769,7 @@ def main() -> int:
             # ============================================================
             telop_enabled = os.environ.get('TELOP_DETECTION_ENABLED', 'true').lower() == 'true'
             if telop_enabled and roi_edge_series and dissolve_frame_indices:
-                velocity_threshold = float(os.environ.get('TELOP_VELOCITY_THRESHOLD', '0.15'))
+                velocity_threshold = float(os.environ.get('TELOP_VELOCITY_THRESHOLD', '0.10'))
                 settling_frames = int(os.environ.get('TELOP_SETTLING_FRAMES', '5'))
                 telop_animations = detect_telop_animations(
                     roi_edge_series=roi_edge_series,
