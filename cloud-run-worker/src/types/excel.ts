@@ -62,6 +62,15 @@ export interface Scene {
 
   /** Path to extracted screenshot (set after frame extraction) */
   screenshotPath?: string;
+
+  /** Detection reason propagated from SceneCut (dissolve uses different captureRatio) */
+  detectionReason?: 'scene_change' | 'subtitle_change' | 'text_overlay_change' | 'dissolve_transition' | 'both';
+
+  /** Dissolve transition start time in seconds (for blur avoidance) */
+  dissolveStart?: number;
+
+  /** Dissolve transition end time in seconds (for blur avoidance) */
+  dissolveEnd?: number;
 }
 
 /**
@@ -77,8 +86,14 @@ export interface SceneCut {
   /** Detection source: full frame, ROI, or both (NEW: ROI detection) */
   source?: 'full_frame' | 'roi_bottom' | 'roi_center' | 'roi_top_left' | 'roi_top_right' | 'both';
 
-  /** Inferred detection reason based on source (NEW: ROI detection) */
-  detectionReason?: 'scene_change' | 'subtitle_change' | 'text_overlay_change' | 'both';
+  /** Inferred detection reason based on source (NEW: ROI detection + dissolve) */
+  detectionReason?: 'scene_change' | 'subtitle_change' | 'text_overlay_change' | 'dissolve_transition' | 'both';
+
+  /** Dissolve transition start time in seconds (for blur avoidance) */
+  dissolveStart?: number;
+
+  /** Dissolve transition end time in seconds (for blur avoidance) */
+  dissolveEnd?: number;
 }
 
 /**

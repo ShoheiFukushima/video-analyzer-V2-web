@@ -35,9 +35,16 @@ export interface TelopAnimation {
   settling: number; // animation settling time (seconds)
 }
 
+export interface PanAnimation {
+  start: number;      // pan start time (seconds)
+  settling: number;   // pan settling time (seconds)
+  direction: 'horizontal' | 'vertical' | 'diagonal';
+}
+
 interface PySceneOutput {
   cuts: PySceneResult[];
   telop_animations: TelopAnimation[];
+  pan_animations: PanAnimation[];
 }
 
 interface PySceneConfig {
@@ -106,7 +113,7 @@ export async function detectWithPyScene(
   videoPath: string,
   videoDuration?: number,
   onProgress?: SceneDetectionProgressCallback
-): Promise<{ cuts: SceneCut[]; telopAnimations: TelopAnimation[] }> {
+): Promise<{ cuts: SceneCut[]; telopAnimations: TelopAnimation[]; panAnimations: PanAnimation[] }> {
   const config = loadConfig();
   const startTime = Date.now();
 
@@ -159,7 +166,7 @@ export async function detectWithPyScene(
   }
 
   try {
-    const { results, telopAnimations } = await runPySceneProcess(videoPath, outputJson, config);
+    const { results, telopAnimations, panAnimations } = await runPySceneProcess(videoPath, outputJson, config);
 
     const cuts: SceneCut[] = results.map((r) => ({
       timestamp: Math.floor(r.timestamp * 1000) / 1000, // ミリ秒精度を保持（0.1s丸めによるカット消失を防止）
@@ -187,8 +194,17 @@ export async function detectWithPyScene(
         console.log(`    ... and ${telopAnimations.length - 5} more`);
       }
     }
+    if (panAnimations.length > 0) {
+      console.log(`  📷 [PyScene] Camera pans detected: ${panAnimations.length} regions`);
+      for (const pa of panAnimations.slice(0, 5)) {
+        console.log(`    ${pa.direction}: ${pa.start.toFixed(2)}s → ${pa.settling.toFixed(2)}s`);
+      }
+      if (panAnimations.length > 5) {
+        console.log(`    ... and ${panAnimations.length - 5} more`);
+      }
+    }
 
-    return { cuts, telopAnimations };
+    return { cuts, telopAnimations, panAnimations };
   } finally {
     if (timerInterval) clearInterval(timerInterval);
     // Cleanup output file
@@ -203,7 +219,7 @@ function runPySceneProcess(
   videoPath: string,
   outputJson: string,
   config: PySceneConfig
-): Promise<{ results: PySceneResult[]; telopAnimations: TelopAnimation[] }> {
+): Promise<{ results: PySceneResult[]; telopAnimations: TelopAnimation[]; panAnimations: PanAnimation[] }> {
   return new Promise((resolve, reject) => {
     let completed = false;
 
@@ -271,7 +287,8 @@ function runPySceneProcess(
         // Support both array (legacy) and object (new) format
         const results: PySceneResult[] = Array.isArray(parsed) ? parsed : parsed.cuts;
         const telopAnimations: TelopAnimation[] = Array.isArray(parsed) ? [] : (parsed.telop_animations || []);
-        resolve({ results, telopAnimations });
+        const panAnimations: PanAnimation[] = Array.isArray(parsed) ? [] : (parsed.pan_animations || []);
+        resolve({ results, telopAnimations, panAnimations });
       } catch (error) {
         reject(new Error(`Failed to parse PySceneDetect output: ${error}`));
       }

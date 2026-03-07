@@ -31,6 +31,8 @@ export interface AudioExtractionConfig {
   volumeNormalization?: boolean;
   /** Audio bitrate (default: 64k for speech) */
   bitrate?: string;
+  /** Apply VAD preprocessing filters in the same pass (BGM suppression + voice enhancement) */
+  withVADPreprocessing?: boolean;
 }
 
 const DEFAULT_CONFIG: Required<AudioExtractionConfig> = {
@@ -39,6 +41,7 @@ const DEFAULT_CONFIG: Required<AudioExtractionConfig> = {
   noiseReduction: true,
   volumeNormalization: true,
   bitrate: '64k',     // Sufficient for speech
+  withVADPreprocessing: false,
 };
 
 /**
@@ -98,7 +101,19 @@ export async function extractAudioForWhisper(
 
     // Build audio filters
     const filters: string[] = [];
-    if (finalConfig.volumeNormalization) {
+    if (finalConfig.withVADPreprocessing) {
+      // Combined filter chain: BGM suppression + voice enhancement + normalization
+      // This replaces the separate preprocessAudioForVAD() call, saving one FFmpeg pass
+      filters.push(
+        'highpass=f=80',
+        'lowpass=f=8000',
+        'equalizer=f=60:width_type=h:width=40:g=-10',
+        'equalizer=f=160:width_type=h:width=160:g=12',
+        'equalizer=f=3000:width_type=h:width=2000:g=6',
+        'afftdn=nr=10:nf=-40:tn=1',
+        'dynaudnorm=f=150:g=15'
+      );
+    } else if (finalConfig.volumeNormalization) {
       filters.push('dynaudnorm=f=150:g=15');
     }
 

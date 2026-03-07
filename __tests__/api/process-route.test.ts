@@ -66,7 +66,6 @@ function validBody(overrides: Record<string, unknown> = {}) {
     r2Key: VALID_R2_KEY,
     fileName: 'test.mp4',
     dataConsent: true,
-    detectionMode: 'standard',
     ...overrides,
   };
 }

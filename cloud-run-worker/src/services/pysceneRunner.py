@@ -115,12 +115,13 @@ def detect_dissolves(
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"[Dissolve] Error: Cannot open video: {video_path}", file=sys.stderr)
-        return []
+        return [], {}, [], fps, [], []
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     # ------------------------------------------------------------------
     # Pass 2a: Collect signals for all sampled frames
+    # Also collects phaseCorrelate motion magnitudes for camera pan detection
     # ------------------------------------------------------------------
     lap_vars: List[float] = []
     edge_counts: List[float] = []
@@ -131,6 +132,11 @@ def detect_dissolves(
         "full": [], "bottom": [], "lower_third": [], "center_text": [], "top_left": [], "top_right": []
     }
     frame_indices: List[int] = []  # actual frame numbers
+    # Camera pan detection: phaseCorrelate motion magnitudes
+    import math
+    motion_magnitudes: List[float] = []
+    motion_directions: List[str] = []  # 'horizontal', 'vertical', 'diagonal', 'none'
+    prev_gray_float = None
     frame_num = 0
     processed = 0
     log_interval = max(1, total_frames // 10)
@@ -153,6 +159,24 @@ def detect_dissolves(
             roi_edge_series[region_key].append(roi_ec[region_key])
         frame_indices.append(frame_num)
 
+        # Camera pan detection: compute phaseCorrelate between consecutive frames
+        gray_small = cv2.cvtColor(cv2.resize(frame, (160, 120)), cv2.COLOR_BGR2GRAY)
+        curr_float = gray_small.astype(np.float64)
+        if prev_gray_float is not None:
+            (dx, dy), _response = cv2.phaseCorrelate(prev_gray_float, curr_float)
+            motion = math.sqrt(dx * dx + dy * dy)
+            motion_magnitudes.append(motion)
+            if abs(dx) > abs(dy) * 2:
+                motion_directions.append('horizontal')
+            elif abs(dy) > abs(dx) * 2:
+                motion_directions.append('vertical')
+            else:
+                motion_directions.append('diagonal')
+        else:
+            motion_magnitudes.append(0.0)
+            motion_directions.append('none')
+        prev_gray_float = curr_float
+
         # Progress logging
         if frame_num > 0 and frame_num % log_interval == 0:
             pct = int(frame_num / total_frames * 100)
@@ -171,7 +195,7 @@ def detect_dissolves(
     if n < window_frames + 10:
         print(f"[Dissolve] Too few frames ({n}) for window size {window_frames}. "
               f"Skipping dissolve detection.", file=sys.stderr)
-        return [], roi_edge_series, frame_indices, fps
+        return [], roi_edge_series, frame_indices, fps, motion_magnitudes, motion_directions
 
     # ------------------------------------------------------------------
     # Pass 2b: Compute rolling median and detect dips
@@ -446,7 +470,7 @@ def detect_dissolves(
 
     print(f"[Dissolve] Completed: {len(cuts)} dissolve cuts detected "
           f"({processed} frames processed)", file=sys.stderr)
-    return cuts, roi_edge_series, frame_indices, fps
+    return cuts, roi_edge_series, frame_indices, fps, motion_magnitudes, motion_directions
 
 
 def detect_telop_animations(
@@ -619,6 +643,125 @@ def detect_telop_animations(
     return results
 
 
+def detect_camera_pans(
+    motion_magnitudes: List[float],
+    motion_directions: List[str],
+    frame_indices: List[int],
+    fps: float,
+    motion_threshold: float = 1.5,
+    min_pan_frames: int = 5,
+    settling_frames: int = 3,
+    frame_step: int = 2,
+) -> List[Dict[str, Any]]:
+    """
+    Detect camera pan (horizontal/vertical movement) periods from phaseCorrelate motion data.
+
+    Algorithm:
+      1. Smooth motion_magnitudes with rolling average (3-frame window)
+      2. Mark frames where smoothed motion > motion_threshold as "panning"
+      3. Consecutive panning frames >= min_pan_frames → pan region confirmed
+      4. Add settling_frames margin after each pan ends
+      5. Merge nearby pan regions (gap < 1.0s)
+      6. Output: [{start, settling, direction}]
+
+    Args:
+        motion_magnitudes: Per-frame motion magnitude from phaseCorrelate (px in 160x120 space)
+        motion_directions: Per-frame dominant direction ('horizontal', 'vertical', 'diagonal', 'none')
+        frame_indices: Actual frame numbers corresponding to each entry
+        fps: Video frame rate
+        motion_threshold: Minimum motion magnitude (px/frame at 160x120) to consider as panning
+        min_pan_frames: Minimum consecutive panning frames to confirm a pan
+        settling_frames: Extra margin frames after pan ends (camera settling time)
+        frame_step: Frame subsampling step used during signal collection
+    """
+    import numpy as np
+
+    n = len(motion_magnitudes)
+    if n < min_pan_frames + 2:
+        print(f"[Pan] Too few frames ({n}) for pan detection", file=sys.stderr)
+        return []
+
+    # Step 1: Smooth with rolling average (3-frame window)
+    arr = np.array(motion_magnitudes, dtype=np.float64)
+    kernel = np.ones(3) / 3.0
+    smoothed = np.convolve(arr, kernel, mode='same')
+
+    # Step 2: Mark panning frames
+    is_panning = smoothed > motion_threshold
+
+    # Step 3: Find consecutive panning regions
+    pan_regions = []
+    start_idx = None
+    for i in range(n):
+        if is_panning[i]:
+            if start_idx is None:
+                start_idx = i
+        else:
+            if start_idx is not None:
+                length = i - start_idx
+                if length >= min_pan_frames:
+                    pan_regions.append((start_idx, i - 1))
+                start_idx = None
+    # Handle pan that extends to end
+    if start_idx is not None:
+        length = n - start_idx
+        if length >= min_pan_frames:
+            pan_regions.append((start_idx, n - 1))
+
+    if not pan_regions:
+        print(f"[Pan] No camera pans detected (threshold={motion_threshold})", file=sys.stderr)
+        return []
+
+    # Step 4: Add settling margin and convert to timestamps
+    results = []
+    for (s_idx, e_idx) in pan_regions:
+        # Add settling frames margin
+        end_with_settling = min(e_idx + settling_frames, n - 1)
+
+        start_time = frame_indices[s_idx] / fps
+        settling_time = frame_indices[end_with_settling] / fps
+
+        # Determine dominant direction by majority vote
+        directions = motion_directions[s_idx:e_idx + 1]
+        dir_counts = {}
+        for d in directions:
+            if d != 'none':
+                dir_counts[d] = dir_counts.get(d, 0) + 1
+        dominant_dir = max(dir_counts, key=dir_counts.get) if dir_counts else 'horizontal'
+
+        results.append({
+            "start": round(start_time, 3),
+            "settling": round(settling_time, 3),
+            "direction": dominant_dir,
+        })
+
+    # Step 5: Merge nearby pan regions (gap < 1.0s)
+    if len(results) > 1:
+        merged = [results[0]]
+        for r in results[1:]:
+            prev = merged[-1]
+            if r["start"] - prev["settling"] < 1.0:
+                # Merge: extend previous region
+                prev["settling"] = r["settling"]
+                # Keep the longer direction
+            else:
+                merged.append(r)
+        results = merged
+
+    print(f"[Pan] Detected {len(results)} camera pan periods:", file=sys.stderr)
+    for r in results[:10]:
+        avg_motion = np.mean(smoothed[
+            max(0, next(i for i, fi in enumerate(frame_indices) if fi / fps >= r["start"])):
+            next((i for i, fi in enumerate(frame_indices) if fi / fps >= r["settling"]), n)
+        ]) if n > 0 else 0
+        print(f"    {r['direction']}: {r['start']:.2f}s → {r['settling']:.2f}s "
+              f"(duration={r['settling'] - r['start']:.2f}s)", file=sys.stderr)
+    if len(results) > 10:
+        print(f"    ... and {len(results) - 10} more", file=sys.stderr)
+
+    return results
+
+
 def merge_and_deduplicate(
     hard_cuts: List[Dict[str, Any]],
     dissolve_cuts: List[Dict[str, Any]],
@@ -783,10 +926,12 @@ def main() -> int:
         # Also collects ROI edge signals for telop animation detection
         # ============================================================
         telop_animations: List[Dict[str, Any]] = []
+        pan_animations: List[Dict[str, Any]] = []
         roi_edge_series = None
 
         if args.enable_dissolve:
-            dissolve_cuts, roi_edge_series, dissolve_frame_indices, dissolve_fps = detect_dissolves(
+            dissolve_cuts, roi_edge_series, dissolve_frame_indices, dissolve_fps, \
+                dissolve_motion_mags, dissolve_motion_dirs = detect_dissolves(
                 video_path=video_path,
                 fps=fps,
                 dip_threshold=args.dissolve_dip_ratio,
@@ -831,15 +976,35 @@ def main() -> int:
                     settling_frames=settling_frames,
                     frame_step=args.frame_step,
                 )
+
+            # ============================================================
+            # Pass 4: Camera Pan Detection (uses motion signals from Pass 2)
+            # ============================================================
+            pan_enabled = os.environ.get('PAN_DETECTION_ENABLED', 'true').lower() == 'true'
+            if pan_enabled and dissolve_motion_mags and dissolve_frame_indices:
+                pan_motion_threshold = float(os.environ.get('PAN_MOTION_THRESHOLD', '1.5'))
+                pan_min_frames = int(os.environ.get('PAN_MIN_FRAMES', '5'))
+                pan_settling_frames = int(os.environ.get('PAN_SETTLING_FRAMES', '3'))
+                pan_animations = detect_camera_pans(
+                    motion_magnitudes=dissolve_motion_mags,
+                    motion_directions=dissolve_motion_dirs,
+                    frame_indices=dissolve_frame_indices,
+                    fps=dissolve_fps,
+                    motion_threshold=pan_motion_threshold,
+                    min_pan_frames=pan_min_frames,
+                    settling_frames=pan_settling_frames,
+                    frame_step=args.frame_step,
+                )
         else:
             results = hard_cuts
 
         print(f"[PyScene] {len(results)} total scene cuts", file=sys.stderr)
 
-        # Output as object format (supports both cuts and telop_animations)
+        # Output as object format (supports cuts, telop_animations, and pan_animations)
         output = {
             "cuts": results,
             "telop_animations": telop_animations,
+            "pan_animations": pan_animations,
         }
 
         with open(output_json, 'w', encoding='utf-8') as f:

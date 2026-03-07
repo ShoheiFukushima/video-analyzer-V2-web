@@ -12,7 +12,7 @@ import pLimit from 'p-limit';
 import { Scene, SceneCut, VideoMetadata } from '../types/excel.js';
 import { formatTimecode } from '../utils/timecode.js';
 import { TIMEOUTS } from '../config/timeouts.js';
-import type { TelopAnimation } from './pysceneDetector.js';
+import type { TelopAnimation, PanAnimation } from './pysceneDetector.js';
 
 // Concurrency limit for parallel frame extraction
 // Balanced for 4 vCPU Cloud Run instance
@@ -78,15 +78,20 @@ async function generateSceneRanges(
   cuts: SceneCut[],
   videoDuration: number,
   minSceneDuration: number = 0.2,
-  telopAnimations: TelopAnimation[] = []
+  telopAnimations: TelopAnimation[] = [],
+  panAnimations: PanAnimation[] = []
 ): Promise<Scene[]> {
   const scenes: Scene[] = [];
   let sceneNumber = 1;
   let telopAdjustCount = 0;
+  let panAdjustCount = 0;
 
   console.log(`📐 Generating scene ranges from ${cuts.length} cuts...`);
   if (telopAnimations.length > 0) {
     console.log(`  🎯 Telop animations: ${telopAnimations.length} regions for midTime avoidance`);
+  }
+  if (panAnimations.length > 0) {
+    console.log(`  📷 Camera pans: ${panAnimations.length} regions for midTime avoidance`);
   }
 
   for (let i = 0; i < cuts.length; i++) {
@@ -109,6 +114,14 @@ async function generateSceneRanges(
     const dissolveEnd = cuts[i].dissolveEnd;
     let midTime = (i === 0) ? 0 : startTime + (endTime - startTime) * 0.5;
 
+    // Debug: Log scene details for dissolve diagnosis
+    if (i > 0) {
+      const nextCut = i < cuts.length - 1 ? cuts[i + 1] : null;
+      console.log(`  📊 Scene ${sceneNumber}: start=${startTime.toFixed(2)}s end=${endTime.toFixed(2)}s midTime=${midTime.toFixed(2)}s` +
+        (isDissolve ? ` [dissolve: ${dissolveStart?.toFixed(2)}-${dissolveEnd?.toFixed(2)}]` : '') +
+        (nextCut?.detectionReason === 'dissolve_transition' ? ` [next dissolve: ${nextCut.dissolveStart?.toFixed(2)}-${nextCut.dissolveEnd?.toFixed(2)}]` : ''));
+    }
+
     // Telop animation avoidance: shift midTime if it falls within an animation region
     if (i > 0 && telopAnimations.length > 0) {
       for (const ta of telopAnimations) {
@@ -125,6 +138,26 @@ async function generateSceneRanges(
           // else: no safe position, keep original midTime
           telopAdjustCount++;
           break; // Only adjust for the first overlapping animation
+        }
+      }
+    }
+
+    // Camera pan avoidance: shift midTime if it falls within a pan region
+    if (i > 0 && panAnimations.length > 0) {
+      for (const pa of panAnimations) {
+        if (midTime >= pa.start && midTime <= pa.settling) {
+          const afterSettling = pa.settling + 0.2;
+          const beforeStart = pa.start - 0.2;
+          if (afterSettling < endTime) {
+            console.log(`  📷 Scene ${sceneNumber}: midTime ${midTime.toFixed(2)}s in camera pan (${pa.direction} ${pa.start.toFixed(2)}-${pa.settling.toFixed(2)}s) → shifted to ${afterSettling.toFixed(2)}s`);
+            midTime = afterSettling;
+          } else if (beforeStart > startTime) {
+            console.log(`  📷 Scene ${sceneNumber}: midTime ${midTime.toFixed(2)}s in camera pan (${pa.direction} ${pa.start.toFixed(2)}-${pa.settling.toFixed(2)}s) → shifted to ${beforeStart.toFixed(2)}s`);
+            midTime = beforeStart;
+          }
+          // else: no safe position, keep original midTime
+          panAdjustCount++;
+          break; // Only adjust for the first overlapping pan
         }
       }
     }
@@ -146,6 +179,9 @@ async function generateSceneRanges(
   console.log(`✅ Generated ${scenes.length} valid scene ranges`);
   if (telopAdjustCount > 0) {
     console.log(`  🎯 Adjusted ${telopAdjustCount} midTimes to avoid telop animations`);
+  }
+  if (panAdjustCount > 0) {
+    console.log(`  📷 Adjusted ${panAdjustCount} midTimes to avoid camera pans`);
   }
   return scenes;
 }
@@ -282,6 +318,21 @@ const DEFAULT_SHARPNESS_THRESHOLD = 100;
 /** How many candidate positions to try when a frame is blurry */
 const BLUR_RETRY_OFFSETS = [0.25, 0.90, 0.15, 0.75]; // ratios within scene duration
 
+// ============================================================
+// Dissolve Detection Thresholds (Phase A: logging only)
+// ============================================================
+const DEFAULT_DISSOLVE_EDGE_RATIO_THRESHOLD = 0.08;
+const DEFAULT_DISSOLVE_LOCAL_CONTRAST_THRESHOLD = 25.0;
+
+/**
+ * Frame quality metrics for dissolve detection
+ */
+interface FrameQuality {
+  sharpness: number;      // Laplacian variance (existing metric)
+  edgeRatio: number;      // Canny edge pixel ratio (0.0-1.0)
+  localContrast: number;  // Mean of 8x8 patch standard deviations
+}
+
 /**
  * Measure frame sharpness using Laplacian variance via Python+OpenCV.
  * Returns a numeric sharpness score (higher = sharper).
@@ -334,100 +385,74 @@ print(f"{cv2.Laplacian(gray, cv2.CV_64F).var():.2f}")
   });
 }
 
+
 /**
- * Extract a frame with blur avoidance.
- * If the extracted frame is blurry (Laplacian variance below threshold),
- * try alternative positions within the scene and pick the sharpest one.
+ * Measure frame quality with multiple metrics for dissolve detection.
+ * Returns sharpness (Laplacian variance), edge ratio (Canny), and local contrast
+ * in a single Python+OpenCV call.
  *
- * @param videoPath - Path to video file
- * @param scene - Scene with startTime, endTime, midTime
- * @param outputPath - Output PNG path
- * @param videoMetadata - Video metadata for adaptive resizing
- * @param targetWidth - Target width for resizing
- * @param sharpnessThreshold - Minimum Laplacian variance (default: 100)
+ * Phase A: Used for logging metrics to calibrate dissolve thresholds.
+ *
+ * @param imagePath - Path to PNG frame file
+ * @returns FrameQuality metrics
  */
-async function extractFrameWithBlurAvoidance(
-  videoPath: string,
-  scene: Scene,
-  outputPath: string,
-  videoMetadata?: VideoMetadata,
-  targetWidth?: number,
-  sharpnessThreshold?: number,
-): Promise<void> {
-  const threshold = sharpnessThreshold ?? parseFloat(process.env.BLUR_SHARPNESS_THRESHOLD || String(DEFAULT_SHARPNESS_THRESHOLD));
+async function measureFrameQuality(imagePath: string): Promise<FrameQuality> {
+  return new Promise((resolve) => {
+    const pythonPath = process.env.PYSCENE_PYTHON_PATH || '/opt/venv/bin/python3';
+    const script = `
+import cv2, sys, json
+import numpy as np
+img = cv2.imread(sys.argv[1])
+if img is None:
+    print(json.dumps({"sharpness": 0, "edgeRatio": 0, "localContrast": 0}))
+    sys.exit(0)
+gray = cv2.cvtColor(cv2.resize(img, (160, 120)), cv2.COLOR_BGR2GRAY)
+sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+edges = cv2.Canny(gray, 50, 150)
+edge_ratio = float(edges.sum() / 255) / (160 * 120)
+h, w = gray.shape
+patch_stds = []
+for y in range(0, h - 7, 8):
+    for x in range(0, w - 7, 8):
+        patch_stds.append(float(gray[y:y+8, x:x+8].std()))
+local_contrast = float(np.mean(patch_stds))
+print(json.dumps({"sharpness": round(sharpness, 2), "edgeRatio": round(edge_ratio, 4), "localContrast": round(local_contrast, 2)}))
+`.trim();
 
-  // First attempt: extract at calculated midTime
-  await extractFrameAtTime(videoPath, scene.midTime, outputPath, videoMetadata, targetWidth);
+    const proc = spawn(pythonPath, ['-c', script, imagePath], {
+      timeout: 15000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
 
-  // Check sharpness
-  const sharpness = await measureFrameSharpness(outputPath);
+    let stdout = '';
+    let stderr = '';
 
-  if (sharpness >= threshold) {
-    return; // Frame is sharp enough
-  }
+    proc.stdout?.on('data', (data: Buffer) => { stdout += data.toString(); });
+    proc.stderr?.on('data', (data: Buffer) => { stderr += data.toString(); });
 
-  console.log(`  🔍 Scene ${scene.sceneNumber}: blurry frame (sharpness=${sharpness.toFixed(1)} < ${threshold}) at ${scene.midTime.toFixed(2)}s, trying alternatives...`);
-
-  // Try alternative positions
-  const duration = scene.endTime - scene.startTime;
-  let bestScore = sharpness;
-  let bestPath = outputPath;
-
-  // Build candidate timestamps, avoiding known dissolve zones
-  const candidates: number[] = [];
-  for (const ratio of BLUR_RETRY_OFFSETS) {
-    let t = scene.startTime + duration * ratio;
-    // Skip candidates within dissolve zone
-    if (scene.dissolveStart != null && scene.dissolveEnd != null) {
-      if (t >= scene.dissolveStart && t <= scene.dissolveEnd) {
-        continue;
-      }
-    }
-    // Clamp to scene boundaries with margin
-    t = Math.max(scene.startTime + 0.1, Math.min(t, scene.endTime - 0.1));
-    candidates.push(t);
-  }
-
-  const dir = path.dirname(outputPath);
-  const ext = path.extname(outputPath);
-  const base = path.basename(outputPath, ext);
-
-  for (let i = 0; i < candidates.length; i++) {
-    const candidatePath = path.join(dir, `${base}_candidate${i}${ext}`);
-    try {
-      await extractFrameAtTime(videoPath, candidates[i], candidatePath, videoMetadata, targetWidth);
-      const score = await measureFrameSharpness(candidatePath);
-
-      if (score > bestScore) {
-        // Clean up previous best if it was a candidate
-        if (bestPath !== outputPath) {
-          await fs.unlink(bestPath).catch(() => {});
+    proc.on('close', (code) => {
+      if (code === 0 && stdout.trim()) {
+        try {
+          const result = JSON.parse(stdout.trim());
+          if (typeof result.sharpness === 'number' &&
+              typeof result.edgeRatio === 'number' &&
+              typeof result.localContrast === 'number') {
+            resolve(result as FrameQuality);
+            return;
+          }
+        } catch {
+          // JSON parse failed, fall through
         }
-        bestScore = score;
-        bestPath = candidatePath;
-
-        // If sharp enough, stop early
-        if (score >= threshold) {
-          break;
-        }
-      } else {
-        // Clean up this candidate
-        await fs.unlink(candidatePath).catch(() => {});
       }
-    } catch (err) {
-      // Candidate extraction failed, skip
-      await fs.unlink(candidatePath).catch(() => {});
-    }
-  }
+      console.warn(`⚠️ Frame quality check failed (code=${code}): ${stderr.trim()}`);
+      resolve({ sharpness: 0, edgeRatio: 0, localContrast: 0 });
+    });
 
-  // If we found a better frame, replace the original
-  if (bestPath !== outputPath) {
-    await fs.unlink(outputPath).catch(() => {});
-    await fs.rename(bestPath, outputPath);
-    console.log(`  ✅ Scene ${scene.sceneNumber}: replaced with sharper frame (sharpness=${bestScore.toFixed(1)}, was ${sharpness.toFixed(1)})`);
-  } else {
-    console.log(`  ⚠️ Scene ${scene.sceneNumber}: no sharper alternative found (best=${bestScore.toFixed(1)}), keeping original`);
-  }
+    proc.on('error', (err) => {
+      console.warn(`⚠️ Frame quality check spawn error: ${err.message}`);
+      resolve({ sharpness: 0, edgeRatio: 0, localContrast: 0 });
+    });
+  });
 }
 
 /**
@@ -650,6 +675,7 @@ export async function detectScenesOnly(
   const pyResult = await detectWithPyScene(videoPath, videoMetadata.duration, onProgress);
   const cuts = pyResult.cuts;
   const telopAnimations = pyResult.telopAnimations;
+  const panAnimations = pyResult.panAnimations;
   console.log(`  ✓ PySceneDetect: ${cuts.length} cuts detected`);
 
   if (cuts.length === 0) {
@@ -657,7 +683,7 @@ export async function detectScenesOnly(
     cuts.push({ timestamp: 0, confidence: 0.03 });
   }
 
-  const scenes = await generateSceneRanges(cuts, videoMetadata.duration, 0.2, telopAnimations);
+  const scenes = await generateSceneRanges(cuts, videoMetadata.duration, 0.2, telopAnimations, panAnimations);
 
   console.log(`✅ Detected ${scenes.length} scenes (frames will be extracted in batches)`);
 
@@ -687,33 +713,93 @@ export async function extractFramesForBatch(
   const startTime = Date.now();
 
   // Count dissolve scenes for logging
-  const dissolveCount = scenes.filter(s => s.detectionReason === 'dissolve_transition').length;
   const widthInfo = targetWidth ? ` at ${targetWidth}px` : '';
-  const blurInfo = blurAvoidanceEnabled ? `, blur avoidance: ON (${dissolveCount} dissolve scenes)` : '';
+  const blurInfo = blurAvoidanceEnabled ? `, blur avoidance: ON (all scenes)` : '';
   console.log(`  📸 Extracting ${scenes.length} frames${widthInfo} (batch, concurrency: ${BATCH_FRAME_EXTRACTION_CONCURRENCY}${blurInfo})...`);
 
   let blurRetryCount = 0;
+  let dissolveDetectedCount = 0;
+
+  // Dissolve detection thresholds (Phase A: logging only)
+  const dissolveEdgeThreshold = parseFloat(
+    process.env.DISSOLVE_EDGE_RATIO_THRESHOLD || String(DEFAULT_DISSOLVE_EDGE_RATIO_THRESHOLD)
+  );
+  const dissolveContrastThreshold = parseFloat(
+    process.env.DISSOLVE_LOCAL_CONTRAST_THRESHOLD || String(DEFAULT_DISSOLVE_LOCAL_CONTRAST_THRESHOLD)
+  );
 
   await Promise.all(
     scenes.map((scene) =>
       limit(async () => {
         const filename = path.join(framesDir, `scene-${scene.sceneNumber.toString().padStart(4, '0')}.png`);
 
-        if (blurAvoidanceEnabled && scene.detectionReason === 'dissolve_transition') {
-          // Use blur avoidance for dissolve scenes
-          const sharpnessBefore = await (async () => {
-            await extractFrameAtTime(videoPath, scene.midTime, filename, videoMetadata, targetWidth);
-            return measureFrameSharpness(filename);
-          })();
+        await extractFrameAtTime(videoPath, scene.midTime, filename, videoMetadata, targetWidth);
+
+        if (blurAvoidanceEnabled) {
+          // Apply blur avoidance to ALL scenes (not just dissolve-tagged ones)
+          // Internal dissolves within a scene may not be tagged as dissolve_transition
+          const sharpness = await measureFrameSharpness(filename);
           const threshold = parseFloat(process.env.BLUR_SHARPNESS_THRESHOLD || String(DEFAULT_SHARPNESS_THRESHOLD));
-          if (sharpnessBefore < threshold) {
+          if (sharpness < threshold) {
+            console.log(`  🔍 Scene ${scene.sceneNumber}: blurry (sharpness=${sharpness.toFixed(1)}, threshold=${threshold}), trying alternatives...`);
             blurRetryCount++;
-            // Clean up and use blur avoidance
-            await fs.unlink(filename).catch(() => {});
-            await extractFrameWithBlurAvoidance(videoPath, scene, filename, videoMetadata, targetWidth);
+            // Try alternative positions within the scene
+            const duration = scene.endTime - scene.startTime;
+            let bestScore = sharpness;
+            let bestPath = filename;
+            const dir = path.dirname(filename);
+            const ext = path.extname(filename);
+            const base = path.basename(filename, ext);
+
+            for (let ci = 0; ci < BLUR_RETRY_OFFSETS.length; ci++) {
+              let t = scene.startTime + duration * BLUR_RETRY_OFFSETS[ci];
+              // Skip candidates within dissolve zone if known
+              if (scene.dissolveStart != null && scene.dissolveEnd != null) {
+                if (t >= scene.dissolveStart && t <= scene.dissolveEnd) continue;
+              }
+              t = Math.max(scene.startTime + 0.1, Math.min(t, scene.endTime - 0.1));
+
+              const candidatePath = path.join(dir, `${base}_cand${ci}${ext}`);
+              try {
+                await extractFrameAtTime(videoPath, t, candidatePath, videoMetadata, targetWidth);
+                const score = await measureFrameSharpness(candidatePath);
+                if (score > bestScore) {
+                  if (bestPath !== filename) await fs.unlink(bestPath).catch(() => {});
+                  bestScore = score;
+                  bestPath = candidatePath;
+                  if (score >= threshold) break;
+                } else {
+                  await fs.unlink(candidatePath).catch(() => {});
+                }
+              } catch {
+                await fs.unlink(candidatePath).catch(() => {});
+              }
+            }
+
+            if (bestPath !== filename) {
+              await fs.unlink(filename).catch(() => {});
+              await fs.rename(bestPath, filename);
+              console.log(`  ✅ Scene ${scene.sceneNumber}: replaced with sharper frame (sharpness=${bestScore.toFixed(1)}, was ${sharpness.toFixed(1)})`);
+            } else {
+              console.log(`  ⚠️ Scene ${scene.sceneNumber}: no sharper alternative found (best=${bestScore.toFixed(1)}), keeping original`);
+            }
           }
-        } else {
-          await extractFrameAtTime(videoPath, scene.midTime, filename, videoMetadata, targetWidth);
+
+          // Phase A: Dissolve quality metrics logging (after blur avoidance)
+          // Measure full quality metrics on the final frame to collect data for threshold calibration
+          const quality = await measureFrameQuality(filename);
+          const isDissolveCandidate =
+            quality.sharpness >= threshold &&
+            quality.edgeRatio < dissolveEdgeThreshold &&
+            quality.localContrast < dissolveContrastThreshold;
+
+          if (isDissolveCandidate) {
+            dissolveDetectedCount++;
+            console.log(`  🔬 Scene ${scene.sceneNumber}: DISSOLVE-LIKE (sharpness=${quality.sharpness.toFixed(1)}, edgeRatio=${quality.edgeRatio.toFixed(4)}, localContrast=${quality.localContrast.toFixed(1)}) ← passed blur check but may be dissolve`);
+          } else {
+            // Log all metrics at debug level for threshold calibration
+            console.log(`  📊 Scene ${scene.sceneNumber}: quality OK (sharpness=${quality.sharpness.toFixed(1)}, edgeRatio=${quality.edgeRatio.toFixed(4)}, localContrast=${quality.localContrast.toFixed(1)})`);
+          }
         }
 
         // Set screenshot path
@@ -724,7 +810,8 @@ export async function extractFramesForBatch(
 
   const elapsed = Date.now() - startTime;
   const retryInfo = blurRetryCount > 0 ? `, ${blurRetryCount} blur retries` : '';
-  console.log(`  ⚡ Batch frame extraction: ${scenes.length} frames in ${(elapsed / 1000).toFixed(1)}s${retryInfo}`);
+  const dissolveInfo = dissolveDetectedCount > 0 ? `, ${dissolveDetectedCount} dissolve-like frames detected` : '';
+  console.log(`  ⚡ Batch frame extraction: ${scenes.length} frames in ${(elapsed / 1000).toFixed(1)}s${retryInfo}${dissolveInfo}`);
 
   return scenes;
 }

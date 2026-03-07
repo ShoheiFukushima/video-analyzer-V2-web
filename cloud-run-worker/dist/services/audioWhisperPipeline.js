@@ -6,6 +6,7 @@ import { processAudioWithVAD, extractAudioChunk, cleanupVADFiles } from './vadSe
 import { splitAudioIntoChunks, cleanupPreChunks, getAudioMetadata } from './audioExtractor.js';
 import { getVADConfig, WHISPER_COST, DEFAULT_PRE_CHUNK_CONFIG } from '../config/vad.js';
 import { addCompletedAudioChunks, WHISPER_CHECKPOINT_INTERVAL, } from './checkpointService.js';
+import { getWhisperRateLimiter, isRetryableError } from './rateLimiter.js';
 /**
  * VAD + Whisper Integration Pipeline
  *
@@ -463,6 +464,17 @@ function validateChunkFile(chunk, uploadId) {
     return true;
 }
 /**
+ * Get file size synchronously, return -1 if file doesn't exist
+ */
+function getFileSizeSync(filePath) {
+    try {
+        return fs.statSync(filePath).size;
+    }
+    catch {
+        return -1;
+    }
+}
+/**
  * Prepare Whisper API request parameters
  *
  * @param chunk - Audio chunk metadata
@@ -486,8 +498,76 @@ function prepareWhisperRequest(chunk) {
  * @returns Whisper API response
  */
 async function callWhisperAPI(params) {
-    const response = await openai.audio.transcriptions.create(params);
-    return response;
+    try {
+        const response = await openai.audio.transcriptions.create(params);
+        return response;
+    }
+    catch (error) {
+        // Extract detailed error info from OpenAI SDK errors
+        const details = extractOpenAIErrorDetails(error);
+        if (details) {
+            throw new Error(details);
+        }
+        throw error;
+    }
+}
+/**
+ * Extract detailed error information from OpenAI SDK errors
+ *
+ * OpenAI SDK wraps errors into typed classes (APIError, APIConnectionError, etc.)
+ * with status, code, type, cause, and request_id fields. This function extracts
+ * all available information for better debugging.
+ */
+function extractOpenAIErrorDetails(error) {
+    if (!error || typeof error !== 'object')
+        return null;
+    const err = error;
+    const parts = [];
+    // Error class name (e.g., APIConnectionError, RateLimitError)
+    const className = err.constructor?.name;
+    if (className && className !== 'Error') {
+        parts.push(`[${className}]`);
+    }
+    // HTTP status code
+    if (err.status !== undefined) {
+        parts.push(`status=${err.status}`);
+    }
+    // Error code from OpenAI (e.g., "insufficient_quota", "invalid_api_key")
+    if (err.code) {
+        parts.push(`code=${err.code}`);
+    }
+    // Error type (e.g., "invalid_request_error", "server_error")
+    if (err.type) {
+        parts.push(`type=${err.type}`);
+    }
+    // Request ID for OpenAI support
+    if (err.request_id) {
+        parts.push(`request_id=${err.request_id}`);
+    }
+    // Original message
+    if (err.message) {
+        parts.push(String(err.message));
+    }
+    // Cause chain (APIConnectionError stores the original error in cause)
+    if (err.cause) {
+        const cause = err.cause;
+        const causeInfo = [];
+        if (cause.code)
+            causeInfo.push(`code=${cause.code}`);
+        if (cause.syscall)
+            causeInfo.push(`syscall=${cause.syscall}`);
+        if (cause.hostname)
+            causeInfo.push(`host=${cause.hostname}`);
+        if (cause.port)
+            causeInfo.push(`port=${cause.port}`);
+        if (cause.message && cause.message !== err.message) {
+            causeInfo.push(String(cause.message));
+        }
+        if (causeInfo.length > 0) {
+            parts.push(`cause: {${causeInfo.join(', ')}}`);
+        }
+    }
+    return parts.length > 0 ? parts.join(' ') : null;
 }
 /**
  * Parse Whisper API response into transcription segments
@@ -532,52 +612,44 @@ function shouldRetry(error) {
     return !(errorMessage.includes('API key') || errorMessage.includes('Invalid'));
 }
 /**
- * Transcribe a single audio chunk with Whisper (with retry logic)
+ * Transcribe a single audio chunk with Whisper (rate-limited with retry)
+ *
+ * Uses the Whisper rate limiter singleton for concurrency control,
+ * sliding window rate limiting, and exponential backoff with jitter.
  *
  * @param chunk - Audio chunk metadata
  * @param uploadId - Upload ID for logging
  * @returns Transcription segments (relative to chunk start)
  */
 async function transcribeAudioChunk(chunk, uploadId) {
-    const maxRetries = 3;
-    const baseDelay = 1000; // 1 second
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            // 1. Validate chunk file exists
-            if (!validateChunkFile(chunk, uploadId)) {
-                return []; // Abort, no retry for missing files
-            }
-            // 2. Prepare Whisper API request
-            const params = prepareWhisperRequest(chunk);
-            // 3. Call Whisper API
-            const responseData = await callWhisperAPI(params);
-            // 4. Parse response into transcription segments
-            return parseWhisperResponse(responseData, chunk);
-        }
-        catch (error) {
-            const err = error;
-            // Check if it's a fatal error (don't retry)
-            if (!shouldRetry(err)) {
-                console.error(`[${uploadId}] Fatal Whisper error (no retry): ${err.message}`);
-                return []; // Abort
-            }
-            // Retry on temporary errors
-            console.warn(`[${uploadId}] Whisper API attempt ${attempt}/${maxRetries} failed for chunk ${chunk.chunkIndex}:`, err.message);
-            if (attempt < maxRetries) {
-                // Exponential backoff: 1s, 2s, 4s
-                const delay = baseDelay * Math.pow(2, attempt - 1);
-                console.log(`[${uploadId}] Retrying in ${delay}ms...`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-            }
-            else {
-                // Final attempt failed
-                console.error(`[${uploadId}] All ${maxRetries} attempts failed for chunk ${chunk.chunkIndex}`);
-                return [];
-            }
-        }
+    // 1. Validate chunk file exists (no retry for missing files)
+    if (!validateChunkFile(chunk, uploadId)) {
+        return [];
     }
-    // Should never reach here, but TypeScript requires it
-    return [];
+    try {
+        const rateLimiter = getWhisperRateLimiter();
+        const responseData = await rateLimiter.executeWithRetry(async () => {
+            const params = prepareWhisperRequest(chunk);
+            return await callWhisperAPI(params);
+        }, (error) => {
+            const err = error;
+            // Don't retry fatal errors (API key issues, invalid requests)
+            if (!shouldRetry(err)) {
+                return false;
+            }
+            return isRetryableError(error);
+        });
+        return parseWhisperResponse(responseData, chunk);
+    }
+    catch (error) {
+        const err = error;
+        console.error(`[${uploadId}] Whisper API failed for chunk ${chunk.chunkIndex} after all retries: ${err.message}`);
+        // Log first failure details for diagnosis (only first chunk to avoid log spam)
+        if (chunk.chunkIndex === 0 || chunk.chunkIndex % 50 === 0) {
+            console.error(`[${uploadId}] [WhisperDiag] chunk=${chunk.chunkIndex} file=${chunk.filePath} size=${getFileSizeSync(chunk.filePath)} error_type=${err.constructor?.name} stack=${err.stack?.split('\n').slice(0, 3).join(' | ')}`);
+        }
+        return [];
+    }
 }
 /**
  * Create fallback audio chunks (fixed 30-second intervals)

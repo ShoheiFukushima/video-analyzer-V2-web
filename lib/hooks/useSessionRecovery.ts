@@ -12,7 +12,24 @@ import { useAuth, useClerk } from "@clerk/nextjs";
  * - Network reconnection
  *
  * Automatically refreshes Clerk session token when needed.
+ * Includes exponential backoff retry for 429 (rate limit) errors.
  */
+
+const MAX_RETRY_ATTEMPTS = 3;
+const BASE_RETRY_DELAY_MS = 1000;
+
+function is429Error(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const err = error as Record<string, unknown>;
+  if (err.status === 429) return true;
+  const message = String(err.message ?? "");
+  return message.includes("429") || message.includes("rate limit") || message.includes("Too Many Requests");
+}
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export function useSessionRecovery() {
   const { isSignedIn, getToken } = useAuth();
   const { session } = useClerk();
@@ -32,26 +49,52 @@ export function useSessionRecovery() {
       if (timeSinceActive > 5 * 60 * 1000) {
         console.log("[SessionRecovery] Refreshing session after inactivity...");
 
-        // Force token refresh by getting a fresh token
-        const token = await getToken({ skipCache: true });
+        // Force token refresh with retry on 429
+        let token: string | null = null;
+        for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+          try {
+            token = await getToken({ skipCache: true });
+            break;
+          } catch (tokenError) {
+            if (is429Error(tokenError) && attempt < MAX_RETRY_ATTEMPTS) {
+              const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+              console.warn(
+                `[SessionRecovery] getToken() 429 rate limited, retry ${attempt}/${MAX_RETRY_ATTEMPTS} after ${delay}ms`
+              );
+              await sleep(delay);
+              continue;
+            }
+            throw tokenError;
+          }
+        }
 
         if (token) {
           console.log("[SessionRecovery] Session refreshed successfully");
         } else {
           console.warn("[SessionRecovery] Failed to refresh token, session may be expired");
-          // Session might be expired, Clerk will handle redirect to sign-in
         }
       }
     } catch (error) {
       console.error("[SessionRecovery] Error refreshing session:", error);
 
-      // If session refresh fails, try to touch the session
-      try {
-        await session?.touch();
-        console.log("[SessionRecovery] Session touched successfully");
-      } catch (touchError) {
-        console.error("[SessionRecovery] Session touch failed:", touchError);
-        // User may need to re-login
+      // If session refresh fails, try to touch the session with retry on 429
+      for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+        try {
+          await session?.touch();
+          console.log("[SessionRecovery] Session touched successfully");
+          break;
+        } catch (touchError) {
+          if (is429Error(touchError) && attempt < MAX_RETRY_ATTEMPTS) {
+            const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+            console.warn(
+              `[SessionRecovery] session.touch() 429 rate limited, retry ${attempt}/${MAX_RETRY_ATTEMPTS} after ${delay}ms`
+            );
+            await sleep(delay);
+            continue;
+          }
+          console.error("[SessionRecovery] Session touch failed:", touchError);
+          break;
+        }
       }
     } finally {
       lastActiveTime.current = Date.now();

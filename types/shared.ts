@@ -5,18 +5,6 @@
  */
 
 // ========================================
-// Detection Mode Types
-// ========================================
-
-/**
- * Video detection mode
- * - standard: Fast processing, detects hard cuts only
- * - enhanced: Better for fades, dissolves, text animations (slower)
- * - reverse_engineer: PySceneDetect ContentDetector — adaptive threshold, works on all videos
- */
-export type DetectionMode = 'standard' | 'enhanced' | 'reverse_engineer';
-
-// ========================================
 // Processing Status Types
 // ========================================
 
@@ -29,8 +17,6 @@ export type ProcessingStage =
   | 'audio'
   | 'audio_skipped'
   | 'vad_whisper'
-  | 'luminance_detection'
-  | 'text_stabilization'
   | 'scene_ocr_excel'
   | 'scene_detection'
   | 'frame_extraction'
@@ -81,9 +67,6 @@ export interface ProcessingMetadata {
   scenesWithNarration?: number;
   resultR2Key?: string; // Production only - R2 key for result file download
   blobUrl?: string; // @deprecated - Use resultR2Key instead
-  detectionMode?: DetectionMode;
-  luminanceTransitionsDetected?: number;
-  textStabilizationPoints?: number;
   warnings?: string[]; // Non-fatal issues encountered during processing
 }
 
@@ -253,7 +236,6 @@ export interface ProcessVideoRequest {
   r2Key: string;
   fileName: string;
   dataConsent: boolean;
-  detectionMode?: DetectionMode;
 }
 
 export interface ProcessVideoResponse {

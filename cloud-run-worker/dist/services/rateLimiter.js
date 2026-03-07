@@ -72,8 +72,11 @@ export class Semaphore {
 export class SlidingWindowRateLimiter {
     constructor(maxRequests, windowMs) {
         this.requestTimestamps = [];
+        this.lastRequestTime = 0;
         this.maxRequests = maxRequests;
         this.windowMs = windowMs;
+        // Minimum interval between requests to smooth out bursts
+        this.minIntervalMs = Math.floor(windowMs / maxRequests);
     }
     /**
      * Clean up old timestamps outside the window
@@ -109,14 +112,22 @@ export class SlidingWindowRateLimiter {
         return Math.max(0, waitTime);
     }
     /**
-     * Wait until a request slot is available
+     * Wait until a request slot is available, with request smoothing
      */
     async wait() {
+        // Enforce minimum interval between requests (smoothing)
+        const timeSinceLastRequest = Date.now() - this.lastRequestTime;
+        if (this.lastRequestTime > 0 && timeSinceLastRequest < this.minIntervalMs) {
+            const smoothingDelay = this.minIntervalMs - timeSinceLastRequest;
+            await new Promise((resolve) => setTimeout(resolve, smoothingDelay));
+        }
+        // Wait for sliding window slot
         const waitTime = this.getWaitTimeMs();
         if (waitTime > 0) {
             await new Promise((resolve) => setTimeout(resolve, waitTime));
         }
         this.recordRequest();
+        this.lastRequestTime = Date.now();
     }
     /**
      * Get current request count in window
@@ -208,10 +219,26 @@ export class RateLimiter {
             catch (error) {
                 lastError = error;
                 if (!isRetryable(error) || attempt >= this.config.maxRetries - 1) {
+                    if (attempt >= this.config.maxRetries - 1) {
+                        console.error(`[RateLimiter] All ${this.config.maxRetries} retries exhausted`);
+                    }
+                    else {
+                        const err = error;
+                        console.error(`[RateLimiter] Non-retryable error: ${err.constructor?.name || 'Unknown'} status=${err.status} code=${err.code} message=${err.message}`);
+                    }
                     throw error;
                 }
-                const delay = this.config.retryDelayMs * Math.pow(2, attempt);
-                console.log(`[RateLimiter] Retry ${attempt + 1}/${this.config.maxRetries} after ${delay}ms`);
+                const base = this.config.retryDelayMs * Math.pow(2, attempt);
+                const jitterFactor = this.config.jitterFactor ?? 0.5;
+                const jitter = base * jitterFactor * Math.random();
+                let delay = Math.round(base + jitter);
+                // Respect Retry-After header if present
+                const retryAfterMs = extractRetryAfter(error);
+                if (retryAfterMs !== null && retryAfterMs > delay) {
+                    console.log(`[RateLimiter] Retry-After header: ${retryAfterMs}ms (overriding calculated ${delay}ms)`);
+                    delay = retryAfterMs;
+                }
+                console.log(`[RateLimiter] Retry ${attempt + 1}/${this.config.maxRetries} after ${delay}ms (base=${base}, jitter=${Math.round(jitter)})`);
                 await new Promise((resolve) => setTimeout(resolve, delay));
             }
         }
@@ -252,7 +279,8 @@ export function createGeminiRateLimiter() {
         maxRequestsPerWindow,
         windowMs: 60000,
         retryDelayMs: 1000,
-        maxRetries: 3,
+        maxRetries: 5,
+        jitterFactor: 0.5,
     });
 }
 // ============================================================
@@ -275,8 +303,75 @@ export function resetGeminiRateLimiter() {
     geminiRateLimiter = null;
 }
 // ============================================================
+// Whisper Rate Limiter
+// ============================================================
+/**
+ * Create Whisper API rate limiter
+ * Default: 5 concurrent, 50 requests/minute
+ */
+export function createWhisperRateLimiter() {
+    const maxConcurrent = parseInt(process.env.WHISPER_MAX_PARALLEL || '5', 10);
+    const maxRequestsPerWindow = parseInt(process.env.WHISPER_RATE_LIMIT || '50', 10);
+    console.log(`[RateLimiter] Creating Whisper rate limiter: ${maxConcurrent} concurrent, ${maxRequestsPerWindow} req/min`);
+    return new RateLimiter({
+        maxConcurrent,
+        maxRequestsPerWindow,
+        windowMs: 60000,
+        retryDelayMs: 1000,
+        maxRetries: 5,
+        jitterFactor: 0.5,
+    });
+}
+let whisperRateLimiter = null;
+/**
+ * Get or create the Whisper rate limiter singleton
+ */
+export function getWhisperRateLimiter() {
+    if (!whisperRateLimiter) {
+        whisperRateLimiter = createWhisperRateLimiter();
+    }
+    return whisperRateLimiter;
+}
+/**
+ * Reset the Whisper rate limiter (for testing)
+ */
+export function resetWhisperRateLimiter() {
+    whisperRateLimiter = null;
+}
+// ============================================================
 // Utility Functions
 // ============================================================
+/**
+ * Extract Retry-After value from error response headers
+ * Supports both seconds (numeric) and HTTP-date formats
+ *
+ * @param error - Error object (may contain response headers)
+ * @returns Retry-after delay in milliseconds, or null if not present
+ */
+export function extractRetryAfter(error) {
+    if (!error || typeof error !== 'object')
+        return null;
+    const err = error;
+    // Check for Retry-After header in response
+    const retryAfterHeader = err.response?.headers?.['retry-after'] ??
+        err.response?.headers?.get?.('retry-after');
+    if (retryAfterHeader) {
+        const seconds = Number(retryAfterHeader);
+        if (!isNaN(seconds)) {
+            return seconds * 1000; // Convert seconds to ms
+        }
+        // Try HTTP-date format
+        const date = new Date(retryAfterHeader);
+        if (!isNaN(date.getTime())) {
+            return Math.max(0, date.getTime() - Date.now());
+        }
+    }
+    // Check for Google SDK retryDelay format
+    if (typeof err.retryDelay === 'number') {
+        return err.retryDelay;
+    }
+    return null;
+}
 /**
  * Check if an error is a rate limit error
  */
@@ -299,8 +394,12 @@ export function isRetryableError(error) {
         return (isRateLimitError(error) ||
             message.includes('timeout') ||
             message.includes('network') ||
+            message.includes('connection') ||
             message.includes('econnreset') ||
             message.includes('econnrefused') ||
+            message.includes('enotfound') ||
+            message.includes('etimedout') ||
+            message.includes('socket') ||
             message.includes('503') ||
             message.includes('502') ||
             message.includes('500'));

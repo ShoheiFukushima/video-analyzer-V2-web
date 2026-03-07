@@ -15,7 +15,7 @@
  * @since 2026-02-08
  */
 import pLimit from 'p-limit';
-import { createGeminiProvider } from './providers/geminiProvider.js';
+import { createGeminiProvider, classifyGeminiError } from './providers/geminiProvider.js';
 import { createMistralProvider } from './providers/mistralProvider.js';
 import { createGLMProvider } from './providers/glmProvider.js';
 // ============================================================
@@ -177,6 +177,9 @@ export class OCRRouter {
         console.log(`[OCRRouter] Processing ${tasks.length} images in parallel ` +
             `(limit: ${effectiveParallel}, providers: ${this.providers.length})`);
         const providerUsage = {};
+        const errorCategories = {
+            rate_limit: 0, auth: 0, network: 0, server: 0, unknown: 0,
+        };
         const results = [];
         let successCount = 0;
         let failureCount = 0;
@@ -186,6 +189,7 @@ export class OCRRouter {
             if (!provider) {
                 console.warn(`[OCRRouter] No provider available for task ${task.id}`);
                 failureCount++;
+                errorCategories.unknown++;
                 return {
                     text: '',
                     confidence: 0,
@@ -201,6 +205,7 @@ export class OCRRouter {
                 return result;
             }
             catch (error) {
+                const classified = classifyGeminiError(error);
                 // Try fallback if enabled
                 if (this.config.enableFallback) {
                     try {
@@ -209,12 +214,18 @@ export class OCRRouter {
                         successCount++;
                         return result;
                     }
-                    catch {
-                        // Fallback also failed
+                    catch (fallbackError) {
+                        const fbClassified = classifyGeminiError(fallbackError);
+                        console.warn(`[OCRRouter] Task ${task.id} fallback also failed: ` +
+                            `provider=${provider.name}, category=${fbClassified.category}, ` +
+                            `detail=${fbClassified.detail.slice(0, 150)}`);
                     }
                 }
                 failureCount++;
-                console.error(`[OCRRouter] Task ${task.id} failed: ${error instanceof Error ? error.message : String(error)}`);
+                errorCategories[classified.category]++;
+                console.error(`[OCRRouter] Task ${task.id} failed: provider=${provider.name}, ` +
+                    `category=${classified.category}, status=${classified.status ?? 'N/A'}, ` +
+                    `detail=${classified.detail.slice(0, 150)}`);
                 return {
                     text: '',
                     confidence: 0,
@@ -230,6 +241,14 @@ export class OCRRouter {
         console.log(`[OCRRouter] Batch complete: ${successCount}/${tasks.length} succeeded ` +
             `in ${(processingTimeMs / 1000).toFixed(2)}s`);
         console.log(`[OCRRouter] Provider usage:`, providerUsage);
+        // Log error breakdown if there were failures
+        if (failureCount > 0) {
+            const activeCategories = Object.entries(errorCategories)
+                .filter(([, count]) => count > 0)
+                .map(([cat, count]) => `${cat}=${count}`)
+                .join(', ');
+            console.error(`[OCRRouter] Error summary: ${failureCount} failures — ${activeCategories}`);
+        }
         return {
             results,
             stats: {

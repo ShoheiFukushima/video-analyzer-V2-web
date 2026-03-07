@@ -33,6 +33,15 @@ const PHASE_COMPLETE_LABELS: Record<ProcessingPhase, string> = {
   3: "Report ready",
 };
 
+/**
+ * Event log entry for tracking processing events chronologically
+ */
+interface ProcessingEvent {
+  timestamp: Date;
+  type: 'info' | 'warning' | 'error';
+  message: string;
+}
+
 export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps) {
   const [error, setError] = useState<string | null>(null);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
@@ -43,10 +52,20 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
   const [isError, setIsError] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
+  const [isStale, setIsStale] = useState(false);
+  const [events, setEvents] = useState<ProcessingEvent[]>([]);
 
-  // Stale detection: if status hasn't updated for 5 minutes, show error
-  // Heartbeat updates every 60s, so 5 min means ~5 missed heartbeats
-  const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+  // Helper to add event without duplicating the same message consecutively
+  const addEvent = useCallback((type: ProcessingEvent['type'], message: string) => {
+    setEvents(prev => {
+      if (prev.length > 0 && prev[prev.length - 1].message === message) return prev;
+      return [...prev, { timestamp: new Date(), type, message }];
+    });
+  }, []);
+
+  // Stale detection: show warning (not error) if heartbeat missed for 15 minutes
+  // Polling continues — auto-recovers when backend responds with completed/error
+  const STALE_THRESHOLD_MS = 15 * 60 * 1000; // 15 minutes
 
   // Phase state
   const [phases, setPhases] = useState<PhaseData[]>([
@@ -120,6 +139,16 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
     const pollStatus = async () => {
       try {
         const response = await fetch(`/api/status/${uploadId}`);
+
+        // Skip this poll if API returned non-200 (auth error, server error, etc.)
+        if (!response.ok) {
+          console.warn(`[${uploadId}] Status poll returned ${response.status}, will retry`);
+          if (response.status === 429) {
+            addEvent('warning', 'Rate limited — retrying shortly');
+          }
+          return false; // Continue polling
+        }
+
         const data = await response.json();
 
         // Check for stale status (processing hasn't updated for too long)
@@ -128,13 +157,19 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
           const now = Date.now();
           const timeSinceUpdate = now - updatedAt;
 
-          // If status is "processing" but hasn't updated for 30+ minutes, treat as error
           if (data.status === "processing" && timeSinceUpdate > STALE_THRESHOLD_MS) {
-            console.error(`[${uploadId}] Processing stale: no update for ${Math.round(timeSinceUpdate / 1000 / 60)} minutes`);
-            setIsError(true);
-            setError("Processing appears to have stopped unexpectedly. Please try uploading again.");
-            onComplete?.();
-            return true; // Stop polling
+            // Show warning but keep polling — backend may still be working
+            if (!isStale) {
+              console.warn(`[${uploadId}] Processing may be slow: no update for ${Math.round(timeSinceUpdate / 1000 / 60)} minutes (still polling)`);
+              addEvent('warning', `No update for ${Math.round(timeSinceUpdate / 1000 / 60)} minutes — still monitoring`);
+            }
+            setIsStale(true);
+          } else {
+            // Status is fresh — clear any stale warning
+            if (isStale) {
+              console.log(`[${uploadId}] Processing resumed (stale warning cleared)`);
+            }
+            setIsStale(false);
           }
 
           setLastUpdatedAt(data.updatedAt);
@@ -142,7 +177,6 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
 
         // Update phase data from API response
         if (data.phase !== undefined) {
-          // Debug: Log phase data from API
           if (data.phase === 2 && data.subTask) {
             console.log(`[ProcessingStatus] Phase 2 subTask: "${data.subTask}"`);
           }
@@ -176,7 +210,11 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
         }
 
         if (data.status === "completed" && data.resultUrl) {
-          // Mark all phases as completed
+          // Completed always wins — clear any previous error/stale state
+          setIsStale(false);
+          setIsError(false);
+          setError(null);
+          addEvent('info', 'Processing completed successfully');
           setPhases(prev => prev.map(p => ({
             ...p,
             status: p.status === 'skipped' ? 'skipped' : 'completed',
@@ -189,13 +227,16 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
           onComplete?.();
           return true; // Stop polling
         } else if (data.status === "error") {
+          const errorMsg = data.error || "Processing failed";
+          addEvent('error', errorMsg);
+          setIsStale(false);
           setIsError(true);
-          setError(data.error || "Processing failed");
+          setError(errorMsg);
           onComplete?.();
-          return true; // Stop polling
+          return true; // Stop polling — DB error status is terminal
         }
       } catch (err) {
-        console.error("Error polling status:", err);
+        console.warn(`[${uploadId}] Status poll error (will retry):`, err);
       }
       return false; // Continue polling
     };
@@ -217,37 +258,8 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
     }
   }, [isCompleted, resultUrl, autoDownloadTriggered, downloadResult]);
 
-  // Error state
-  if (isError) {
-    // Determine if this is a server-side interruption (not a user error)
-    const isServerInterruption = error?.includes('maintenance') ||
-                                  error?.includes('scaling') ||
-                                  error?.includes('resource') ||
-                                  error?.includes('interrupted') ||
-                                  error?.includes('stopped unexpectedly');
-
-    return (
-      <div className="bg-destructive/10 border border-destructive/20 rounded-lg p-6 space-y-4">
-        <div className="flex items-start gap-4">
-          <AlertCircle className="w-6 h-6 text-destructive flex-shrink-0" />
-          <div className="flex-1">
-            <h3 className="text-lg font-semibold font-serif text-destructive">
-              {isServerInterruption ? 'Processing was interrupted' : 'An issue occurred'}
-            </h3>
-            <p className="text-destructive/80 mt-1">{error}</p>
-            {isServerInterruption && (
-              <p className="text-muted-foreground text-sm mt-2">
-                This was not caused by your video. The server was restarted or scaled down during processing.
-              </p>
-            )}
-          </div>
-        </div>
-        <p className="text-xs text-muted-foreground/50">Upload ID: {uploadId}</p>
-      </div>
-    );
-  }
-
-  // Completed state
+  // Completed state — ALWAYS takes priority over error
+  // Even if errors occurred during processing, completion means the result is available
   if (isCompleted && resultUrl) {
     return (
       <div className="space-y-6">
@@ -279,13 +291,13 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
         )}
 
         {metadata?.warnings && metadata.warnings.length > 0 && (
-          <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg p-4 flex items-start gap-3">
-            <AlertCircle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+          <div className="bg-amber-50 dark:bg-yellow-950/30 border border-amber-300 dark:border-yellow-700/60 rounded-lg p-4 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-amber-600 dark:text-yellow-400 flex-shrink-0 mt-0.5" />
             <div className="flex-1">
-              <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
+              <p className="text-sm font-medium text-amber-800 dark:text-yellow-200">
                 Processing completed with {metadata.warnings.length} warning{metadata.warnings.length > 1 ? 's' : ''}
               </p>
-              <ul className="text-xs text-amber-600/80 dark:text-amber-400/70 mt-1 space-y-1 list-disc list-inside">
+              <ul className="text-xs text-amber-700 dark:text-yellow-100/80 mt-1 space-y-1 list-disc list-inside">
                 {metadata.warnings.map((warning, i) => (
                   <li key={i}>{warning}</li>
                 ))}
@@ -295,11 +307,11 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
         )}
 
         {downloadError && (
-          <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg p-4 flex items-start gap-3">
-            <AlertCircle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+          <div className="bg-red-50 dark:bg-red-950/30 border border-red-300 dark:border-red-700/60 rounded-lg p-4 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-red-600 dark:text-red-400 flex-shrink-0 mt-0.5" />
             <div className="flex-1">
-              <p className="text-sm font-medium text-amber-700 dark:text-amber-400">Download failed</p>
-              <p className="text-xs text-amber-600/80 dark:text-amber-400/70 mt-1">{downloadError}</p>
+              <p className="text-sm font-medium text-red-800 dark:text-red-200">Download failed</p>
+              <p className="text-xs text-red-700 dark:text-red-300/80 mt-1">{downloadError}</p>
             </div>
           </div>
         )}
@@ -312,9 +324,62 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
     );
   }
 
+  // Error state — only shown if NOT completed (completed always wins above)
+  if (isError) {
+    const isServerInterruption = error?.includes('maintenance') ||
+                                  error?.includes('scaling') ||
+                                  error?.includes('resource') ||
+                                  error?.includes('interrupted') ||
+                                  error?.includes('stopped unexpectedly');
+
+    return (
+      <div className="space-y-4">
+        <div className="bg-destructive/10 border border-destructive/20 rounded-lg p-6 space-y-4">
+          <div className="flex items-start gap-4">
+            <AlertCircle className="w-6 h-6 text-destructive flex-shrink-0" />
+            <div className="flex-1">
+              <h3 className="text-lg font-semibold font-serif text-destructive">
+                {isServerInterruption ? 'Processing was interrupted' : 'An issue occurred'}
+              </h3>
+              <p className="text-destructive/80 mt-1">{error}</p>
+              {isServerInterruption && (
+                <p className="text-muted-foreground text-sm mt-2">
+                  This was not caused by your video. The server was restarted or scaled down during processing.
+                </p>
+              )}
+              <p className="text-muted-foreground text-xs mt-3">
+                Please try uploading the video again. If the issue persists, contact support.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Event log */}
+        {events.length > 0 && <EventLog events={events} />}
+
+        <p className="text-xs text-muted-foreground/50">Upload ID: {uploadId}</p>
+      </div>
+    );
+  }
+
   // Processing state - 3-Phase UI
   return (
     <div className="space-y-6">
+      {/* Stale warning banner — shown when heartbeat missed, but polling continues */}
+      {isStale && (
+        <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg p-4 flex items-start gap-3">
+          <AlertCircle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+          <div className="flex-1">
+            <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
+              Processing is taking longer than expected
+            </p>
+            <p className="text-xs text-amber-600/80 dark:text-amber-400/70 mt-1">
+              Long videos can take over an hour. Processing is still running — this page will update automatically when complete.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Phase indicators */}
       <div className="space-y-4">
         {phases.map((phase) => (
@@ -342,7 +407,57 @@ export function ProcessingStatus({ uploadId, onComplete }: ProcessingStatusProps
           </p>
         )}
       </div>
+      {/* Event log during processing */}
+      {events.length > 0 && <EventLog events={events} />}
+
       <p className="text-xs text-muted-foreground/50 text-center">Upload ID: {uploadId}</p>
+    </div>
+  );
+}
+
+// ============================================================
+// Event Log Component
+// ============================================================
+
+function EventLog({ events }: { events: ProcessingEvent[] }) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const errorCount = events.filter(e => e.type === 'error').length;
+  const warningCount = events.filter(e => e.type === 'warning').length;
+
+  if (events.length === 0) return null;
+
+  const label = [
+    errorCount > 0 ? `${errorCount} error${errorCount > 1 ? 's' : ''}` : '',
+    warningCount > 0 ? `${warningCount} warning${warningCount > 1 ? 's' : ''}` : '',
+  ].filter(Boolean).join(', ') || `${events.length} event${events.length > 1 ? 's' : ''}`;
+
+  return (
+    <div className="border border-secondary rounded-lg overflow-hidden">
+      <button
+        onClick={() => setIsExpanded(!isExpanded)}
+        className="w-full flex items-center justify-between px-4 py-2.5 text-xs text-muted-foreground hover:bg-secondary/30 transition-colors"
+      >
+        <span>{label} during processing</span>
+        <span className="text-[10px]">{isExpanded ? 'Hide' : 'Show'}</span>
+      </button>
+      {isExpanded && (
+        <div className="border-t border-secondary px-4 py-2 space-y-1.5 max-h-40 overflow-y-auto">
+          {events.map((event, i) => (
+            <div key={i} className="flex items-start gap-2 text-xs">
+              <span className="text-muted-foreground/50 tabular-nums shrink-0">
+                {event.timestamp.toLocaleTimeString()}
+              </span>
+              <span className={cn(
+                event.type === 'error' && 'text-destructive',
+                event.type === 'warning' && 'text-amber-600 dark:text-amber-400',
+                event.type === 'info' && 'text-muted-foreground',
+              )}>
+                {event.message}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

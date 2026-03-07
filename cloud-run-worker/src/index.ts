@@ -250,92 +250,11 @@ app.get('/diag/ffprobe-test', async (req: Request, res: Response) => {
   }
 });
 
-// Diagnostic endpoint - tests scene detection with FFmpeg spawn
-// Verifies the spawn-based scene detection works in gVisor environment
-app.get('/diag/scene-detection-test', async (req: Request, res: Response) => {
-  const { getVideoMetadata, extractScenesWithFrames, cleanupFrames } = await import('./services/ffmpeg.js');
-  const axios = (await import('axios')).default;
-  const fs = await import('fs/promises');
-  const path = await import('path');
-
-  const startTime = Date.now();
-  const testVideoUrl = 'https://www.w3schools.com/html/mov_bbb.mp4'; // Small test video (1.6MB)
-  const testFilePath = path.join('/tmp', `diag-scene-test-${Date.now()}.mp4`);
-
-  try {
-    console.log('[Diag-Scene] Starting scene detection test after download...');
-
-    // Step 1: Download the test video
-    console.log('[Diag-Scene] Downloading test video...');
-    const response = await axios.get(testVideoUrl, {
-      responseType: 'arraybuffer',
-      timeout: 30000,
-    });
-    await fs.writeFile(testFilePath, Buffer.from(response.data));
-    const downloadTime = Date.now() - startTime;
-    console.log(`[Diag-Scene] Downloaded ${response.data.length} bytes in ${downloadTime}ms`);
-
-    // Step 2: Get metadata
-    console.log('[Diag-Scene] Getting video metadata...');
-    const metadataStartTime = Date.now();
-    const metadata = await getVideoMetadata(testFilePath);
-    const metadataTime = Date.now() - metadataStartTime;
-    console.log(`[Diag-Scene] Metadata extracted in ${metadataTime}ms`);
-
-    // Step 3: Run scene detection
-    console.log('[Diag-Scene] Running scene detection...');
-    const sceneStartTime = Date.now();
-    const scenes = await extractScenesWithFrames(testFilePath, undefined, metadata);
-    const sceneTime = Date.now() - sceneStartTime;
-    console.log(`[Diag-Scene] Scene detection completed in ${sceneTime}ms`);
-
-    // Cleanup
-    await cleanupFrames(scenes);
-    await fs.unlink(testFilePath).catch(() => {});
-
-    const totalTime = Date.now() - startTime;
-    console.log(`[Diag-Scene] ✅ Scene detection test PASSED in ${totalTime}ms`);
-
-    res.json({
-      status: 'ok',
-      message: 'Scene detection works after download',
-      metadata,
-      scenes: scenes.map(s => ({
-        sceneNumber: s.sceneNumber,
-        startTime: s.startTime,
-        endTime: s.endTime,
-        midTime: s.midTime,
-        timecode: s.timecode
-      })),
-      timing: {
-        downloadMs: downloadTime,
-        metadataMs: metadataTime,
-        sceneDetectionMs: sceneTime,
-        totalMs: totalTime,
-      }
-    });
-  } catch (error: any) {
-    const totalTime = Date.now() - startTime;
-    console.error(`[Diag-Scene] ❌ Scene detection test FAILED after ${totalTime}ms:`, error.message);
-
-    // Cleanup on error
-    await fs.unlink(testFilePath).catch(() => {});
-
-    res.status(500).json({
-      status: 'error',
-      message: error.message,
-      timing: {
-        totalMs: totalTime,
-      }
-    });
-  }
-});
-
 // Process video endpoint - Direct processing with keep-alive pattern
 // Returns 202 immediately, then processes video while keeping connection open.
 // The open connection prevents Cloud Run from terminating the instance.
 app.post('/process', validateAuth, async (req: Request, res: Response): Promise<void> => {
-  const { uploadId, r2Key, fileName, userId, dataConsent, detectionMode } = req.body;
+  const { uploadId, r2Key, fileName, userId, dataConsent } = req.body;
 
   // Security: Validate required fields including userId for IDOR protection
   if (!uploadId || !r2Key || !userId) {
@@ -346,15 +265,10 @@ app.post('/process', validateAuth, async (req: Request, res: Response): Promise<
     return;
   }
 
-  // Validate detectionMode (default to 'standard' if not provided or invalid)
-  const validModes = ['standard', 'enhanced'];
-  const mode = validModes.includes(detectionMode) ? detectionMode : 'standard';
-
   console.log(`[${uploadId}] Starting video processing`, {
     fileName,
     userId,
     r2Key,
-    detectionMode: mode
   });
 
   // Send 202 Accepted immediately via chunked response.
@@ -369,12 +283,11 @@ app.post('/process', validateAuth, async (req: Request, res: Response): Promise<
     uploadId,
     message: 'Video processing started',
     status: 'processing',
-    detectionMode: mode,
   }));
 
   try {
     // Process video — can take up to 60 minutes
-    await processVideo(uploadId, r2Key, fileName, userId, dataConsent || false, mode);
+    await processVideo(uploadId, r2Key, fileName, userId, dataConsent || false);
     console.log(`[${uploadId}] Processing completed successfully`);
   } catch (error) {
     // processVideo handles its own error status updates via failStatus()

@@ -9,7 +9,8 @@
  * 4. Generate Excel with ideal format (Scene # | Timecode | Screenshot | OCR | NA Text)
  */
 import { Scene, VideoMetadata, ProcessingStats } from '../types/excel.js';
-import type { TranscriptionSegment, DetectionMode } from '../types/shared.js';
+import type { TranscriptionSegment } from '../types/shared.js';
+import { WarningCollector } from './warningCollector.js';
 import { type ProcessingCheckpoint } from './checkpointService.js';
 /**
  * Main pipeline execution
@@ -17,12 +18,24 @@ import { type ProcessingCheckpoint } from './checkpointService.js';
  * @param projectTitle - Project/video title
  * @param transcription - Transcription from whisperService
  * @param uploadId - Optional upload ID for progress tracking
- * @param detectionMode - Detection mode ('standard' or 'enhanced')
  * @param checkpoint - Optional checkpoint for resumable processing
  * @returns Path to generated Excel file
  */
-export declare function executeIdealPipeline(videoPath: string, projectTitle: string, transcription: TranscriptionSegment[], uploadId?: string, detectionMode?: DetectionMode, checkpoint?: ProcessingCheckpoint, preDetectedScenes?: Scene[], videoMetadata?: VideoMetadata): Promise<{
+export declare function executeIdealPipeline(videoPath: string, projectTitle: string, transcription: TranscriptionSegment[], uploadId?: string, checkpoint?: ProcessingCheckpoint, preDetectedScenes?: Scene[], videoMetadata?: VideoMetadata, warningCollector?: WarningCollector): Promise<{
     excelPath: string;
     stats: ProcessingStats;
 }>;
+/**
+ * Extended Scene interface with OCR
+ */
+export interface SceneWithOCR extends Scene {
+    ocrText: string;
+    ocrConfidence: number;
+}
+/**
+ * Extended Scene interface with OCR and narration
+ */
+export interface SceneWithNarration extends SceneWithOCR {
+    narrationText: string;
+}
 //# sourceMappingURL=pipeline.d.ts.map

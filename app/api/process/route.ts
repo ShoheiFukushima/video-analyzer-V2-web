@@ -137,7 +137,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const { uploadId, r2Key, fileName, dataConsent, detectionMode } = body;
+    const { uploadId, r2Key, fileName, dataConsent } = body;
 
     if (!uploadId || !r2Key) {
       return NextResponse.json(
@@ -148,9 +148,6 @@ export async function POST(request: NextRequest) {
         { status: 400 }
       );
     }
-
-    const validModes = ['standard', 'enhanced', 'reverse_engineer'];
-    const mode = validModes.includes(detectionMode) ? detectionMode : 'reverse_engineer';
 
     if (!isValidR2Key(r2Key)) {
       return NextResponse.json(
@@ -219,7 +216,7 @@ export async function POST(request: NextRequest) {
                 current_step = 'Initiating...',
                 error_message = NULL,
                 updated_at = datetime('now')`,
-        args: [uploadId, userId, JSON.stringify({ fileName, detectionMode: mode })],
+        args: [uploadId, userId, JSON.stringify({ fileName })],
       });
     } catch (initError) {
       console.error(`[${uploadId}] Failed to initialize status in Turso:`, initError);
@@ -241,15 +238,12 @@ export async function POST(request: NextRequest) {
     if (fallbackUrls.length > 0) {
       console.log(`[${uploadId}] Fallback URLs: ${fallbackUrls.join(', ')}`);
     }
-    console.log(`[${uploadId}] Detection mode: ${mode}`);
-
     const payload = {
       uploadId,
       r2Key,
       fileName,
       userId,
       dataConsent: dataConsent || false,
-      detectionMode: mode,
     };
 
     // Background: Cloud Run call (kept alive via waitUntil)
@@ -289,7 +283,6 @@ export async function POST(request: NextRequest) {
       uploadId,
       message: "Video processing started successfully",
       status: "processing",
-      detectionMode: mode,
       region: geoRegion || 'default',
     });
   } catch (error) {

@@ -8,7 +8,6 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     python3-venv \
     curl \
-    git \
     libgl1-mesa-glx \
     libglib2.0-0 \
     strace \
@@ -17,18 +16,15 @@ RUN apt-get update && apt-get install -y \
     procps \
     && rm -rf /var/lib/apt/lists/*
 
-# Create Python virtual environment and install TransNet V2
+# Create Python virtual environment for PySceneDetect
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install TransNet V2 and dependencies
-# Note: Using CPU-only TensorFlow to reduce image size
-# TransNet V2 must be installed from GitHub
+# Install PySceneDetect dependencies
 RUN pip install --no-cache-dir \
-    tensorflow-cpu==2.15.0 \
     numpy \
     pillow \
-    && pip install --no-cache-dir git+https://github.com/soCzech/TransNetV2.git
+    "scenedetect[opencv]"
 
 # Set working directory
 WORKDIR /app
@@ -47,8 +43,8 @@ ARG CACHE_BUST=20260211113000
 # Copy source files
 COPY src ./src
 
-# Copy Python scripts for TransNet V2
-COPY src/services/transnetRunner.py /app/transnetRunner.py
+# Copy Python script for PySceneDetect
+COPY src/services/pysceneRunner.py /app/pysceneRunner.py
 
 # Copy pre-built build-info.json (contains commit SHA from deploy.sh)
 COPY build-info.json ./

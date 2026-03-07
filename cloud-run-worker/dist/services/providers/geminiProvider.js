@@ -9,6 +9,34 @@
  */
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { OCRProvider, OCR_PROMPT } from '../ocrProviderInterface.js';
+import { extractRetryAfter } from '../rateLimiter.js';
+/**
+ * Extract detailed error information from Gemini SDK errors
+ * Gemini SDK wraps HTTP errors in GoogleGenerativeAIError with nested structures
+ */
+export function classifyGeminiError(error) {
+    const err = error;
+    const message = err?.message || String(error);
+    const status = err?.status ?? err?.response?.status ?? err?.errorDetails?.[0]?.httpStatusCode;
+    const code = err?.code ?? err?.errorDetails?.[0]?.reason;
+    if (status === 429 || message.includes('429') || message.includes('RESOURCE_EXHAUSTED') ||
+        message.includes('rate limit') || message.includes('quota')) {
+        return { category: 'rate_limit', status, code, detail: message };
+    }
+    if (status === 401 || status === 403 || message.includes('API_KEY_INVALID') ||
+        message.includes('PERMISSION_DENIED') || message.includes('insufficient_quota')) {
+        return { category: 'auth', status, code, detail: message };
+    }
+    if (message.includes('ECONNRESET') || message.includes('ETIMEDOUT') ||
+        message.includes('ENOTFOUND') || message.includes('network') ||
+        message.includes('socket') || message.includes('fetch failed')) {
+        return { category: 'network', status, code, detail: message };
+    }
+    if (status === 500 || status === 502 || status === 503 || status === 504) {
+        return { category: 'server', status, code, detail: message };
+    }
+    return { category: 'unknown', status, code, detail: message };
+}
 // ============================================================
 // Gemini Provider Implementation
 // ============================================================
@@ -70,12 +98,17 @@ export class GeminiOCRProvider extends OCRProvider {
         catch (error) {
             const processingTimeMs = Date.now() - startTime;
             const errorMessage = error instanceof Error ? error.message : String(error);
+            const classified = classifyGeminiError(error);
+            console.error(`[GeminiProvider] OCR failed: category=${classified.category}, ` +
+                `status=${classified.status ?? 'N/A'}, code=${classified.code ?? 'N/A'}, ` +
+                `detail=${classified.detail.slice(0, 200)}`);
             this.updateStats(false, processingTimeMs, errorMessage);
-            // Mark unavailable on repeated failures
-            if (errorMessage.includes('503') ||
-                errorMessage.includes('429') ||
-                errorMessage.includes('quota')) {
-                this.markUnavailable(60000); // 1 minute cooldown
+            // Mark unavailable on repeated failures with adaptive cooldown
+            if (classified.category === 'rate_limit' ||
+                classified.category === 'server' ||
+                classified.category === 'auth') {
+                const retryAfterMs = extractRetryAfter(error) ?? undefined;
+                this.markUnavailable(retryAfterMs);
             }
             throw error;
         }

@@ -1,9 +1,7 @@
 /**
- * FFmpeg Scene Detection Service
- * Implements multi-pass scene detection with mid-point frame extraction
- * Based on VideoContentAnalyzer V2's proven algorithm (100% OCR accuracy)
- *
- * Adapted from V1 for V2 architecture with Scene interface
+ * FFmpeg Utility Service
+ * Frame extraction, video metadata, and scene range generation.
+ * Scene detection is handled by PySceneDetect (pysceneDetector.ts).
  */
 import { Scene, VideoMetadata } from '../types/excel.js';
 /**
@@ -27,15 +25,6 @@ export declare function extractFrameAtTime(videoPath: string, timestamp: number,
  * Uses fluent-ffmpeg's ffprobe with gVisor-compatible environment settings
  */
 export declare function getVideoMetadata(videoPath: string): Promise<VideoMetadata>;
-/**
- * Main scene detection and frame extraction function
- * Implements FFmpeg scene detection + mid-point frame extraction
- * @param videoPath - Path to the video file
- * @param outputDir - Directory for extracted frames (optional, defaults to /tmp/frames-{timestamp})
- * @param existingMetadata - Pre-fetched video metadata (optional, avoids duplicate ffprobe call)
- * @returns Array of Scene objects with screenshot paths
- */
-export declare function extractScenesWithFrames(videoPath: string, outputDir?: string, existingMetadata?: VideoMetadata): Promise<Scene[]>;
 /**
  * Clean up temporary frame files
  * @param scenes - Array of scenes with screenshot paths
@@ -65,7 +54,7 @@ export declare function detectScenesOnly(videoPath: string, existingMetadata?: V
  * @param videoMetadata - Video metadata for adaptive resizing
  * @returns Updated scenes with screenshotPath set
  */
-export declare function extractFramesForBatch(videoPath: string, scenes: Scene[], framesDir: string, videoMetadata: VideoMetadata): Promise<Scene[]>;
+export declare function extractFramesForBatch(videoPath: string, scenes: Scene[], framesDir: string, videoMetadata: VideoMetadata, targetWidth?: number): Promise<Scene[]>;
 /**
  * Cleanup frames for a specific batch of scenes
  * Removes only the frame files for the given scenes, not the entire directory

@@ -10,14 +10,9 @@
  */
 
 import {
-  extractScenesWithFrames,
   getVideoMetadata,
   cleanupFrames,
-  transcodeToProcessingResolution,
-  splitVideoWithOverlap,
-  cleanupChunks,
   extractFrameAtTime,
-  VideoChunk,
   // Batch processing functions (memory optimization)
   detectScenesOnly,
   extractFramesForBatch,
@@ -36,24 +31,12 @@ import fs from 'fs';
 import { promises as fsPromises } from 'fs';
 import path from 'path';
 import os from 'os';
-import type { TranscriptionSegment, DetectionMode, SceneCut } from '../types/shared.js';
+import type { TranscriptionSegment, SceneCut } from '../types/shared.js';
 import pLimit from 'p-limit';
 import { ProgressReporter } from './progressReporter.js';
 import { getOCRRouter, ImageTask } from './ocrRouter.js';
-import { runLuminanceDetection, StabilizationPoint } from './luminanceDetector.js';
-import { processStabilizationPoints, StableTextResult } from './textStabilityDetector.js';
 import { updateStatus, updatePhaseProgress, completePhase } from './statusManager.js';
 import { WarningCollector } from './warningCollector.js';
-import {
-  detectWithTransNetAndFallback,
-  isTransNetEnabled,
-  validateTransNetInstallation,
-} from './transnetDetector.js';
-import {
-  detectSupplementarySections,
-  mergeWithTransNetCuts,
-} from './supplementaryDetector.js';
-import { sendTransNetFailureAlert } from './alertService.js';
 import {
   saveCheckpoint,
   setSceneCuts,
@@ -69,7 +52,6 @@ import { registerOcrProgress, clearOcrProgress } from './emergencyCheckpoint.js'
  * @param projectTitle - Project/video title
  * @param transcription - Transcription from whisperService
  * @param uploadId - Optional upload ID for progress tracking
- * @param detectionMode - Detection mode ('standard' or 'enhanced')
  * @param checkpoint - Optional checkpoint for resumable processing
  * @returns Path to generated Excel file
  */
@@ -78,7 +60,6 @@ export async function executeIdealPipeline(
   projectTitle: string,
   transcription: TranscriptionSegment[],
   uploadId?: string,
-  detectionMode: DetectionMode = 'standard',
   checkpoint?: ProcessingCheckpoint,
   preDetectedScenes?: Scene[],
   videoMetadata?: VideoMetadata,
@@ -87,7 +68,6 @@ export async function executeIdealPipeline(
   console.log('🎬 Starting Ideal Pipeline Execution');
   console.log(`  📹 Video: ${videoPath}`);
   console.log(`  🎙️ Transcription: ${transcription.length} segments`);
-  console.log(`  🎯 Detection Mode: ${detectionMode}`);
 
   // Helper function for safe phase progress updates
   const safePhaseProgress = async (
@@ -139,7 +119,7 @@ export async function executeIdealPipeline(
         const sceneCuts: SceneCut[] = scenes.map(scene => ({
           timestamp: scene.startTime,
           confidence: 0.95,
-          source: 'ffmpeg_standard' as const,
+          source: 'pyscenedetect' as const,
         }));
         await setSceneCuts(uploadId, sceneCuts);
         console.log(`  💾 Saved ${sceneCuts.length} pre-detected scene cuts to checkpoint`);
@@ -196,8 +176,7 @@ export async function executeIdealPipeline(
     const { scenes: detectedScenes } = await detectScenesOnly(
       videoPath,
       videoMetadata,
-      sceneDetectionProgress,
-      detectionMode
+      sceneDetectionProgress
     );
     scenes = detectedScenes;
     console.log(`  ✓ Detected ${scenes.length} scenes`);
@@ -208,7 +187,7 @@ export async function executeIdealPipeline(
         const sceneCuts: SceneCut[] = scenes.map(scene => ({
           timestamp: scene.startTime,
           confidence: 0.95,
-          source: 'ffmpeg_standard' as const,
+          source: 'pyscenedetect' as const,
         }));
         await setSceneCuts(uploadId, sceneCuts);
         console.log(`  💾 Saved ${sceneCuts.length} scene cuts to checkpoint`);
@@ -235,190 +214,6 @@ export async function executeIdealPipeline(
   }
 
   await safePhaseProgress(2, 25, `${scenes.length} scenes detected`, 'frame_extraction');
-
-  // Enhanced mode statistics
-  let luminanceTransitionsDetected = 0;
-  let textStabilizationPoints = 0;
-  let transnetCutsCount = 0;
-  let supplementaryCutsCount = 0;
-  let fallbackUsed = false;
-
-  // Enhanced mode: TransNet V2 + Supplementary detection
-  if (detectionMode === 'enhanced') {
-    console.log('\n🚀 Step 2.5: Enhanced Mode V2 - TransNet V2 + Supplementary Detection...');
-
-    // Check if TransNet V2 is enabled and available
-    const transnetEnabled = isTransNetEnabled();
-    console.log(`  TransNet V2 enabled: ${transnetEnabled}`);
-
-    if (transnetEnabled) {
-      // Validate TransNet installation
-      const validation = await validateTransNetInstallation();
-      console.log(`  TransNet V2 validation: ${validation.valid ? '✓ Available' : '✗ Not available'}`);
-
-      if (validation.valid) {
-        // Phase 2 enhanced mode progress: 25-30%
-        await safePhaseProgress(2, 28, 'TransNet V2: Processing video...', 'scene_detection');
-
-        try {
-          // Step 2.5a: Transcode to 720p for faster processing
-          console.log('\n  📹 Step 2.5a: Transcoding to 720p for processing...');
-          const processingVideoPath = path.join(os.tmpdir(), `transnet_720p_${Date.now()}.mp4`);
-          await transcodeToProcessingResolution(videoPath, processingVideoPath, 720);
-          console.log(`  ✓ Transcoded to 720p: ${processingVideoPath}`);
-
-          // Step 2.5b: Split video into chunks for parallel processing
-          console.log('\n  📦 Step 2.5b: Splitting video into chunks...');
-          const chunksDir = fs.mkdtempSync(path.join(os.tmpdir(), 'transnet-chunks-'));
-          const chunks = await splitVideoWithOverlap(processingVideoPath, chunksDir, 60, 10);
-          console.log(`  ✓ Split into ${chunks.length} chunks (60s each, 10s overlap)`);
-
-          // Phase 2 progress: 30%
-          await safePhaseProgress(2, 30, `TransNet V2: Processing ${chunks.length} chunks...`, 'scene_detection');
-
-          // Step 2.5c: Run TransNet V2 with fallback
-          console.log('\n  🧠 Step 2.5c: Running TransNet V2 detection...');
-          const transnetResult = await detectWithTransNetAndFallback(
-            processingVideoPath,
-            chunks,
-            // FFmpeg fallback function
-            async (fallbackPath: string) => {
-              console.log('  🔄 Falling back to FFmpeg detection...');
-              const ffmpegScenes = await extractScenesWithFrames(fallbackPath);
-              return ffmpegScenes.map(scene => ({
-                timestamp: scene.startTime,
-                confidence: 0.8,
-                source: 'ffmpeg_enhanced' as const,
-              }));
-            },
-            // Fallback callback for developer notification
-            async (error: string) => {
-              console.warn(`  ⚠️ TransNet V2 failed, sending alert: ${error}`);
-              await sendTransNetFailureAlert(error, {
-                uploadId,
-                fileName: projectTitle,
-                stage: 'transnet_detection',
-                error,
-              });
-            }
-          );
-
-          transnetCutsCount = transnetResult.cuts.length;
-          fallbackUsed = transnetResult.fallbackUsed;
-          console.log(`  ✓ TransNet detection: ${transnetCutsCount} cuts (fallback: ${fallbackUsed})`);
-
-          // Step 2.5d: Run supplementary detection
-          console.log('\n  🔍 Step 2.5d: Running supplementary detection...');
-          // Phase 2 progress: 35%
-          await safePhaseProgress(2, 35, 'Supplementary detection: Analyzing...', 'scene_detection');
-
-          const supplementaryResult = await detectSupplementarySections(processingVideoPath);
-          supplementaryCutsCount = supplementaryResult.cuts.length;
-          luminanceTransitionsDetected = supplementaryResult.luminanceSections.length;
-          console.log(`  ✓ Supplementary detection: ${supplementaryCutsCount} cuts`);
-          console.log(`    - Luminance sections: ${supplementaryResult.luminanceSections.length}`);
-          console.log(`    - Motion sections: ${supplementaryResult.motionSections.length}`);
-
-          // Step 2.5e: Merge all cuts
-          console.log('\n  🔀 Step 2.5e: Merging detection results...');
-          const allCuts = mergeWithTransNetCuts(transnetResult.cuts, supplementaryResult.cuts, 0.5);
-          console.log(`  ✓ Total merged cuts: ${allCuts.length}`);
-
-          // Step 2.5f: Convert cuts to scenes (extract frames from ORIGINAL video)
-          console.log('\n  🎬 Step 2.5f: Converting cuts to scenes with original resolution frames...');
-          const enhancedScenes = await convertCutsToScenes(
-            allCuts,
-            videoPath, // Use original video for high-quality screenshots
-            videoMetadata.duration
-          );
-
-          // Merge with standard detection or replace
-          if (enhancedScenes.length > 0) {
-            scenes = enhancedScenes;
-            console.log(`  ✓ Enhanced mode produced ${scenes.length} scenes`);
-          }
-
-          // Cleanup temporary files
-          console.log('\n  🧹 Cleaning up temporary files...');
-          await cleanupChunks(chunks);
-          await fsPromises.unlink(processingVideoPath).catch(() => {});
-          await fsPromises.rm(chunksDir, { recursive: true, force: true }).catch(() => {});
-          console.log('  ✓ Cleanup complete');
-
-        } catch (transnetError) {
-          // TransNet mode errors are non-fatal - continue with standard detection
-          console.warn('\n⚠️ TransNet V2 enhanced mode failed, continuing with standard results:');
-          console.warn(`  Error: ${transnetError instanceof Error ? transnetError.message : String(transnetError)}`);
-
-          // Send failure alert
-          await sendTransNetFailureAlert(
-            transnetError instanceof Error ? transnetError.message : String(transnetError),
-            { uploadId, fileName: projectTitle, stage: 'transnet_pipeline' }
-          ).catch(e => console.warn('Failed to send alert:', e));
-        }
-      } else {
-        console.warn(`  ⚠️ TransNet V2 not available: ${validation.error}`);
-        console.log('  Falling back to legacy enhanced mode...');
-        // Fall through to legacy enhanced mode
-      }
-    }
-
-    // Legacy enhanced mode (if TransNet is not enabled or not available)
-    if (!transnetEnabled || transnetCutsCount === 0) {
-      console.log('\n🔦 Step 2.5 (Legacy): Luminance-based detection...');
-
-      // Phase 2 progress: 28%
-      await safePhaseProgress(2, 28, 'Luminance-based detection: Analyzing...', 'scene_detection');
-
-      try {
-        // Step 2.5a: Run luminance detection
-        const luminanceResults = await runLuminanceDetection(videoPath);
-        luminanceTransitionsDetected = luminanceResults.stabilizationPoints.length;
-
-        console.log(`  ✓ Found ${luminanceResults.whiteIntervals.length} white screen intervals`);
-        console.log(`  ✓ Found ${luminanceResults.blackIntervals.length} black screen intervals`);
-        console.log(`  ✓ Found ${luminanceTransitionsDetected} stabilization points`);
-
-        // Step 2.5b: Process text stabilization if stabilization points were found
-        if (luminanceResults.stabilizationPoints.length > 0) {
-          // Phase 2 progress: 35%
-          await safePhaseProgress(2, 35, 'Processing text stabilization points...', 'scene_detection');
-
-          // Create temporary directory for stabilization frames
-          const stabTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'stab-frames-'));
-
-          try {
-            const textResults = await processStabilizationPoints(
-              videoPath,
-              luminanceResults.stabilizationPoints,
-              stabTempDir
-            );
-
-            textStabilizationPoints = textResults.length;
-            console.log(`  ✓ Found ${textStabilizationPoints} text stabilization points`);
-
-            // Step 2.5c: Merge text stabilization results with existing scenes
-            if (textResults.length > 0) {
-              scenes = mergeEnhancedDetectionResults(scenes, textResults);
-              console.log(`  ✓ Merged enhanced detection: ${scenes.length} total scenes`);
-            }
-          } finally {
-            // Cleanup temporary frames
-            try {
-              fs.rmSync(stabTempDir, { recursive: true, force: true });
-            } catch (e) {
-              console.warn('  ⚠️ Failed to cleanup stabilization frames:', e);
-            }
-          }
-        }
-
-      } catch (enhancedError) {
-        // Enhanced mode errors are non-fatal - continue with standard detection
-        console.warn('\n⚠️ Enhanced mode detection failed, continuing with standard results:');
-        console.warn(`  Error: ${enhancedError instanceof Error ? enhancedError.message : String(enhancedError)}`);
-      }
-    }
-  }
 
   // Phase 2 Step 3: Perform OCR on each scene frame
   // Phase 2 progress: 25-90% (batch processing) or 40-90% (traditional)
@@ -563,15 +358,12 @@ export async function executeIdealPipeline(
   await safePhaseProgress(3, 70, 'Excel file created', 'excel_generation');
 
   // Step 7: Calculate statistics
-  const stats: ProcessingStats & { luminanceTransitionsDetected?: number; textStabilizationPoints?: number } = {
+  const stats: ProcessingStats = {
     totalScenes: scenes.length,
     scenesWithOCRText: excelRows.filter(r => r.ocrText && r.ocrText.trim().length > 0).length,
     scenesWithNarration: excelRows.filter(r => r.narrationText && r.narrationText.trim().length > 0).length,
     processingTimeMs: 0, // Set by caller
     videoMetadata,
-    // Enhanced mode statistics (only populated if detectionMode === 'enhanced')
-    luminanceTransitionsDetected: detectionMode === 'enhanced' ? luminanceTransitionsDetected : undefined,
-    textStabilizationPoints: detectionMode === 'enhanced' ? textStabilizationPoints : undefined
   };
 
   console.log('\n✅ Ideal Pipeline Execution Complete');
@@ -1389,155 +1181,3 @@ export interface SceneWithNarration extends SceneWithOCR {
   narrationText: string;
 }
 
-/**
- * Merge Enhanced mode detection results with standard scene detection
- *
- * This function:
- * 1. Creates new scenes from text stabilization results
- * 2. Filters out overlapping scenes (within 1 second of existing scenes)
- * 3. Merges and sorts by timestamp
- * 4. Re-numbers all scenes
- *
- * @param existingScenes - Scenes from standard detection
- * @param textResults - Text stabilization results from Enhanced mode
- * @returns Merged and sorted scenes
- */
-function mergeEnhancedDetectionResults(
-  existingScenes: Scene[],
-  textResults: StableTextResult[]
-): Scene[] {
-  const OVERLAP_THRESHOLD = 1.0; // 1 second overlap threshold
-
-  console.log(`  🔀 Merging ${existingScenes.length} standard scenes with ${textResults.length} enhanced results`);
-
-  // Create new scenes from text stabilization results
-  const enhancedScenes: Scene[] = textResults.map((result, index) => {
-    // Find a reasonable end time (next scene start or +2 seconds)
-    const nextResult = textResults[index + 1];
-    const endTime = nextResult
-      ? Math.min(nextResult.timestamp, result.timestamp + 2)
-      : result.timestamp + 2;
-
-    const startTime = result.timestamp;
-    const midTime = (startTime + endTime) / 2;
-
-    return {
-      sceneNumber: 0, // Will be renumbered
-      startTime,
-      endTime,
-      midTime,
-      timecode: formatTimecode(startTime),
-      screenshotPath: result.framePath, // Use the stabilized frame
-    };
-  });
-
-  // Filter out enhanced scenes that overlap with existing scenes
-  const nonOverlappingEnhancedScenes = enhancedScenes.filter(enhancedScene => {
-    const overlaps = existingScenes.some(existingScene => {
-      const timeDiff = Math.abs(enhancedScene.startTime - existingScene.startTime);
-      return timeDiff < OVERLAP_THRESHOLD;
-    });
-
-    if (overlaps) {
-      console.log(`    Skipping enhanced scene at ${enhancedScene.startTime.toFixed(2)}s (overlaps with existing)`);
-    }
-
-    return !overlaps;
-  });
-
-  console.log(`    Non-overlapping enhanced scenes: ${nonOverlappingEnhancedScenes.length}`);
-
-  // Merge all scenes
-  const mergedScenes = [...existingScenes, ...nonOverlappingEnhancedScenes];
-
-  // Sort by start time
-  mergedScenes.sort((a, b) => a.startTime - b.startTime);
-
-  // Re-number scenes
-  mergedScenes.forEach((scene, index) => {
-    scene.sceneNumber = index + 1;
-  });
-
-  // Update end times and midTimes to be consistent (end = next scene start)
-  for (let i = 0; i < mergedScenes.length - 1; i++) {
-    mergedScenes[i].endTime = mergedScenes[i + 1].startTime;
-    mergedScenes[i].midTime = (mergedScenes[i].startTime + mergedScenes[i].endTime) / 2;
-  }
-
-  console.log(`  ✓ Merged result: ${mergedScenes.length} total scenes`);
-
-  return mergedScenes;
-}
-
-/**
- * Convert scene cuts (timestamps) to Scene objects with extracted frames
- *
- * @param cuts - Array of scene cuts with timestamps
- * @param videoPath - Path to original video (for high-quality frame extraction)
- * @param videoDuration - Total video duration in seconds
- * @returns Array of Scene objects with extracted screenshots
- */
-async function convertCutsToScenes(
-  cuts: SceneCut[],
-  videoPath: string,
-  videoDuration: number
-): Promise<Scene[]> {
-  // Sort cuts by timestamp
-  const sortedCuts = [...cuts].sort((a, b) => a.timestamp - b.timestamp);
-
-  // Create temp directory for frames
-  const framesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enhanced-frames-'));
-
-  const scenes: Scene[] = [];
-
-  // Add scene at timestamp 0 if first cut is not at the start
-  if (sortedCuts.length === 0 || sortedCuts[0].timestamp > 0.5) {
-    const startTime = 0;
-    const endTime = sortedCuts.length > 0 ? sortedCuts[0].timestamp : videoDuration;
-    const midTime = (startTime + endTime) / 2;
-
-    const framePath = path.join(framesDir, `scene_0001_${midTime.toFixed(3)}.png`);
-    await extractFrameAtTime(videoPath, midTime, framePath);
-
-    scenes.push({
-      sceneNumber: 1,
-      startTime,
-      endTime,
-      midTime,
-      timecode: formatTimecode(startTime),
-      screenshotPath: framePath,
-    });
-  }
-
-  // Convert each cut to a scene
-  for (let i = 0; i < sortedCuts.length; i++) {
-    const cut = sortedCuts[i];
-    const nextCut = sortedCuts[i + 1];
-
-    const startTime = cut.timestamp;
-    const endTime = nextCut ? nextCut.timestamp : videoDuration;
-    const midTime = (startTime + endTime) / 2;
-
-    const sceneNumber = scenes.length + 1;
-    const framePath = path.join(framesDir, `scene_${String(sceneNumber).padStart(4, '0')}_${midTime.toFixed(3)}.png`);
-
-    try {
-      await extractFrameAtTime(videoPath, midTime, framePath);
-
-      scenes.push({
-        sceneNumber,
-        startTime,
-        endTime,
-        midTime,
-        timecode: formatTimecode(startTime),
-        screenshotPath: framePath,
-      });
-    } catch (error) {
-      console.warn(`  ⚠️ Failed to extract frame for scene ${sceneNumber} at ${midTime}s: ${error}`);
-      // Skip this scene if frame extraction fails
-    }
-  }
-
-  console.log(`  ✓ Converted ${cuts.length} cuts to ${scenes.length} scenes with frames`);
-  return scenes;
-}

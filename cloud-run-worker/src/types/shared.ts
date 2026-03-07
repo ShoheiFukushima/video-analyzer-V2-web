@@ -5,36 +5,6 @@
  */
 
 // ========================================
-// Detection Mode Types
-// ========================================
-
-/**
- * Video detection mode
- * - standard: Fast processing, detects hard cuts only
- * - enhanced: Better for fades, dissolves, text animations (slower)
- * - reverse_engineer: PySceneDetect ContentDetector — adaptive threshold, works on all videos
- */
-export type DetectionMode = 'standard' | 'enhanced' | 'reverse_engineer';
-
-/**
- * Detection mode descriptions for UI
- */
-export const DETECTION_MODE_INFO: Record<DetectionMode, { label: string; description: string }> = {
-  standard: {
-    label: 'Standard',
-    description: 'Fast processing, works well for most videos with hard cuts'
-  },
-  enhanced: {
-    label: 'Enhanced',
-    description: 'Better for fades, dissolves, text animations (2-3x processing time)'
-  },
-  reverse_engineer: {
-    label: 'Reverse Engineer',
-    description: 'PySceneDetect ContentDetector — adaptive threshold, works on all videos'
-  }
-};
-
-// ========================================
 // Processing Status Types
 // ========================================
 
@@ -76,8 +46,6 @@ export type ProcessingStage =
   | 'audio'
   | 'audio_skipped'
   | 'vad_whisper'
-  | 'luminance_detection'
-  | 'text_stabilization'
   | 'scene_ocr_excel'        // @deprecated - Use scene_detection, ocr_processing, excel_generation instead
   | 'scene_detection'        // シーン検出中 (60-67%)
   | 'frame_extraction'       // フレーム抽出中 (67-70%)
@@ -100,9 +68,6 @@ export interface ProcessingMetadata {
   scenesWithNarration?: number;
   resultR2Key?: string; // Production only - R2 key for result file download
   blobUrl?: string; // @deprecated - Use resultR2Key instead
-  detectionMode?: DetectionMode;
-  luminanceTransitionsDetected?: number;
-  textStabilizationPoints?: number;
   warnings?: string[]; // Non-fatal issues encountered during processing
 }
 
@@ -261,16 +226,13 @@ export interface CompressionResult {
  * Source of scene cut detection
  */
 export type SceneCutSource =
-  | 'transnet_v2'      // TransNet V2 deep learning detection
-  | 'ffmpeg_standard'  // FFmpeg standard detection
-  | 'ffmpeg_enhanced'  // FFmpeg enhanced detection
   | 'full_frame'       // Full-frame detection (for ROI compatibility)
   | 'roi_bottom'       // ROI detection (bottom region)
   | 'roi_center'       // ROI detection (center region)
   | 'roi_top_left'     // ROI detection (top-left region)
   | 'roi_top_right'    // ROI detection (top-right region)
   | 'both'             // Detected by both methods
-  | 'supplementary';   // Supplementary detection (luminance, black, etc.)
+  | 'pyscenedetect';   // PySceneDetect ContentDetector
 
 /**
  * Scene cut detected during video analysis
@@ -322,7 +284,6 @@ export interface ProcessVideoRequest {
   r2Key: string;
   fileName: string;
   dataConsent: boolean;
-  detectionMode?: DetectionMode;
 }
 
 export interface ProcessVideoResponse {

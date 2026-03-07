@@ -13,6 +13,9 @@ export declare const updateStatus: (uploadId: string, updates: Partial<Processin
 /**
  * Update phase progress (helper function for 3-phase UI)
  * Phase data is stored in metadata JSON for persistence
+ *
+ * Throttled: only writes to DB every 3 seconds (matches frontend poll interval).
+ * Phase completions and status changes always write through immediately.
  */
 export declare const updatePhaseProgress: (uploadId: string, phase: ProcessingPhase, phaseProgress: number, options?: {
     phaseStatus?: PhaseStatus;

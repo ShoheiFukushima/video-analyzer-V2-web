@@ -154,8 +154,24 @@ export const updateStatus = async (
       args.push(updates.error);
     }
     if (updates.metadata) {
-      setClauses.push('metadata = ?');
-      args.push(JSON.stringify(updates.metadata));
+      // Merge with existing metadata to preserve resultR2Key, fileName, etc.
+      // when phase updates write phase-only data to the metadata column
+      try {
+        const existing = await client.execute({
+          sql: 'SELECT metadata FROM processing_status WHERE upload_id = ?',
+          args: [uploadId],
+        });
+        const existingMeta = existing.rows[0]?.metadata
+          ? JSON.parse(existing.rows[0].metadata as string)
+          : {};
+        const merged = { ...existingMeta, ...updates.metadata };
+        setClauses.push('metadata = ?');
+        args.push(JSON.stringify(merged));
+      } catch {
+        // Fallback: write as-is if merge fails
+        setClauses.push('metadata = ?');
+        args.push(JSON.stringify(updates.metadata));
+      }
     }
 
     // Add upload_id for WHERE clause
@@ -216,9 +232,17 @@ export const updateStatus = async (
   }
 };
 
+// Throttle state for progress updates
+// Frontend polls every 3s, so writing more often is wasteful
+let lastProgressWriteTime = 0;
+const PROGRESS_THROTTLE_MS = 3000;
+
 /**
  * Update phase progress (helper function for 3-phase UI)
  * Phase data is stored in metadata JSON for persistence
+ *
+ * Throttled: only writes to DB every 3 seconds (matches frontend poll interval).
+ * Phase completions and status changes always write through immediately.
  */
 export const updatePhaseProgress = async (
   uploadId: string,
@@ -231,6 +255,23 @@ export const updatePhaseProgress = async (
     stage?: ProcessingStatus['stage'];
   }
 ): Promise<ProcessingStatus> => {
+  // Always write through for phase completions, skips, and first call
+  const isImportant = options?.phaseStatus === 'completed' || options?.phaseStatus === 'skipped';
+  const now = Date.now();
+
+  if (!isImportant && (now - lastProgressWriteTime < PROGRESS_THROTTLE_MS)) {
+    // Throttled: return minimal status without DB write
+    return {
+      uploadId,
+      userId: '',
+      status: 'processing',
+      progress: 0,
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  lastProgressWriteTime = now;
+
   // Skip progress updates during shutdown to prevent race condition with error status
   if (getShutdownFlag()) {
     console.log(`[${uploadId}] Skipping phase update - shutdown in progress`);

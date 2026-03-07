@@ -68,10 +68,13 @@ EXAMPLE BAD OUTPUT (DO NOT DO THIS):
 /**
  * Abstract base class for OCR providers
  */
+/** Cooldown schedule for consecutive failures (30s → 1m → 2m → 5m) */
+const COOLDOWN_SCHEDULE_MS = [30000, 60000, 120000, 300000];
 export class OCRProvider {
     constructor(config) {
         this._isAvailable = true;
         this.unavailableUntil = 0;
+        this.consecutiveFailures = 0;
         this.config = config;
         this.rateLimiter = new RateLimiter({
             maxConcurrent: config.maxParallel,
@@ -121,14 +124,18 @@ export class OCRProvider {
         return this._isAvailable;
     }
     /**
-     * Mark provider as temporarily unavailable
-     * @param durationMs - Cooldown duration in milliseconds
+     * Mark provider as temporarily unavailable with adaptive cooldown
+     * @param retryAfterMs - Optional Retry-After value from server (overrides schedule if larger)
      */
-    markUnavailable(durationMs = 30000) {
+    markUnavailable(retryAfterMs) {
+        this.consecutiveFailures++;
+        const scheduleIndex = Math.min(this.consecutiveFailures - 1, COOLDOWN_SCHEDULE_MS.length - 1);
+        const scheduledCooldown = COOLDOWN_SCHEDULE_MS[scheduleIndex];
+        const durationMs = retryAfterMs ? Math.max(retryAfterMs, scheduledCooldown) : scheduledCooldown;
         this._isAvailable = false;
         this.unavailableUntil = Date.now() + durationMs;
         this.stats.isAvailable = false;
-        console.warn(`[${this.name}] Marked as unavailable for ${durationMs}ms`);
+        console.warn(`[${this.name}] Marked as unavailable for ${durationMs}ms (consecutive failures: ${this.consecutiveFailures})`);
     }
     /**
      * Get provider statistics
@@ -143,6 +150,7 @@ export class OCRProvider {
         this.stats.totalRequests++;
         if (success) {
             this.stats.successfulRequests++;
+            this.consecutiveFailures = 0; // Reset on success
             // Update average processing time (exponential moving average)
             if (this.stats.avgProcessingTimeMs === 0) {
                 this.stats.avgProcessingTimeMs = processingTimeMs;

@@ -24,6 +24,8 @@ export interface RateLimiterConfig {
     retryDelayMs: number;
     /** Maximum retry attempts */
     maxRetries: number;
+    /** Jitter factor for backoff randomization (0-1, default: 0.5) */
+    jitterFactor?: number;
 }
 export interface RateLimiterStats {
     currentConcurrent: number;
@@ -64,7 +66,9 @@ export declare class Semaphore {
 export declare class SlidingWindowRateLimiter {
     private readonly windowMs;
     private readonly maxRequests;
+    private readonly minIntervalMs;
     private requestTimestamps;
+    private lastRequestTime;
     constructor(maxRequests: number, windowMs: number);
     /**
      * Clean up old timestamps outside the window
@@ -83,7 +87,7 @@ export declare class SlidingWindowRateLimiter {
      */
     getWaitTimeMs(): number;
     /**
-     * Wait until a request slot is available
+     * Wait until a request slot is available, with request smoothing
      */
     wait(): Promise<void>;
     /**
@@ -138,6 +142,27 @@ export declare function getGeminiRateLimiter(): RateLimiter;
  * Reset the Gemini rate limiter (for testing)
  */
 export declare function resetGeminiRateLimiter(): void;
+/**
+ * Create Whisper API rate limiter
+ * Default: 5 concurrent, 50 requests/minute
+ */
+export declare function createWhisperRateLimiter(): RateLimiter;
+/**
+ * Get or create the Whisper rate limiter singleton
+ */
+export declare function getWhisperRateLimiter(): RateLimiter;
+/**
+ * Reset the Whisper rate limiter (for testing)
+ */
+export declare function resetWhisperRateLimiter(): void;
+/**
+ * Extract Retry-After value from error response headers
+ * Supports both seconds (numeric) and HTTP-date formats
+ *
+ * @param error - Error object (may contain response headers)
+ * @returns Retry-after delay in milliseconds, or null if not present
+ */
+export declare function extractRetryAfter(error: unknown): number | null;
 /**
  * Check if an error is a rate limit error
  */

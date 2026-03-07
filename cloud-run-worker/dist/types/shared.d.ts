@@ -3,19 +3,6 @@
  *
  * Common types used across frontend and backend to ensure type consistency.
  */
-/**
- * Video detection mode
- * - standard: Fast processing, detects hard cuts only
- * - enhanced: Better for fades, dissolves, text animations (slower)
- */
-export type DetectionMode = 'standard' | 'enhanced';
-/**
- * Detection mode descriptions for UI
- */
-export declare const DETECTION_MODE_INFO: Record<DetectionMode, {
-    label: string;
-    description: string;
-}>;
 export type ProcessingStatusType = 'pending' | 'processing' | 'completed' | 'error';
 /**
  * Processing phase (1-3)
@@ -39,7 +26,7 @@ export interface PhaseInfo {
     estimatedTime?: string;
     subTask?: string;
 }
-export type ProcessingStage = 'downloading' | 'compressing' | 'metadata' | 'audio' | 'audio_skipped' | 'vad_whisper' | 'luminance_detection' | 'text_stabilization' | 'scene_ocr_excel' | 'scene_detection' | 'frame_extraction' | 'multi_frame_ocr' | 'ocr_processing' | 'ocr_completed' | 'batch_processing' | 'narration_mapping' | 'excel_generation' | 'upload_result' | 'completed';
+export type ProcessingStage = 'downloading' | 'compressing' | 'metadata' | 'audio' | 'audio_skipped' | 'vad_whisper' | 'scene_ocr_excel' | 'scene_detection' | 'frame_extraction' | 'multi_frame_ocr' | 'ocr_processing' | 'ocr_completed' | 'batch_processing' | 'narration_mapping' | 'excel_generation' | 'upload_result' | 'completed';
 export interface ProcessingMetadata {
     duration: number;
     segmentCount: number;
@@ -50,9 +37,7 @@ export interface ProcessingMetadata {
     scenesWithNarration?: number;
     resultR2Key?: string;
     blobUrl?: string;
-    detectionMode?: DetectionMode;
-    luminanceTransitionsDetected?: number;
-    textStabilizationPoints?: number;
+    warnings?: string[];
 }
 export interface ProcessingStatus {
     uploadId: string;
@@ -174,7 +159,7 @@ export interface CompressionResult {
 /**
  * Source of scene cut detection
  */
-export type SceneCutSource = 'transnet_v2' | 'ffmpeg_standard' | 'ffmpeg_enhanced' | 'full_frame' | 'roi_bottom' | 'roi_center' | 'roi_top_left' | 'roi_top_right' | 'both' | 'supplementary';
+export type SceneCutSource = 'full_frame' | 'roi_bottom' | 'roi_center' | 'roi_top_left' | 'roi_top_right' | 'both' | 'pyscenedetect';
 /**
  * Scene cut detected during video analysis
  */
@@ -213,7 +198,6 @@ export interface ProcessVideoRequest {
     r2Key: string;
     fileName: string;
     dataConsent: boolean;
-    detectionMode?: DetectionMode;
 }
 export interface ProcessVideoResponse {
     success: boolean;

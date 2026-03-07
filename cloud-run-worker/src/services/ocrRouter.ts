@@ -17,10 +17,11 @@
 
 import pLimit from 'p-limit';
 import { OCRProvider, OCRResult, OCRProviderStats } from './ocrProviderInterface.js';
-import { createGeminiProvider } from './providers/geminiProvider.js';
+import { createGeminiProvider, classifyGeminiError, type OCRErrorCategory } from './providers/geminiProvider.js';
 import { createMistralProvider } from './providers/mistralProvider.js';
 import { createGLMProvider } from './providers/glmProvider.js';
-import { createOpenAIProvider } from './providers/openaiProvider.js';
+// OpenAI is excluded from OCR providers — unreliable (rate limits, empty responses).
+// OpenAI SDK remains available for Whisper (STT) only.
 
 // ============================================================
 // Types and Interfaces
@@ -107,21 +108,20 @@ export class OCRRouter {
 
   /**
    * Initialize available providers
-   * Priority order: Gemini (1) > Mistral (2) > GLM (3) > OpenAI (4)
+   * Priority order: Gemini (1) > Mistral (2) > GLM (3)
+   * Note: OpenAI excluded — unreliable for OCR (rate limits, empty responses)
    */
   private initializeProviders(): void {
-    // Try to create each provider
+    // Try to create each provider (OpenAI excluded from OCR)
     const gemini = createGeminiProvider();
     const mistral = createMistralProvider();
     const glm = createGLMProvider();
-    const openai = createOpenAIProvider();
 
     // Collect all non-null providers
     const candidates: OCRProvider[] = [];
     if (gemini) candidates.push(gemini);
     if (mistral) candidates.push(mistral);
     if (glm) candidates.push(glm);
-    if (openai) candidates.push(openai);
 
     // Filter enabled providers and sort by priority
     const enabledProviders = candidates.filter((p) => p.enabled);
@@ -254,6 +254,9 @@ export class OCRRouter {
     );
 
     const providerUsage: Record<string, number> = {};
+    const errorCategories: Record<OCRErrorCategory, number> = {
+      rate_limit: 0, auth: 0, network: 0, server: 0, unknown: 0,
+    };
     const results: OCRResult[] = [];
     let successCount = 0;
     let failureCount = 0;
@@ -266,6 +269,7 @@ export class OCRRouter {
         if (!provider) {
           console.warn(`[OCRRouter] No provider available for task ${task.id}`);
           failureCount++;
+          errorCategories.unknown++;
           return {
             text: '',
             confidence: 0,
@@ -282,6 +286,8 @@ export class OCRRouter {
           successCount++;
           return result;
         } catch (error) {
+          const classified = classifyGeminiError(error);
+
           // Try fallback if enabled
           if (this.config.enableFallback) {
             try {
@@ -289,14 +295,22 @@ export class OCRRouter {
               providerUsage[result.provider] = (providerUsage[result.provider] || 0) + 1;
               successCount++;
               return result;
-            } catch {
-              // Fallback also failed
+            } catch (fallbackError) {
+              const fbClassified = classifyGeminiError(fallbackError);
+              console.warn(
+                `[OCRRouter] Task ${task.id} fallback also failed: ` +
+                  `provider=${provider.name}, category=${fbClassified.category}, ` +
+                  `detail=${fbClassified.detail.slice(0, 150)}`
+              );
             }
           }
 
           failureCount++;
+          errorCategories[classified.category]++;
           console.error(
-            `[OCRRouter] Task ${task.id} failed: ${error instanceof Error ? error.message : String(error)}`
+            `[OCRRouter] Task ${task.id} failed: provider=${provider.name}, ` +
+              `category=${classified.category}, status=${classified.status ?? 'N/A'}, ` +
+              `detail=${classified.detail.slice(0, 150)}`
           );
 
           return {
@@ -320,6 +334,17 @@ export class OCRRouter {
         `in ${(processingTimeMs / 1000).toFixed(2)}s`
     );
     console.log(`[OCRRouter] Provider usage:`, providerUsage);
+
+    // Log error breakdown if there were failures
+    if (failureCount > 0) {
+      const activeCategories = Object.entries(errorCategories)
+        .filter(([, count]) => count > 0)
+        .map(([cat, count]) => `${cat}=${count}`)
+        .join(', ');
+      console.error(
+        `[OCRRouter] Error summary: ${failureCount} failures — ${activeCategories}`
+      );
+    }
 
     return {
       results,

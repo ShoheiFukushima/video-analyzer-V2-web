@@ -21,8 +21,27 @@ const DEFAULT_OPTIONS: Required<RetryOptions> = {
  * Check if the error is retryable
  */
 function isRetryableError(status: number): boolean {
-  // Retry on auth errors and gateway errors
-  return [401, 502, 503, 504].includes(status);
+  // Retry on auth errors, rate limit, and gateway errors
+  return [401, 429, 502, 503, 504].includes(status);
+}
+
+/**
+ * Parse Retry-After header value into milliseconds
+ */
+function parseRetryAfter(response: Response): number | null {
+  const retryAfter = response.headers.get("retry-after");
+  if (!retryAfter) return null;
+
+  const seconds = Number(retryAfter);
+  if (!isNaN(seconds)) {
+    return seconds * 1000;
+  }
+  // Try HTTP-date format
+  const date = new Date(retryAfter);
+  if (!isNaN(date.getTime())) {
+    return Math.max(0, date.getTime() - Date.now());
+  }
+  return null;
 }
 
 /**
@@ -68,12 +87,18 @@ export async function fetchWithRetry(
         const error = new Error(`HTTP ${response.status}: ${response.statusText}`);
         onRetry(attempt, error);
 
+        // Use Retry-After header if present, otherwise exponential backoff
+        const retryAfterMs = parseRetryAfter(response);
+        const backoffMs = retryDelay * attempt;
+        const waitMs = retryAfterMs !== null ? Math.max(retryAfterMs, backoffMs) : backoffMs;
+
         console.warn(
           `[fetchWithRetry] Attempt ${attempt}/${maxRetries} failed with ${response.status}, ` +
-          `retrying in ${retryDelay}ms...`
+          `retrying in ${waitMs}ms...` +
+          (retryAfterMs !== null ? ` (Retry-After: ${retryAfterMs}ms)` : "")
         );
 
-        await sleep(retryDelay * attempt); // Exponential backoff
+        await sleep(waitMs);
         continue;
       }
 

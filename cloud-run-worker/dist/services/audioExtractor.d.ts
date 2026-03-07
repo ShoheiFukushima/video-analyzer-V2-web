@@ -24,6 +24,8 @@ export interface AudioExtractionConfig {
     volumeNormalization?: boolean;
     /** Audio bitrate (default: 64k for speech) */
     bitrate?: string;
+    /** Apply VAD preprocessing filters in the same pass (BGM suppression + voice enhancement) */
+    withVADPreprocessing?: boolean;
 }
 /**
  * Extract audio from video file optimized for Whisper transcription

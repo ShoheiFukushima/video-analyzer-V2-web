@@ -61,22 +61,6 @@ export declare const TIMEOUTS: {
      */
     readonly AUDIO_PREPROCESSING: 600000;
     /**
-     * Luminance detection timeout (5 minutes)
-     *
-     * Used for: FFmpeg signalstats luminance analysis (Enhanced mode)
-     * Typical duration: 20-60 seconds for 10-minute video, 2-3 minutes for 2GB
-     * Buffer: 2x typical duration for safety
-     */
-    readonly LUMINANCE_DETECTION: 300000;
-    /**
-     * Text stabilization detection timeout (10 minutes)
-     *
-     * Used for: Frame extraction and OCR for text stability detection (Enhanced mode)
-     * Typical duration: 30-90 seconds, 3-6 minutes for 2GB
-     * Buffer: 1.5x typical duration for safety
-     */
-    readonly TEXT_STABILIZATION: 600000;
-    /**
      * R2 chunk download timeout (5 minutes)
      *
      * Used for: Individual chunk download from R2 with Range header

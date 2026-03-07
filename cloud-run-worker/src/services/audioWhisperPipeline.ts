@@ -644,6 +644,17 @@ function validateChunkFile(chunk: AudioChunk, uploadId: string): boolean {
 }
 
 /**
+ * Get file size synchronously, return -1 if file doesn't exist
+ */
+function getFileSizeSync(filePath: string): number {
+  try {
+    return fs.statSync(filePath).size;
+  } catch {
+    return -1;
+  }
+}
+
+/**
  * Prepare Whisper API request parameters
  *
  * @param chunk - Audio chunk metadata
@@ -671,8 +682,80 @@ function prepareWhisperRequest(chunk: AudioChunk): WhisperRequestParams {
 async function callWhisperAPI(
   params: WhisperRequestParams
 ): Promise<WhisperVerboseResponse> {
-  const response: unknown = await (openai.audio.transcriptions.create as Function)(params);
-  return response as WhisperVerboseResponse;
+  try {
+    const response: unknown = await (openai.audio.transcriptions.create as Function)(params);
+    return response as WhisperVerboseResponse;
+  } catch (error) {
+    // Extract detailed error info from OpenAI SDK errors
+    const details = extractOpenAIErrorDetails(error);
+    if (details) {
+      throw new Error(details);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Extract detailed error information from OpenAI SDK errors
+ *
+ * OpenAI SDK wraps errors into typed classes (APIError, APIConnectionError, etc.)
+ * with status, code, type, cause, and request_id fields. This function extracts
+ * all available information for better debugging.
+ */
+function extractOpenAIErrorDetails(error: unknown): string | null {
+  if (!error || typeof error !== 'object') return null;
+
+  const err = error as Record<string, any>;
+  const parts: string[] = [];
+
+  // Error class name (e.g., APIConnectionError, RateLimitError)
+  const className = err.constructor?.name;
+  if (className && className !== 'Error') {
+    parts.push(`[${className}]`);
+  }
+
+  // HTTP status code
+  if (err.status !== undefined) {
+    parts.push(`status=${err.status}`);
+  }
+
+  // Error code from OpenAI (e.g., "insufficient_quota", "invalid_api_key")
+  if (err.code) {
+    parts.push(`code=${err.code}`);
+  }
+
+  // Error type (e.g., "invalid_request_error", "server_error")
+  if (err.type) {
+    parts.push(`type=${err.type}`);
+  }
+
+  // Request ID for OpenAI support
+  if (err.request_id) {
+    parts.push(`request_id=${err.request_id}`);
+  }
+
+  // Original message
+  if (err.message) {
+    parts.push(String(err.message));
+  }
+
+  // Cause chain (APIConnectionError stores the original error in cause)
+  if (err.cause) {
+    const cause = err.cause as Record<string, any>;
+    const causeInfo: string[] = [];
+    if (cause.code) causeInfo.push(`code=${cause.code}`);
+    if (cause.syscall) causeInfo.push(`syscall=${cause.syscall}`);
+    if (cause.hostname) causeInfo.push(`host=${cause.hostname}`);
+    if (cause.port) causeInfo.push(`port=${cause.port}`);
+    if (cause.message && cause.message !== err.message) {
+      causeInfo.push(String(cause.message));
+    }
+    if (causeInfo.length > 0) {
+      parts.push(`cause: {${causeInfo.join(', ')}}`);
+    }
+  }
+
+  return parts.length > 0 ? parts.join(' ') : null;
 }
 
 /**
@@ -764,6 +847,10 @@ async function transcribeAudioChunk(
   } catch (error) {
     const err = error as Error;
     console.error(`[${uploadId}] Whisper API failed for chunk ${chunk.chunkIndex} after all retries: ${err.message}`);
+    // Log first failure details for diagnosis (only first chunk to avoid log spam)
+    if (chunk.chunkIndex === 0 || chunk.chunkIndex % 50 === 0) {
+      console.error(`[${uploadId}] [WhisperDiag] chunk=${chunk.chunkIndex} file=${chunk.filePath} size=${getFileSizeSync(chunk.filePath)} error_type=${err.constructor?.name} stack=${err.stack?.split('\n').slice(0, 3).join(' | ')}`);
+    }
     return [];
   }
 }

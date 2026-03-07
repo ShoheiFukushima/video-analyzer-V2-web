@@ -1,9 +1,7 @@
 /**
- * FFmpeg Scene Detection Service
- * Implements multi-pass scene detection with mid-point frame extraction
- * Based on VideoContentAnalyzer V2's proven algorithm (100% OCR accuracy)
- *
- * Adapted from V1 for V2 architecture with Scene interface
+ * FFmpeg Utility Service
+ * Frame extraction, video metadata, and scene range generation.
+ * Scene detection is handled by PySceneDetect (pysceneDetector.ts).
  */
 import ffmpeg from 'fluent-ffmpeg';
 import { promises as fs } from 'fs';
@@ -11,7 +9,7 @@ import path from 'path';
 import { spawn, execSync } from 'child_process';
 import pLimit from 'p-limit';
 import { formatTimecode } from '../utils/timecode.js';
-import { TIMEOUTS, getSceneDetectionTimeout } from '../config/timeouts.js';
+import { TIMEOUTS } from '../config/timeouts.js';
 // Concurrency limit for parallel frame extraction
 // Balanced for 4 vCPU Cloud Run instance
 const FRAME_EXTRACTION_CONCURRENCY = 10;
@@ -44,710 +42,8 @@ function parseFFmpegTime(timeStr) {
     }
     return null;
 }
-/**
- * Default ROI configuration for Phase 2 (4 regions)
- * Added: 2025-11-14 - MVP implementation (bottom subtitle area)
- * Updated: 2025-11-14 - Phase 2 implementation (4 regions)
- * Covers 95%+ of videos with text overlays
- */
-const DEFAULT_ROI_CONFIG = {
-    enabled: false, // Disabled by default for backward compatibility
-    regions: [
-        {
-            name: 'bottom_subtitle',
-            crop: 'iw:ih*0.15:0:ih*0.85', // Bottom 15% of frame
-            thresholds: [0.01, 0.015], // Lower thresholds for subtitle detection
-            description: 'Bottom 15% subtitle area - detects text overlay changes'
-        },
-        {
-            name: 'center_text',
-            crop: 'iw:ih*0.15:0:ih*0.425', // Center 15% of frame
-            thresholds: [0.01, 0.015], // Lower thresholds for text detection
-            description: 'Center 15% main text area - detects primary text changes'
-        },
-        {
-            name: 'top_left_logo',
-            crop: 'iw*0.25:ih*0.1:0:0', // Top-left 25x10% area
-            thresholds: [0.015, 0.02], // Slightly higher thresholds for logo/branding
-            description: 'Top-left 10% logo area - detects logo/branding changes'
-        },
-        {
-            name: 'top_right_info',
-            crop: 'iw*0.25:ih*0.1:iw*0.75:0', // Top-right 25x10% area
-            thresholds: [0.015, 0.02], // Slightly higher thresholds for timestamp/info
-            description: 'Top-right 10% info area - detects timestamp/metadata changes'
-        }
-    ],
-    deduplicationInterval: 0.1 // 100ms deduplication (typical subtitle display precision)
-};
-/**
- * Default configuration based on V2 implementation
- * Updated: 2025-11-14 - Fine-tuned thresholds for stricter scene detection
- * Updated: 2025-11-14 - Increased minSceneInterval to skip fade-in animations
- */
-const DEFAULT_CONFIG = {
-    thresholds: [0.025, 0.055, 0.085], // Stricter multi-pass detection (fine-tuned from [0.02, 0.05, 0.08])
-    minSceneDuration: 0.5, // Filter out very short scenes (0.5s threshold)
-    minSceneInterval: 1.0, // Minimum 1.0 seconds between consecutive scene cuts (increased from 0.5s to skip subtitle fade-ins)
-    roi: undefined // ROI disabled by default (opt-in feature)
-};
-/**
- * Load ROI configuration from environment variables
- * Allows runtime configuration without code changes
- * @returns ROI configuration or undefined if disabled
- */
-function loadROIConfigFromEnv() {
-    const enabled = process.env.ROI_DETECTION_ENABLED === 'true';
-    if (!enabled) {
-        console.log('🔍 ROI detection disabled (ROI_DETECTION_ENABLED not set to "true")');
-        return undefined;
-    }
-    console.log('🔍 ROI detection enabled via environment variable');
-    // Use default configuration for MVP (bottom subtitle area)
-    // Future: Parse custom regions from ROI_REGIONS environment variable (JSON format)
-    return DEFAULT_ROI_CONFIG;
-}
-/**
- * Validate FFmpeg crop filter syntax
- * Prevents runtime errors from invalid crop expressions
- * @param cropFilter - FFmpeg crop filter string (e.g., "iw:ih*0.15:0:ih*0.85")
- * @returns true if valid
- * @throws Error if invalid syntax
- */
-function validateCropFilter(cropFilter) {
-    // Basic regex validation for crop syntax: width:height:x:y
-    // Allows: iw, ih, numeric values, arithmetic operators (*, +, -, /)
-    const regex = /^(iw|ih|\d+)([\*\+\-\/][\d\.]+)?:(iw|ih|\d+)([\*\+\-\/][\d\.]+)?:(\d+|iw[\*\+\-\/][\d\.]+|ih[\*\+\-\/][\d\.]+)?:(iw|ih|\d+)([\*\+\-\/][\d\.]+)?$/;
-    if (!regex.test(cropFilter)) {
-        throw new Error(`Invalid crop filter syntax: ${cropFilter}\n` +
-            `Expected format: width:height:x:y\n` +
-            `Examples:\n` +
-            `  - iw:ih*0.3:0:ih*0.7 (bottom 30%)\n` +
-            `  - iw:ih*0.15:0:ih*0.85 (bottom 15%)\n` +
-            `  - iw*0.5:ih:100:0 (left 50%, offset 100px from left)`);
-    }
-    return true;
-}
-/**
- * Merge scene cuts from full-frame and ROI detection
- * Preserves source information and assigns detection reasons
- * @param fullFrameCuts - Cuts detected from full-frame analysis
- * @param roiCuts - Cuts detected from ROI analysis
- * @param roiRegionName - Name of the ROI region (e.g., 'bottom_subtitle')
- * @returns Merged array of scene cuts with source and detectionReason fields
- */
-function mergeCutsWithSource(fullFrameCuts, roiCuts, roiRegionName = 'roi_bottom') {
-    const mergedMap = new Map();
-    // Add full-frame cuts with source='full_frame'
-    fullFrameCuts.forEach(cut => {
-        mergedMap.set(cut.timestamp, {
-            ...cut,
-            source: 'full_frame',
-            detectionReason: 'scene_change'
-        });
-    });
-    // Add or merge ROI cuts
-    roiCuts.forEach(cut => {
-        const existing = mergedMap.get(cut.timestamp);
-        if (existing) {
-            // Detected by both full-frame and ROI → source='both'
-            mergedMap.set(cut.timestamp, {
-                timestamp: cut.timestamp,
-                confidence: Math.max(existing.confidence, cut.confidence),
-                source: 'both',
-                detectionReason: 'both'
-            });
-        }
-        else {
-            // Detected only by ROI → infer source from region name
-            const source = roiRegionName === 'bottom_subtitle' ? 'roi_bottom' :
-                roiRegionName === 'center_text' ? 'roi_center' :
-                    roiRegionName === 'top_left_logo' ? 'roi_top_left' :
-                        roiRegionName === 'top_right_info' ? 'roi_top_right' : 'roi_bottom';
-            const detectionReason = roiRegionName === 'bottom_subtitle' ? 'subtitle_change' : 'text_overlay_change';
-            mergedMap.set(cut.timestamp, {
-                ...cut,
-                source: source,
-                detectionReason
-            });
-        }
-    });
-    // Convert map to sorted array
-    return Array.from(mergedMap.values())
-        .sort((a, b) => a.timestamp - b.timestamp);
-}
-/**
- * Remove duplicate scene cuts that are too close together
- * Enhanced version that preserves source and detectionReason fields
- * @param cuts - Array of scene cuts to deduplicate
- * @param minInterval - Minimum interval in seconds between cuts (default: 0.1s)
- * @returns Deduplicated array of scene cuts
- */
-function deduplicateCuts(cuts, minInterval = 0.1) {
-    if (cuts.length === 0)
-        return cuts;
-    const deduplicated = [cuts[0]];
-    let removedCount = 0;
-    for (let i = 1; i < cuts.length; i++) {
-        const lastCut = deduplicated[deduplicated.length - 1];
-        const currentCut = cuts[i];
-        const timeDiff = currentCut.timestamp - lastCut.timestamp;
-        if (timeDiff >= minInterval) {
-            // Keep this cut (sufficiently far from previous)
-            deduplicated.push(currentCut);
-        }
-        else {
-            // Too close → choose cut with higher confidence
-            if (currentCut.confidence > lastCut.confidence) {
-                deduplicated[deduplicated.length - 1] = currentCut;
-                console.log(`  ⚠️  Replaced duplicate at ${lastCut.timestamp.toFixed(1)}s ` +
-                    `with higher confidence cut at ${currentCut.timestamp.toFixed(1)}s ` +
-                    `(confidence: ${lastCut.confidence} → ${currentCut.confidence})`);
-            }
-            removedCount++;
-        }
-    }
-    if (removedCount > 0) {
-        console.log(`  ✓ Deduplication: ${cuts.length} → ${deduplicated.length} cuts ` +
-            `(removed: ${removedCount}, minInterval: ${minInterval}s)`);
-    }
-    return deduplicated;
-}
-/**
- * ROI-based multi-pass scene detection
- * Runs detection on a cropped region with multiple thresholds
- * @param videoPath - Path to the video file
- * @param region - ROI region configuration
- * @returns Array of scene cuts detected in the ROI
- */
-async function detectROICuts(videoPath, region) {
-    const allCuts = new Map(); // timestamp -> confidence
-    console.log(`🔍 Starting ROI scene detection for region: ${region.name}`);
-    console.log(`  Crop: ${region.crop}, Thresholds: ${region.thresholds.join(', ')}`);
-    for (const threshold of region.thresholds) {
-        console.log(`  📊 Running ROI detection pass with threshold ${threshold}...`);
-        const cuts = await runSceneDetectionWithCrop(videoPath, region.crop, threshold);
-        console.log(`  ✓ Found ${cuts.length} cuts in ROI at threshold ${threshold}`);
-        // Merge cuts with maximum confidence
-        cuts.forEach(cut => {
-            const existingConfidence = allCuts.get(cut.timestamp) || 0;
-            allCuts.set(cut.timestamp, Math.max(existingConfidence, cut.confidence));
-        });
-    }
-    // Convert map to array and sort by timestamp
-    const mergedCuts = Array.from(allCuts.entries())
-        .map(([timestamp, confidence]) => ({ timestamp, confidence }))
-        .sort((a, b) => a.timestamp - b.timestamp);
-    console.log(`✅ ROI detection complete: ${mergedCuts.length} total scene cuts in ${region.name}`);
-    return mergedCuts;
-}
-/**
- * Multi-pass FFmpeg scene detection with optional ROI support
- * Runs detection with multiple thresholds and merges results
- * Optionally includes ROI-based detection for subtitle/text changes
- * @param videoPath - Path to the video file
- * @param config - Detection configuration
- * @param videoDuration - Video duration in seconds (for progress tracking)
- * @param onProgress - Progress callback for UI updates
- * @returns Array of scene cuts with confidence scores and source information
- */
-async function detectSceneCuts(videoPath, config = DEFAULT_CONFIG, videoDuration, onProgress) {
-    // Load ROI configuration from environment if not provided in config
-    const roiConfig = config.roi || loadROIConfigFromEnv();
-    // Step 1: Full-frame multi-pass scene detection (PARALLEL)
-    const allCuts = new Map(); // timestamp -> confidence
-    console.log(`🔍 Starting PARALLEL multi-pass scene detection with thresholds: ${config.thresholds.join(', ')}`);
-    // Track progress across parallel runs (use max progress from any threshold)
-    let maxProgressTime = 0;
-    let lastProgressCall = 0;
-    const progressWrapper = onProgress
-        ? (currentTime, totalDuration, formatted) => {
-            const now = Date.now();
-            // Forward progress if it's higher than before, or if it's been more than 1 second
-            if (currentTime > maxProgressTime || (now - lastProgressCall) > 1000) {
-                if (currentTime > maxProgressTime) {
-                    maxProgressTime = currentTime;
-                }
-                lastProgressCall = now;
-                console.log(`  [detectSceneCuts] Forwarding progress: ${formatted}`);
-                onProgress(currentTime, totalDuration, formatted);
-            }
-        }
-        : undefined;
-    // Run all threshold detections in parallel
-    const startTime = Date.now();
-    const thresholdResults = await Promise.all(config.thresholds.map(async (threshold) => {
-        console.log(`  📊 Starting detection pass with threshold ${threshold}...`);
-        const cuts = await runSceneDetection(videoPath, threshold, videoDuration, progressWrapper);
-        console.log(`  ✓ Found ${cuts.length} cuts at threshold ${threshold}`);
-        return { threshold, cuts };
-    }));
-    // Merge all results
-    thresholdResults.forEach(({ cuts }) => {
-        cuts.forEach(cut => {
-            const existingConfidence = allCuts.get(cut.timestamp) || 0;
-            allCuts.set(cut.timestamp, Math.max(existingConfidence, cut.confidence));
-        });
-    });
-    const parallelTime = Date.now() - startTime;
-    console.log(`  ⚡ Parallel detection completed in ${(parallelTime / 1000).toFixed(1)}s`);
-    // Convert map to array and sort by timestamp
-    let fullFrameCuts = Array.from(allCuts.entries())
-        .map(([timestamp, confidence]) => ({ timestamp, confidence }))
-        .sort((a, b) => a.timestamp - b.timestamp);
-    console.log(`✅ Full-frame detection complete: ${fullFrameCuts.length} scene cuts`);
-    // Step 2: ROI-based scene detection (if enabled) - PARALLEL
-    let finalCuts = fullFrameCuts;
-    if (roiConfig && roiConfig.enabled && roiConfig.regions.length > 0) {
-        console.log(`🎯 ROI detection enabled: processing ${roiConfig.regions.length} region(s) in PARALLEL`);
-        // Phase 2: Process all ROI regions in parallel
-        const roiStartTime = Date.now();
-        // Log all regions being processed
-        roiConfig.regions.forEach(region => {
-            console.log(`  📍 Region: ${region.name} (${region.crop})`);
-        });
-        // Run all ROI detections in parallel
-        const roiResults = await Promise.all(roiConfig.regions.map(async (region) => {
-            const cuts = await detectROICuts(videoPath, region);
-            return { region, cuts };
-        }));
-        // Aggregate results
-        let allRoiCuts = [];
-        const roiRegionCounts = {};
-        roiResults.forEach(({ region, cuts }) => {
-            roiRegionCounts[region.name] = cuts.length;
-            allRoiCuts = [...allRoiCuts, ...cuts];
-            console.log(`   ✅ Region "${region.name}": ${cuts.length} cuts detected`);
-        });
-        const roiParallelTime = Date.now() - roiStartTime;
-        console.log(`  ⚡ Parallel ROI detection completed in ${(roiParallelTime / 1000).toFixed(1)}s`);
-        console.log(`\n📊 ROI Detection Summary:`);
-        console.log(`   Full-frame cuts: ${fullFrameCuts.length}`);
-        Object.entries(roiRegionCounts).forEach(([name, count]) => {
-            console.log(`   ${name}: ${count} cuts`);
-        });
-        console.log(`   Total ROI cuts (before merge): ${allRoiCuts.length}`);
-        // Merge all ROI results with full-frame (use generic 'roi_detection' as source)
-        const mergedCuts = mergeCutsWithSource(fullFrameCuts, allRoiCuts, 'roi_detection');
-        console.log(`✅ Merged full-frame (${fullFrameCuts.length}) + ROI (${allRoiCuts.length}) → ${mergedCuts.length} total cuts`);
-        // Deduplicate with ROI-specific interval (default: 100ms)
-        const deduplicationInterval = roiConfig.deduplicationInterval || 0.1;
-        finalCuts = deduplicateCuts(mergedCuts, deduplicationInterval);
-    }
-    else {
-        console.log(`ℹ️  ROI detection disabled (using full-frame results only)`);
-        finalCuts = fullFrameCuts;
-    }
-    console.log(`✅ Scene detection complete: ${finalCuts.length} total scene cuts`);
-    // Step 3: Apply minimum scene interval filter if configured
-    if (config.minSceneInterval && config.minSceneInterval > 0) {
-        const filteredCuts = filterCloseScenes(finalCuts, config.minSceneInterval);
-        // Log ROI detection results summary
-        if (roiConfig && roiConfig.enabled) {
-            logROIDetectionResults(filteredCuts);
-        }
-        return filteredCuts;
-    }
-    // Log ROI detection results summary
-    if (roiConfig && roiConfig.enabled) {
-        logROIDetectionResults(finalCuts);
-    }
-    return finalCuts;
-}
-/**
- * Log ROI detection results with source and detection reason
- * Provides visual summary of how each scene was detected
- * @param cuts - Array of scene cuts with source/detectionReason fields
- */
-function logROIDetectionResults(cuts) {
-    if (cuts.length === 0) {
-        console.log('ℹ️  No scene cuts to analyze');
-        return;
-    }
-    // Count detection sources
-    const stats = {
-        fullFrame: 0,
-        roiOnly: 0,
-        both: 0,
-        noSource: 0
-    };
-    cuts.forEach(cut => {
-        if (!cut.source) {
-            stats.noSource++;
-        }
-        else if (cut.source === 'full_frame') {
-            stats.fullFrame++;
-        }
-        else if (cut.source === 'both') {
-            stats.both++;
-        }
-        else {
-            stats.roiOnly++;
-        }
-    });
-    console.log('\n📊 ROI Detection Results Summary:');
-    console.log(`   Total scene cuts: ${cuts.length}`);
-    if (stats.noSource > 0) {
-        console.log(`   🎬 Full-frame only: ${stats.noSource} (backward compatible mode)`);
-    }
-    else {
-        console.log(`   🎬 Full-frame detection: ${stats.fullFrame} (camera work, scene changes)`);
-        console.log(`   🎯 ROI detection: ${stats.roiOnly} (subtitle/text changes)`);
-        console.log(`   🔗 Both detected: ${stats.both} (scene change + text change)`);
-    }
-    // Detailed breakdown (first 10 cuts)
-    if (cuts.length > 0 && cuts[0].source) {
-        console.log('\n   First 10 scene cuts:');
-        cuts.slice(0, 10).forEach((cut, idx) => {
-            const icon = cut.source === 'full_frame' ? '🎬' :
-                cut.source === 'both' ? '🔗' : '🎯';
-            const reason = cut.detectionReason || 'unknown';
-            console.log(`   ${icon} ${(idx + 1).toString().padStart(2)}) ${cut.timestamp.toFixed(1)}s (${reason})`);
-        });
-        if (cuts.length > 10) {
-            console.log(`   ... and ${cuts.length - 10} more cuts`);
-        }
-    }
-    console.log('');
-}
-/**
- * Filter out scene cuts that are too close together
- * Prevents detection of multiple similar scenes in rapid succession
- * @param cuts - Array of scene cuts
- * @param minInterval - Minimum interval in seconds between scene cuts
- * @returns Filtered array of scene cuts
- */
-function filterCloseScenes(cuts, minInterval) {
-    if (cuts.length === 0)
-        return cuts;
-    const filteredCuts = [cuts[0]];
-    let skippedCount = 0;
-    for (let i = 1; i < cuts.length; i++) {
-        const timeSinceLastCut = cuts[i].timestamp - filteredCuts[filteredCuts.length - 1].timestamp;
-        if (timeSinceLastCut >= minInterval) {
-            filteredCuts.push(cuts[i]);
-        }
-        else {
-            skippedCount++;
-            console.log(`  ⏭️  Skipping close scene cut at ${cuts[i].timestamp.toFixed(1)}s (${timeSinceLastCut.toFixed(1)}s < ${minInterval}s since last cut)`);
-        }
-    }
-    console.log(`  ✓ Filtered ${cuts.length} → ${filteredCuts.length} cuts (minInterval: ${minInterval}s, skipped: ${skippedCount})`);
-    return filteredCuts;
-}
-/**
- * Run FFmpeg scene detection with single threshold
- * Uses spawn directly with gVisor-compatible environment settings
- * @param videoPath - Path to the video file
- * @param threshold - Scene detection threshold (0.0-1.0)
- * @returns Array of scene cuts
- */
-function runSceneDetection(videoPath, threshold, videoDuration, onProgress) {
-    return new Promise((resolve, reject) => {
-        const cuts = [];
-        const TIMEOUT_MS = getSceneDetectionTimeout();
-        let completed = false;
-        let lastProgressTime = 0;
-        const PROGRESS_INTERVAL_MS = 500; // Update progress every 0.5 seconds for more responsive UI
-        let lastProgressUpdate = 0;
-        console.log(`    [SceneDetect] Starting FFmpeg spawn for threshold ${threshold} (timeout: ${TIMEOUT_MS / 60000}min)...`);
-        // Set gVisor-compatible environment
-        const ffmpegEnv = {
-            ...process.env,
-            FONTCONFIG_PATH: '',
-            FONTCONFIG_FILE: '/dev/null',
-            FC_DEBUG: '0',
-            HOME: '/tmp',
-            XDG_CACHE_HOME: '/tmp',
-            XDG_CONFIG_HOME: '/tmp',
-            FFREPORT: '',
-            AV_LOG_FORCE_NOCOLOR: '1',
-        };
-        // Use spawn directly for better control
-        const ffmpegArgs = [
-            '-nostdin', // Disable stdin interaction
-            '-y', // Overwrite output
-            '-stats', // Enable progress stats output (time=XX:XX:XX)
-            '-i', videoPath,
-            '-vf', `select='gt(scene,${threshold})',showinfo`,
-            '-f', 'null',
-            '-'
-        ];
-        console.log(`    [SceneDetect] FFmpeg command: ffmpeg ${ffmpegArgs.join(' ').substring(0, 100)}...`);
-        const proc = spawn('ffmpeg', ffmpegArgs, {
-            env: ffmpegEnv,
-            stdio: ['ignore', 'pipe', 'pipe'],
-        });
-        let stderrBuffer = '';
-        let lastActivityTime = Date.now();
-        // Timeout handler
-        const timeoutId = setTimeout(() => {
-            if (!completed) {
-                completed = true;
-                console.error(`    [SceneDetect] ❌ Timeout after ${TIMEOUT_MS / 1000}s (threshold: ${threshold})`);
-                proc.kill('SIGKILL');
-                reject(new Error(`FFmpeg scene detection timed out after ${TIMEOUT_MS}ms (threshold: ${threshold})`));
-            }
-        }, TIMEOUT_MS);
-        // Timer-based progress estimation (fallback when FFmpeg stats don't show time=)
-        // Estimate: FFmpeg processes video at ~10-50x realtime speed on Cloud Run
-        const estimatedSpeedMultiplier = 20; // Conservative estimate
-        const startTime = Date.now();
-        let timerProgressInterval = null;
-        let lastTimerUpdate = 0;
-        const updateTimerProgress = () => {
-            if (completed)
-                return;
-            const elapsedMs = Date.now() - startTime;
-            const estimatedCurrentTime = Math.min((elapsedMs / 1000) * estimatedSpeedMultiplier, videoDuration * 0.95 // Cap at 95% to avoid showing 100% before completion
-            );
-            // Update every time (don't check lastProgressTime - let progressWrapper handle dedup)
-            const formatted = `${formatTimeForProgress(estimatedCurrentTime)} / ${formatTimeForProgress(videoDuration)}`;
-            console.log(`    [SceneDetect] Timer-based progress: ${formatted} (elapsed: ${elapsedMs}ms)`);
-            onProgress(estimatedCurrentTime, videoDuration, formatted);
-            lastTimerUpdate = Date.now();
-        };
-        if (onProgress && videoDuration && videoDuration > 0) {
-            // Fire immediately, then every 1 second
-            updateTimerProgress();
-            timerProgressInterval = setInterval(updateTimerProgress, 1000);
-        }
-        // Activity watchdog - kill if no output for 60 seconds
-        const activityInterval = setInterval(() => {
-            const idleTime = Date.now() - lastActivityTime;
-            if (idleTime > 60000) { // 60 seconds idle
-                if (!completed) {
-                    completed = true;
-                    console.error(`    [SceneDetect] ❌ FFmpeg idle for ${idleTime / 1000}s - killing process`);
-                    clearTimeout(timeoutId);
-                    clearInterval(activityInterval);
-                    if (timerProgressInterval)
-                        clearInterval(timerProgressInterval);
-                    proc.kill('SIGKILL');
-                    reject(new Error(`FFmpeg scene detection stalled (no output for ${idleTime / 1000}s)`));
-                }
-            }
-        }, 10000); // Check every 10 seconds
-        // Handle stdout (not used but capture anyway)
-        proc.stdout?.on('data', () => {
-            lastActivityTime = Date.now();
-        });
-        // Handle stderr (contains scene detection output)
-        proc.stderr?.on('data', (data) => {
-            lastActivityTime = Date.now();
-            stderrBuffer += data.toString();
-            // Process complete lines
-            // Note: FFmpeg uses \r for progress updates and \n for other messages
-            const lines = stderrBuffer.split(/[\r\n]+/);
-            stderrBuffer = lines.pop() || ''; // Keep incomplete line in buffer
-            for (const line of lines) {
-                // Debug: Log FFmpeg progress lines (sample every 10th to avoid spam)
-                if (line.includes('frame=') && Math.random() < 0.1) {
-                    console.log(`    [SceneDetect] FFmpeg line sample: ${line.substring(0, 100)}`);
-                }
-                // Parse FFmpeg output for scene timestamps
-                // Format: "frame:123 pts:12345 pts_time:12.345"
-                const ptsMatch = line.match(/pts_time:(\d+\.?\d*)/);
-                if (ptsMatch) {
-                    const timestamp = parseFloat(ptsMatch[1]);
-                    cuts.push({
-                        timestamp: Math.floor(timestamp * 10) / 10, // Round to 0.1s precision
-                        confidence: threshold
-                    });
-                }
-                // Parse FFmpeg progress output for current position
-                // Format: "frame=  123 fps= 50 q=-0.0 size=N/A time=00:01:23.45 bitrate=N/A"
-                if (onProgress && videoDuration && videoDuration > 0) {
-                    const timeMatch = line.match(/time=(\d+:\d+:\d+\.?\d*|\d+:\d+\.?\d*)/);
-                    if (timeMatch) {
-                        const currentTime = parseFFmpegTime(timeMatch[1]);
-                        console.log(`    [SceneDetect] Progress: time=${timeMatch[1]} → ${currentTime}s (duration: ${videoDuration}s)`);
-                        if (currentTime !== null && currentTime > lastProgressTime) {
-                            const now = Date.now();
-                            // Throttle progress updates to avoid flooding
-                            if (now - lastProgressUpdate >= PROGRESS_INTERVAL_MS) {
-                                lastProgressTime = currentTime;
-                                lastProgressUpdate = now;
-                                const formatted = `${formatTimeForProgress(currentTime)} / ${formatTimeForProgress(videoDuration)}`;
-                                console.log(`    [SceneDetect] Calling progress callback: ${formatted}`);
-                                onProgress(currentTime, videoDuration, formatted);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        proc.on('close', (code, signal) => {
-            if (completed)
-                return;
-            completed = true;
-            clearTimeout(timeoutId);
-            clearInterval(activityInterval);
-            if (timerProgressInterval)
-                clearInterval(timerProgressInterval);
-            if (code === 0 || code === null) {
-                // Process any remaining data in buffer
-                if (stderrBuffer) {
-                    const match = stderrBuffer.match(/pts_time:(\d+\.?\d*)/);
-                    if (match) {
-                        const timestamp = parseFloat(match[1]);
-                        cuts.push({
-                            timestamp: Math.floor(timestamp * 10) / 10,
-                            confidence: threshold
-                        });
-                    }
-                }
-                console.log(`    [SceneDetect] ✓ FFmpeg completed: ${cuts.length} cuts detected`);
-                resolve(cuts);
-            }
-            else {
-                console.error(`    [SceneDetect] FFmpeg exited with code ${code}, signal ${signal}`);
-                reject(new Error(`FFmpeg scene detection failed with code ${code}`));
-            }
-        });
-        proc.on('error', (err) => {
-            if (completed)
-                return;
-            completed = true;
-            clearTimeout(timeoutId);
-            clearInterval(activityInterval);
-            if (timerProgressInterval)
-                clearInterval(timerProgressInterval);
-            console.error(`    [SceneDetect] FFmpeg spawn error: ${err.message}`);
-            reject(new Error(`FFmpeg spawn error: ${err.message}`));
-        });
-    });
-}
-/**
- * Run FFmpeg scene detection on a cropped region (ROI-based detection)
- * Uses spawn directly with gVisor-compatible environment settings
- * @param videoPath - Path to the video file
- * @param cropFilter - FFmpeg crop filter syntax (e.g., "iw:ih*0.15:0:ih*0.85")
- * @param threshold - Scene detection threshold (0.0-1.0)
- * @returns Array of scene cuts detected in the ROI
- */
-function runSceneDetectionWithCrop(videoPath, cropFilter, threshold) {
-    return new Promise((resolve, reject) => {
-        // Validate crop filter syntax before execution
-        try {
-            validateCropFilter(cropFilter);
-        }
-        catch (error) {
-            reject(error);
-            return;
-        }
-        const cuts = [];
-        const TIMEOUT_MS = getSceneDetectionTimeout();
-        let completed = false;
-        console.log(`    [SceneDetect-ROI] Starting FFmpeg spawn (crop: ${cropFilter}, threshold: ${threshold}, timeout: ${TIMEOUT_MS / 60000}min)...`);
-        // Set gVisor-compatible environment
-        const ffmpegEnv = {
-            ...process.env,
-            FONTCONFIG_PATH: '',
-            FONTCONFIG_FILE: '/dev/null',
-            FC_DEBUG: '0',
-            HOME: '/tmp',
-            XDG_CACHE_HOME: '/tmp',
-            XDG_CONFIG_HOME: '/tmp',
-            FFREPORT: '',
-            AV_LOG_FORCE_NOCOLOR: '1',
-        };
-        // Use spawn directly for better control
-        const ffmpegArgs = [
-            '-nostdin', // Disable stdin interaction
-            '-y', // Overwrite output
-            '-i', videoPath,
-            '-vf', `crop=${cropFilter},select='gt(scene,${threshold})',showinfo`,
-            '-f', 'null',
-            '-'
-        ];
-        const proc = spawn('ffmpeg', ffmpegArgs, {
-            env: ffmpegEnv,
-            stdio: ['ignore', 'pipe', 'pipe'],
-        });
-        let stderrBuffer = '';
-        let lastActivityTime = Date.now();
-        // Timeout handler
-        const timeoutId = setTimeout(() => {
-            if (!completed) {
-                completed = true;
-                console.error(`    [SceneDetect-ROI] ❌ Timeout after ${TIMEOUT_MS / 1000}s`);
-                proc.kill('SIGKILL');
-                reject(new Error(`FFmpeg ROI scene detection timed out after ${TIMEOUT_MS}ms ` +
-                    `(crop: ${cropFilter}, threshold: ${threshold})`));
-            }
-        }, TIMEOUT_MS);
-        // Activity watchdog - kill if no output for 60 seconds
-        const activityInterval = setInterval(() => {
-            const idleTime = Date.now() - lastActivityTime;
-            if (idleTime > 60000) { // 60 seconds idle
-                if (!completed) {
-                    completed = true;
-                    console.error(`    [SceneDetect-ROI] ❌ FFmpeg idle for ${idleTime / 1000}s - killing process`);
-                    clearTimeout(timeoutId);
-                    clearInterval(activityInterval);
-                    proc.kill('SIGKILL');
-                    reject(new Error(`FFmpeg ROI scene detection stalled (no output for ${idleTime / 1000}s)`));
-                }
-            }
-        }, 10000); // Check every 10 seconds
-        proc.stdout?.on('data', () => {
-            lastActivityTime = Date.now();
-        });
-        proc.stderr?.on('data', (data) => {
-            lastActivityTime = Date.now();
-            stderrBuffer += data.toString();
-            // Process complete lines
-            // Note: FFmpeg uses \r for progress updates and \n for other messages
-            const lines = stderrBuffer.split(/[\r\n]+/);
-            stderrBuffer = lines.pop() || '';
-            for (const line of lines) {
-                const match = line.match(/pts_time:(\d+\.?\d*)/);
-                if (match) {
-                    const timestamp = parseFloat(match[1]);
-                    cuts.push({
-                        timestamp: Math.floor(timestamp * 10) / 10,
-                        confidence: threshold
-                    });
-                }
-            }
-        });
-        proc.on('close', (code, signal) => {
-            if (completed)
-                return;
-            completed = true;
-            clearTimeout(timeoutId);
-            clearInterval(activityInterval);
-            if (code === 0 || code === null) {
-                if (stderrBuffer) {
-                    const match = stderrBuffer.match(/pts_time:(\d+\.?\d*)/);
-                    if (match) {
-                        const timestamp = parseFloat(match[1]);
-                        cuts.push({
-                            timestamp: Math.floor(timestamp * 10) / 10,
-                            confidence: threshold
-                        });
-                    }
-                }
-                console.log(`    [SceneDetect-ROI] ✓ FFmpeg completed: ${cuts.length} cuts detected`);
-                resolve(cuts);
-            }
-            else {
-                console.error(`    [SceneDetect-ROI] FFmpeg exited with code ${code}, signal ${signal}`);
-                reject(new Error(`FFmpeg ROI scene detection failed with code ${code}`));
-            }
-        });
-        proc.on('error', (err) => {
-            if (completed)
-                return;
-            completed = true;
-            clearTimeout(timeoutId);
-            clearInterval(activityInterval);
-            console.error(`    [SceneDetect-ROI] FFmpeg spawn error: ${err.message}`);
-            reject(new Error(`FFmpeg ROI spawn error: ${err.message}`));
-        });
-    });
-}
+// Scene detection is handled by PySceneDetect (pysceneDetector.ts)
+// FFmpeg is used only for frame extraction and metadata
 /**
  * Generate scene ranges from detected cuts
  * Calculates mid-point (50% between scene detection points)
@@ -756,10 +52,18 @@ function runSceneDetectionWithCrop(videoPath, cropFilter, threshold) {
  * @param config - Scene detection configuration
  * @returns Array of scene ranges with mid-points
  */
-async function generateSceneRanges(cuts, videoDuration, config = DEFAULT_CONFIG) {
+async function generateSceneRanges(cuts, videoDuration, minSceneDuration = 0.2, telopAnimations = [], panAnimations = []) {
     const scenes = [];
     let sceneNumber = 1;
+    let telopAdjustCount = 0;
+    let panAdjustCount = 0;
     console.log(`📐 Generating scene ranges from ${cuts.length} cuts...`);
+    if (telopAnimations.length > 0) {
+        console.log(`  🎯 Telop animations: ${telopAnimations.length} regions for midTime avoidance`);
+    }
+    if (panAnimations.length > 0) {
+        console.log(`  📷 Camera pans: ${panAnimations.length} regions for midTime avoidance`);
+    }
     for (let i = 0; i < cuts.length; i++) {
         const startTime = cuts[i].timestamp;
         const endTime = i < cuts.length - 1 ? cuts[i + 1].timestamp : videoDuration;
@@ -767,25 +71,82 @@ async function generateSceneRanges(cuts, videoDuration, config = DEFAULT_CONFIG)
         // Filter out very short scenes
         // Note: sceneNumber increments ONLY for valid scenes (duration >= minSceneDuration)
         // This ensures sequential numbering (1, 2, 3...) even when short scenes are skipped
-        if (duration < config.minSceneDuration) {
-            console.log(`  ⏭️  Skipping short scene (${duration.toFixed(2)}s < ${config.minSceneDuration}s)`);
+        if (duration < minSceneDuration) {
+            console.log(`  ⏭️  Skipping short scene (${duration.toFixed(2)}s < ${minSceneDuration}s)`);
             continue; // Skip without consuming a scene number
         }
-        // Calculate screenshot capture point (50% mid-point position)
-        // Combined with minSceneInterval=1.0s to ensure fade-in animations are complete
-        // The 1.0s interval skips fade-in detections, so mid-point (50%) is now optimal
-        const captureRatio = 0.5; // 50% mid-point (reverted from 0.75)
-        const midTime = startTime + (endTime - startTime) * captureRatio;
+        // Scene 1: always use 0 frame (avoids telop animation at start)
+        // Other scenes: 50% midpoint
+        const isDissolve = cuts[i].detectionReason === 'dissolve_transition';
+        const dissolveStart = cuts[i].dissolveStart;
+        const dissolveEnd = cuts[i].dissolveEnd;
+        let midTime = (i === 0) ? 0 : startTime + (endTime - startTime) * 0.5;
+        // Debug: Log scene details for dissolve diagnosis
+        if (i > 0) {
+            const nextCut = i < cuts.length - 1 ? cuts[i + 1] : null;
+            console.log(`  📊 Scene ${sceneNumber}: start=${startTime.toFixed(2)}s end=${endTime.toFixed(2)}s midTime=${midTime.toFixed(2)}s` +
+                (isDissolve ? ` [dissolve: ${dissolveStart?.toFixed(2)}-${dissolveEnd?.toFixed(2)}]` : '') +
+                (nextCut?.detectionReason === 'dissolve_transition' ? ` [next dissolve: ${nextCut.dissolveStart?.toFixed(2)}-${nextCut.dissolveEnd?.toFixed(2)}]` : ''));
+        }
+        // Telop animation avoidance: shift midTime if it falls within an animation region
+        if (i > 0 && telopAnimations.length > 0) {
+            for (const ta of telopAnimations) {
+                if (midTime >= ta.start && midTime <= ta.settling) {
+                    const afterSettling = ta.settling + 0.2;
+                    const beforeStart = ta.start - 0.2;
+                    if (afterSettling < endTime) {
+                        console.log(`  🎯 Scene ${sceneNumber}: midTime ${midTime.toFixed(2)}s in telop animation (${ta.region} ${ta.start.toFixed(2)}-${ta.settling.toFixed(2)}s) → shifted to ${afterSettling.toFixed(2)}s`);
+                        midTime = afterSettling;
+                    }
+                    else if (beforeStart > startTime) {
+                        console.log(`  🎯 Scene ${sceneNumber}: midTime ${midTime.toFixed(2)}s in telop animation (${ta.region} ${ta.start.toFixed(2)}-${ta.settling.toFixed(2)}s) → shifted to ${beforeStart.toFixed(2)}s`);
+                        midTime = beforeStart;
+                    }
+                    // else: no safe position, keep original midTime
+                    telopAdjustCount++;
+                    break; // Only adjust for the first overlapping animation
+                }
+            }
+        }
+        // Camera pan avoidance: shift midTime if it falls within a pan region
+        if (i > 0 && panAnimations.length > 0) {
+            for (const pa of panAnimations) {
+                if (midTime >= pa.start && midTime <= pa.settling) {
+                    const afterSettling = pa.settling + 0.2;
+                    const beforeStart = pa.start - 0.2;
+                    if (afterSettling < endTime) {
+                        console.log(`  📷 Scene ${sceneNumber}: midTime ${midTime.toFixed(2)}s in camera pan (${pa.direction} ${pa.start.toFixed(2)}-${pa.settling.toFixed(2)}s) → shifted to ${afterSettling.toFixed(2)}s`);
+                        midTime = afterSettling;
+                    }
+                    else if (beforeStart > startTime) {
+                        console.log(`  📷 Scene ${sceneNumber}: midTime ${midTime.toFixed(2)}s in camera pan (${pa.direction} ${pa.start.toFixed(2)}-${pa.settling.toFixed(2)}s) → shifted to ${beforeStart.toFixed(2)}s`);
+                        midTime = beforeStart;
+                    }
+                    // else: no safe position, keep original midTime
+                    panAdjustCount++;
+                    break; // Only adjust for the first overlapping pan
+                }
+            }
+        }
         scenes.push({
             sceneNumber,
-            startTime, // Detection point A (前)
-            endTime, // Detection point B (後)
-            midTime, // 75% position for screenshot (captures after text animations)
-            timecode: formatTimecode(startTime) // Timecode assigned to scene start
+            startTime, // Detection point A (前のカット点)
+            endTime, // Detection point B (次のカット点)
+            midTime, // Screenshot capture point
+            timecode: formatTimecode(startTime),
+            ...(isDissolve ? { detectionReason: 'dissolve_transition' } : {}),
+            ...(dissolveStart != null ? { dissolveStart } : {}),
+            ...(dissolveEnd != null ? { dissolveEnd } : {}),
         });
         sceneNumber++;
     }
     console.log(`✅ Generated ${scenes.length} valid scene ranges`);
+    if (telopAdjustCount > 0) {
+        console.log(`  🎯 Adjusted ${telopAdjustCount} midTimes to avoid telop animations`);
+    }
+    if (panAdjustCount > 0) {
+        console.log(`  📷 Adjusted ${panAdjustCount} midTimes to avoid camera pans`);
+    }
     return scenes;
 }
 /**
@@ -890,6 +251,129 @@ export async function extractFrameAtTime(videoPath, timestamp, outputPath, video
             clearTimeout(timeoutId);
             clearInterval(activityInterval);
             reject(new Error(`Frame extraction spawn error: ${err.message}`));
+        });
+    });
+}
+// ============================================================
+// Frame Sharpness Check (Blur Detection)
+// Uses Python+OpenCV (already in Docker image for PySceneDetect)
+// ============================================================
+/** Minimum Laplacian variance to consider a frame "sharp" (160x120 grayscale) */
+const DEFAULT_SHARPNESS_THRESHOLD = 100;
+/** How many candidate positions to try when a frame is blurry */
+const BLUR_RETRY_OFFSETS = [0.25, 0.90, 0.15, 0.75]; // ratios within scene duration
+// ============================================================
+// Dissolve Detection Thresholds (Phase A: logging only)
+// ============================================================
+const DEFAULT_DISSOLVE_EDGE_RATIO_THRESHOLD = 0.08;
+const DEFAULT_DISSOLVE_LOCAL_CONTRAST_THRESHOLD = 25.0;
+/**
+ * Measure frame sharpness using Laplacian variance via Python+OpenCV.
+ * Returns a numeric sharpness score (higher = sharper).
+ * Typical values: <100 = blurry (dissolve), 200-1000+ = sharp.
+ *
+ * @param imagePath - Path to PNG frame file
+ * @returns Laplacian variance score
+ */
+async function measureFrameSharpness(imagePath) {
+    return new Promise((resolve, reject) => {
+        const pythonPath = process.env.PYSCENE_PYTHON_PATH || '/opt/venv/bin/python3';
+        const script = `
+import cv2, sys
+img = cv2.imread(sys.argv[1])
+if img is None:
+    print("0.0")
+    sys.exit(0)
+gray = cv2.cvtColor(cv2.resize(img, (160, 120)), cv2.COLOR_BGR2GRAY)
+print(f"{cv2.Laplacian(gray, cv2.CV_64F).var():.2f}")
+`.trim();
+        const proc = spawn(pythonPath, ['-c', script, imagePath], {
+            timeout: 10000,
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        proc.stdout?.on('data', (data) => { stdout += data.toString(); });
+        proc.stderr?.on('data', (data) => { stderr += data.toString(); });
+        proc.on('close', (code) => {
+            if (code === 0 && stdout.trim()) {
+                const score = parseFloat(stdout.trim());
+                if (!isNaN(score)) {
+                    resolve(score);
+                    return;
+                }
+            }
+            // On error, return 0 (will trigger retry) but don't fail the pipeline
+            console.warn(`⚠️ Sharpness check failed (code=${code}): ${stderr.trim()}`);
+            resolve(0);
+        });
+        proc.on('error', (err) => {
+            console.warn(`⚠️ Sharpness check spawn error: ${err.message}`);
+            resolve(0);
+        });
+    });
+}
+/**
+ * Measure frame quality with multiple metrics for dissolve detection.
+ * Returns sharpness (Laplacian variance), edge ratio (Canny), and local contrast
+ * in a single Python+OpenCV call.
+ *
+ * Phase A: Used for logging metrics to calibrate dissolve thresholds.
+ *
+ * @param imagePath - Path to PNG frame file
+ * @returns FrameQuality metrics
+ */
+async function measureFrameQuality(imagePath) {
+    return new Promise((resolve) => {
+        const pythonPath = process.env.PYSCENE_PYTHON_PATH || '/opt/venv/bin/python3';
+        const script = `
+import cv2, sys, json
+import numpy as np
+img = cv2.imread(sys.argv[1])
+if img is None:
+    print(json.dumps({"sharpness": 0, "edgeRatio": 0, "localContrast": 0}))
+    sys.exit(0)
+gray = cv2.cvtColor(cv2.resize(img, (160, 120)), cv2.COLOR_BGR2GRAY)
+sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+edges = cv2.Canny(gray, 50, 150)
+edge_ratio = float(edges.sum() / 255) / (160 * 120)
+h, w = gray.shape
+patch_stds = []
+for y in range(0, h - 7, 8):
+    for x in range(0, w - 7, 8):
+        patch_stds.append(float(gray[y:y+8, x:x+8].std()))
+local_contrast = float(np.mean(patch_stds))
+print(json.dumps({"sharpness": round(sharpness, 2), "edgeRatio": round(edge_ratio, 4), "localContrast": round(local_contrast, 2)}))
+`.trim();
+        const proc = spawn(pythonPath, ['-c', script, imagePath], {
+            timeout: 15000,
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        proc.stdout?.on('data', (data) => { stdout += data.toString(); });
+        proc.stderr?.on('data', (data) => { stderr += data.toString(); });
+        proc.on('close', (code) => {
+            if (code === 0 && stdout.trim()) {
+                try {
+                    const result = JSON.parse(stdout.trim());
+                    if (typeof result.sharpness === 'number' &&
+                        typeof result.edgeRatio === 'number' &&
+                        typeof result.localContrast === 'number') {
+                        resolve(result);
+                        return;
+                    }
+                }
+                catch {
+                    // JSON parse failed, fall through
+                }
+            }
+            console.warn(`⚠️ Frame quality check failed (code=${code}): ${stderr.trim()}`);
+            resolve({ sharpness: 0, edgeRatio: 0, localContrast: 0 });
+        });
+        proc.on('error', (err) => {
+            console.warn(`⚠️ Frame quality check spawn error: ${err.message}`);
+            resolve({ sharpness: 0, edgeRatio: 0, localContrast: 0 });
         });
     });
 }
@@ -1040,68 +524,6 @@ export async function getVideoMetadata(videoPath) {
     });
 }
 /**
- * Get video duration in seconds (helper function)
- */
-function getVideoDuration(videoPath) {
-    return getVideoMetadata(videoPath).then(metadata => metadata.duration);
-}
-/**
- * Main scene detection and frame extraction function
- * Implements FFmpeg scene detection + mid-point frame extraction
- * @param videoPath - Path to the video file
- * @param outputDir - Directory for extracted frames (optional, defaults to /tmp/frames-{timestamp})
- * @param existingMetadata - Pre-fetched video metadata (optional, avoids duplicate ffprobe call)
- * @returns Array of Scene objects with screenshot paths
- */
-export async function extractScenesWithFrames(videoPath, outputDir, existingMetadata) {
-    const framesDir = outputDir || path.join('/tmp', `frames-${Date.now()}`);
-    try {
-        // Create output directory
-        await fs.mkdir(framesDir, { recursive: true });
-        console.log(`📁 Created output directory: ${framesDir}`);
-        // Use existing metadata if provided, otherwise fetch (avoids ffprobe hanging on duplicate calls)
-        const videoMetadata = existingMetadata || await getVideoMetadata(videoPath);
-        console.log(`🎬 Video duration: ${videoMetadata.duration}s (metadata ${existingMetadata ? 'reused' : 'fetched'})`);
-        // Step 1: Multi-pass scene detection
-        const cuts = await detectSceneCuts(videoPath);
-        if (cuts.length === 0) {
-            console.warn('⚠️ No scene cuts detected, falling back to single scene');
-            // Fallback: treat entire video as one scene
-            cuts.push({ timestamp: 0, confidence: 0.03 });
-        }
-        // Step 2: Generate scene ranges with mid-points
-        const scenes = await generateSceneRanges(cuts, videoMetadata.duration);
-        console.log(`📸 Extracting ${scenes.length} frames at mid-points (50% position) in PARALLEL...`);
-        // Step 3: Extract frames at mid-points (50% position) with adaptive quality - PARALLEL
-        // Note: minSceneInterval=1.0s ensures we skip fade-in detections
-        // Use pLimit to control concurrency (avoid overwhelming the system)
-        const limit = pLimit(FRAME_EXTRACTION_CONCURRENCY);
-        const frameStartTime = Date.now();
-        await Promise.all(scenes.map((scene) => limit(async () => {
-            const filename = path.join(framesDir, `scene-${scene.sceneNumber.toString().padStart(4, '0')}.png`);
-            // Pass video metadata for adaptive resizing and quality optimization
-            await extractFrameAtTime(videoPath, scene.midTime, filename, videoMetadata);
-            // Set screenshot path
-            scene.screenshotPath = filename;
-            console.log(`  ✓ Scene ${scene.sceneNumber}: ${scene.timecode} (mid-point: ${scene.midTime.toFixed(1)}s)`);
-        })));
-        const frameParallelTime = Date.now() - frameStartTime;
-        console.log(`⚡ Parallel frame extraction completed in ${(frameParallelTime / 1000).toFixed(1)}s`);
-        console.log(`✅ Extracted ${scenes.length} frames at mid-points`);
-        return scenes;
-    }
-    catch (error) {
-        // Clean up on error
-        try {
-            await fs.rm(framesDir, { recursive: true, force: true });
-        }
-        catch (cleanupError) {
-            console.error('⚠️ Cleanup error:', cleanupError);
-        }
-        throw error;
-    }
-}
-/**
  * Clean up temporary frame files
  * @param scenes - Array of scenes with screenshot paths
  */
@@ -1140,18 +562,22 @@ const BATCH_FRAME_EXTRACTION_CONCURRENCY = 4;
  * @returns Object containing scenes (without screenshots) and video metadata
  */
 export async function detectScenesOnly(videoPath, existingMetadata, onProgress) {
-    console.log('🎬 Starting scene detection (batch mode - no frame extraction)...');
+    console.log(`🎬 Starting scene detection (PySceneDetect, batch mode - no frame extraction)...`);
     // Use existing metadata if provided, otherwise fetch
     const videoMetadata = existingMetadata || await getVideoMetadata(videoPath);
     console.log(`  📹 Video duration: ${videoMetadata.duration}s`);
-    // Multi-pass scene detection with progress tracking
-    const cuts = await detectSceneCuts(videoPath, DEFAULT_CONFIG, videoMetadata.duration, onProgress);
+    // Always use PySceneDetect ContentDetector
+    const { detectWithPyScene } = await import('./pysceneDetector.js');
+    const pyResult = await detectWithPyScene(videoPath, videoMetadata.duration, onProgress);
+    const cuts = pyResult.cuts;
+    const telopAnimations = pyResult.telopAnimations;
+    const panAnimations = pyResult.panAnimations;
+    console.log(`  ✓ PySceneDetect: ${cuts.length} cuts detected`);
     if (cuts.length === 0) {
         console.warn('⚠️ No scene cuts detected, falling back to single scene');
         cuts.push({ timestamp: 0, confidence: 0.03 });
     }
-    // Generate scene ranges with mid-points (no frame extraction)
-    const scenes = await generateSceneRanges(cuts, videoMetadata.duration);
+    const scenes = await generateSceneRanges(cuts, videoMetadata.duration, 0.2, telopAnimations, panAnimations);
     console.log(`✅ Detected ${scenes.length} scenes (frames will be extracted in batches)`);
     return { scenes, videoMetadata };
 }
@@ -1163,20 +589,98 @@ export async function detectScenesOnly(videoPath, existingMetadata, onProgress) 
  * @param videoMetadata - Video metadata for adaptive resizing
  * @returns Updated scenes with screenshotPath set
  */
-export async function extractFramesForBatch(videoPath, scenes, framesDir, videoMetadata) {
+export async function extractFramesForBatch(videoPath, scenes, framesDir, videoMetadata, targetWidth) {
     // Ensure directory exists
     await fs.mkdir(framesDir, { recursive: true });
+    const blurAvoidanceEnabled = (process.env.BLUR_AVOIDANCE_ENABLED || 'true').toLowerCase() === 'true';
     const limit = pLimit(BATCH_FRAME_EXTRACTION_CONCURRENCY);
     const startTime = Date.now();
-    console.log(`  📸 Extracting ${scenes.length} frames (batch, concurrency: ${BATCH_FRAME_EXTRACTION_CONCURRENCY})...`);
+    // Count dissolve scenes for logging
+    const widthInfo = targetWidth ? ` at ${targetWidth}px` : '';
+    const blurInfo = blurAvoidanceEnabled ? `, blur avoidance: ON (all scenes)` : '';
+    console.log(`  📸 Extracting ${scenes.length} frames${widthInfo} (batch, concurrency: ${BATCH_FRAME_EXTRACTION_CONCURRENCY}${blurInfo})...`);
+    let blurRetryCount = 0;
+    let dissolveDetectedCount = 0;
+    // Dissolve detection thresholds (Phase A: logging only)
+    const dissolveEdgeThreshold = parseFloat(process.env.DISSOLVE_EDGE_RATIO_THRESHOLD || String(DEFAULT_DISSOLVE_EDGE_RATIO_THRESHOLD));
+    const dissolveContrastThreshold = parseFloat(process.env.DISSOLVE_LOCAL_CONTRAST_THRESHOLD || String(DEFAULT_DISSOLVE_LOCAL_CONTRAST_THRESHOLD));
     await Promise.all(scenes.map((scene) => limit(async () => {
         const filename = path.join(framesDir, `scene-${scene.sceneNumber.toString().padStart(4, '0')}.png`);
-        await extractFrameAtTime(videoPath, scene.midTime, filename, videoMetadata);
+        await extractFrameAtTime(videoPath, scene.midTime, filename, videoMetadata, targetWidth);
+        if (blurAvoidanceEnabled) {
+            // Apply blur avoidance to ALL scenes (not just dissolve-tagged ones)
+            // Internal dissolves within a scene may not be tagged as dissolve_transition
+            const sharpness = await measureFrameSharpness(filename);
+            const threshold = parseFloat(process.env.BLUR_SHARPNESS_THRESHOLD || String(DEFAULT_SHARPNESS_THRESHOLD));
+            if (sharpness < threshold) {
+                console.log(`  🔍 Scene ${scene.sceneNumber}: blurry (sharpness=${sharpness.toFixed(1)}, threshold=${threshold}), trying alternatives...`);
+                blurRetryCount++;
+                // Try alternative positions within the scene
+                const duration = scene.endTime - scene.startTime;
+                let bestScore = sharpness;
+                let bestPath = filename;
+                const dir = path.dirname(filename);
+                const ext = path.extname(filename);
+                const base = path.basename(filename, ext);
+                for (let ci = 0; ci < BLUR_RETRY_OFFSETS.length; ci++) {
+                    let t = scene.startTime + duration * BLUR_RETRY_OFFSETS[ci];
+                    // Skip candidates within dissolve zone if known
+                    if (scene.dissolveStart != null && scene.dissolveEnd != null) {
+                        if (t >= scene.dissolveStart && t <= scene.dissolveEnd)
+                            continue;
+                    }
+                    t = Math.max(scene.startTime + 0.1, Math.min(t, scene.endTime - 0.1));
+                    const candidatePath = path.join(dir, `${base}_cand${ci}${ext}`);
+                    try {
+                        await extractFrameAtTime(videoPath, t, candidatePath, videoMetadata, targetWidth);
+                        const score = await measureFrameSharpness(candidatePath);
+                        if (score > bestScore) {
+                            if (bestPath !== filename)
+                                await fs.unlink(bestPath).catch(() => { });
+                            bestScore = score;
+                            bestPath = candidatePath;
+                            if (score >= threshold)
+                                break;
+                        }
+                        else {
+                            await fs.unlink(candidatePath).catch(() => { });
+                        }
+                    }
+                    catch {
+                        await fs.unlink(candidatePath).catch(() => { });
+                    }
+                }
+                if (bestPath !== filename) {
+                    await fs.unlink(filename).catch(() => { });
+                    await fs.rename(bestPath, filename);
+                    console.log(`  ✅ Scene ${scene.sceneNumber}: replaced with sharper frame (sharpness=${bestScore.toFixed(1)}, was ${sharpness.toFixed(1)})`);
+                }
+                else {
+                    console.log(`  ⚠️ Scene ${scene.sceneNumber}: no sharper alternative found (best=${bestScore.toFixed(1)}), keeping original`);
+                }
+            }
+            // Phase A: Dissolve quality metrics logging (after blur avoidance)
+            // Measure full quality metrics on the final frame to collect data for threshold calibration
+            const quality = await measureFrameQuality(filename);
+            const isDissolveCandidate = quality.sharpness >= threshold &&
+                quality.edgeRatio < dissolveEdgeThreshold &&
+                quality.localContrast < dissolveContrastThreshold;
+            if (isDissolveCandidate) {
+                dissolveDetectedCount++;
+                console.log(`  🔬 Scene ${scene.sceneNumber}: DISSOLVE-LIKE (sharpness=${quality.sharpness.toFixed(1)}, edgeRatio=${quality.edgeRatio.toFixed(4)}, localContrast=${quality.localContrast.toFixed(1)}) ← passed blur check but may be dissolve`);
+            }
+            else {
+                // Log all metrics at debug level for threshold calibration
+                console.log(`  📊 Scene ${scene.sceneNumber}: quality OK (sharpness=${quality.sharpness.toFixed(1)}, edgeRatio=${quality.edgeRatio.toFixed(4)}, localContrast=${quality.localContrast.toFixed(1)})`);
+            }
+        }
         // Set screenshot path
         scene.screenshotPath = filename;
     })));
     const elapsed = Date.now() - startTime;
-    console.log(`  ⚡ Batch frame extraction: ${scenes.length} frames in ${(elapsed / 1000).toFixed(1)}s`);
+    const retryInfo = blurRetryCount > 0 ? `, ${blurRetryCount} blur retries` : '';
+    const dissolveInfo = dissolveDetectedCount > 0 ? `, ${dissolveDetectedCount} dissolve-like frames detected` : '';
+    console.log(`  ⚡ Batch frame extraction: ${scenes.length} frames in ${(elapsed / 1000).toFixed(1)}s${retryInfo}${dissolveInfo}`);
     return scenes;
 }
 /**

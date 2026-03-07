@@ -26,7 +26,6 @@ import type {
   VADStats,
   CompressionResult,
   ProcessingMetadata,
-  DetectionMode
 } from '../types/shared.js';
 import type { Scene } from '../types/excel.js';
 import { WarningCollector } from './warningCollector.js';
@@ -76,7 +75,6 @@ export const processVideo = async (
   fileName: string,
   userId: string, // Security: User ID for IDOR protection
   dataConsent: boolean,
-  detectionMode: DetectionMode = 'standard' // Enhanced mode for fade/dissolve detection
 ) => {
   const overallStartTime = Date.now();
   let r2Deleted = false; // Track if R2 object has been deleted
@@ -99,8 +97,6 @@ export const processVideo = async (
     console.log(`[${uploadId}] ═══════════════════════════════════════════════`);
     console.log(`[${uploadId}] Starting video processing for user ${userId}`);
     console.log(`[${uploadId}] R2 Key: ${r2Key}`);
-    console.log(`[${uploadId}] Detection mode: ${detectionMode}`);
-
     // Load or create checkpoint for resumable processing
     checkpoint = await getOrCreateCheckpoint(uploadId, userId);
     const isResuming = checkpoint.currentStep !== 'downloading' || checkpoint.completedAudioChunks.length > 0;
@@ -187,6 +183,14 @@ export const processVideo = async (
         console.log(`[${uploadId}] ⏭️ Skipping audio extraction (resuming from ${cp.currentStep})`);
         videoMetadata = await getVideoMetadata(videoPath);
         hasAudio = await hasAudioStream(videoPath);
+
+        // Re-extract audio if the file was cleaned up from a previous run
+        if (hasAudio && !fs.existsSync(audioPath)) {
+          console.log(`[${uploadId}] 🔄 Audio file missing (cleaned up from previous run), re-extracting...`);
+          const result = await extractMetadataAndAudio(uploadId, videoPath, audioPath);
+          videoMetadata = result.videoMetadata;
+          hasAudio = result.hasAudio;
+        }
       }
 
       // Warning collector for non-fatal issues
@@ -199,6 +203,15 @@ export const processVideo = async (
       let preDetectedScenes: Scene[] | undefined;
 
       if (shouldRunStep('transcription')) {
+        // Ensure audio file exists before parallel processing
+        // (may be missing if cleaned up from a previous run's finally block)
+        if (hasAudio && !fs.existsSync(audioPath)) {
+          console.log(`[${uploadId}] 🔄 Audio file missing before transcription, re-extracting...`);
+          const reExtracted = await extractMetadataAndAudio(uploadId, videoPath, audioPath);
+          videoMetadata = reExtracted.videoMetadata;
+          hasAudio = reExtracted.hasAudio;
+        }
+
         // Run Whisper + Scene Detection in parallel
         const result = await performParallelProcessing(
           uploadId,
@@ -207,7 +220,6 @@ export const processVideo = async (
           hasAudio,
           cp,
           videoMetadata,
-          detectionMode,
           warningCollector
         );
         transcription = result.transcription;
@@ -216,13 +228,22 @@ export const processVideo = async (
 
         // Save checkpoint: transcription + scene detection complete
         cp.currentStep = 'scene_detection';
-        cp.transcriptionSegments = transcription;
+        // Protect cached transcription: never overwrite non-empty cache with empty result
+        // This prevents Whisper retry failures from destroying previously successful data
+        if (transcription.length > 0) {
+          cp.transcriptionSegments = transcription;
+        } else if (cp.transcriptionSegments.length > 0) {
+          console.log(`[${uploadId}] 🛡️ Keeping cached ${cp.transcriptionSegments.length} transcription segments (Whisper returned 0 this run)`);
+          transcription = cp.transcriptionSegments;
+        } else {
+          cp.transcriptionSegments = transcription;
+        }
         // Also save scene cuts to checkpoint for resume support
         if (preDetectedScenes.length > 0) {
           cp.sceneCuts = preDetectedScenes.map(scene => ({
             timestamp: scene.startTime,
             confidence: 0.95,
-            source: 'ffmpeg_standard' as const,
+            source: 'pyscenedetect' as const,
           }));
         }
         await saveCheckpoint(cp);
@@ -243,7 +264,6 @@ export const processVideo = async (
         videoPath,
         fileName,
         transcription,
-        detectionMode,
         cp,
         preDetectedScenes,
         videoMetadata,
@@ -258,7 +278,6 @@ export const processVideo = async (
         transcription,
         stats,
         overallStartTime,
-        detectionMode,
         userId,
         fileName,
         warningCollector
@@ -542,7 +561,6 @@ async function performParallelProcessing(
   hasAudio: boolean,
   checkpoint: ProcessingCheckpoint,
   videoMetadata: any,
-  detectionMode?: DetectionMode,
   warningCollector?: WarningCollector
 ): Promise<{
   transcription: TranscriptionSegment[];
@@ -574,7 +592,7 @@ async function performParallelProcessing(
 
     // Task 2: Scene detection only (no frame extraction)
     timeStep(uploadId, '[PARALLEL] Scene Detection', async () => {
-      console.log(`[${uploadId}] [PARALLEL] Starting scene detection (mode: ${detectionMode || 'standard'})...`);
+      console.log(`[${uploadId}] [PARALLEL] Starting scene detection (PySceneDetect)...`);
       const { scenes } = await detectScenesOnly(
         videoPath,
         videoMetadata,
@@ -594,7 +612,6 @@ async function performParallelProcessing(
             });
           }
         },
-        detectionMode
       );
       console.log(`[${uploadId}] [PARALLEL] Scene detection complete: ${scenes.length} scenes`);
       return scenes;
@@ -652,7 +669,6 @@ async function performParallelProcessing(
  * @param videoPath - Path to video file
  * @param fileName - Original file name
  * @param transcription - Transcription segments
- * @param detectionMode - Detection mode ('standard' or 'enhanced')
  * @param checkpoint - Processing checkpoint for resume support
  * @param preDetectedScenes - Pre-detected scenes from parallel processing (optional)
  * @returns Object containing Excel path and pipeline statistics
@@ -662,7 +678,6 @@ async function executeSceneDetectionAndOCRWithCheckpoint(
   videoPath: string,
   fileName: string,
   transcription: TranscriptionSegment[],
-  detectionMode: DetectionMode = 'standard',
   checkpoint: ProcessingCheckpoint,
   preDetectedScenes?: Scene[],
   videoMetadata?: any,
@@ -682,7 +697,6 @@ async function executeSceneDetectionAndOCRWithCheckpoint(
       fileName,
       transcription,
       uploadId,
-      detectionMode,
       checkpoint,
       preDetectedScenes,
       videoMetadata,
@@ -706,7 +720,6 @@ async function executeSceneDetectionAndOCRWithCheckpoint(
  * @param transcription - Transcription segments
  * @param stats - Pipeline statistics
  * @param overallStartTime - Overall processing start time
- * @param detectionMode - Detection mode used for processing
  * @param userId - User ID for R2 key generation
  * @returns Result URL and R2 key (if in production)
  */
@@ -717,7 +730,6 @@ async function uploadResultAndComplete(
   transcription: TranscriptionSegment[],
   stats: any,
   overallStartTime: number,
-  detectionMode: DetectionMode = 'standard',
   userId: string = 'system',
   fileName: string = 'unknown',
   warningCollector?: WarningCollector
@@ -763,10 +775,6 @@ async function uploadResultAndComplete(
     totalScenes: stats.totalScenes,
     scenesWithOCR: stats.scenesWithOCRText,
     scenesWithNarration: stats.scenesWithNarration,
-    detectionMode,
-    // Enhanced mode metadata (populated by pipeline if enhanced mode was used)
-    luminanceTransitionsDetected: stats.luminanceTransitionsDetected,
-    textStabilizationPoints: stats.textStabilizationPoints,
     // Processing warnings (non-fatal issues)
     warnings: warnings && warnings.length > 0 ? warnings : undefined,
   };

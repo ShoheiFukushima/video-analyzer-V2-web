@@ -8,6 +8,17 @@
  * @since 2026-02-08
  */
 import { OCRProvider, OCRResult, OCRProviderConfig } from '../ocrProviderInterface.js';
+export type OCRErrorCategory = 'rate_limit' | 'auth' | 'network' | 'server' | 'unknown';
+/**
+ * Extract detailed error information from Gemini SDK errors
+ * Gemini SDK wraps HTTP errors in GoogleGenerativeAIError with nested structures
+ */
+export declare function classifyGeminiError(error: unknown): {
+    category: OCRErrorCategory;
+    status?: number;
+    code?: string;
+    detail: string;
+};
 /**
  * Gemini OCR Provider
  */

@@ -292,6 +292,12 @@ export class RateLimiter {
         lastError = error;
 
         if (!isRetryable(error) || attempt >= this.config.maxRetries - 1) {
+          if (attempt >= this.config.maxRetries - 1) {
+            console.error(`[RateLimiter] All ${this.config.maxRetries} retries exhausted`);
+          } else {
+            const err = error as Record<string, any>;
+            console.error(`[RateLimiter] Non-retryable error: ${err.constructor?.name || 'Unknown'} status=${err.status} code=${err.code} message=${err.message}`);
+          }
           throw error;
         }
 
@@ -495,8 +501,12 @@ export function isRetryableError(error: unknown): boolean {
       isRateLimitError(error) ||
       message.includes('timeout') ||
       message.includes('network') ||
+      message.includes('connection') ||
       message.includes('econnreset') ||
       message.includes('econnrefused') ||
+      message.includes('enotfound') ||
+      message.includes('etimedout') ||
+      message.includes('socket') ||
       message.includes('503') ||
       message.includes('502') ||
       message.includes('500')

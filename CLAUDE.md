@@ -744,50 +744,55 @@ if (totalBytes > 0 && downloadedBytes - lastLoggedBytes >= LOG_INTERVAL) {
 ## 🚀 デプロイ手順
 
 ### フロントエンド（Vercel）
+
+**本番URL**: `https://video.function-eight.com/`
+**Vercel URL**: `https://video-analyzer-v2-web.vercel.app`
+
 ```bash
 # 自動デプロイ（mainブランチにプッシュ）
 git add .
 git commit -m "feat: Add new feature"
 git push origin main
 
-# 手動デプロイ
+# 手動デプロイ（git push の自動デプロイが失敗した場合はこちらを使用）
 vercel --prod
 ```
 
-### バックエンド（Cloud Run）
+**注意**: `git push` による自動デプロイが `Error` になることがある（2026-02-18確認）。その場合は `vercel --prod` で手動デプロイすれば成功する。
+
+### Backend (Cloud Run) — Multi-Region Parallel Deploy
+
+**Recommended**: Use `deploy-worker.sh` which builds the image once and deploys to all 6 regions in parallel.
+
 ```bash
-cd cloud-run-worker
+# Type-check before deploy
+cd cloud-run-worker && ./node_modules/.bin/tsc --noEmit && cd ..
 
-# ビルド確認
-./node_modules/.bin/tsc
+# Deploy to ALL 6 regions (build once → parallel deploy)
+./scripts/deploy-worker.sh
 
-# デプロイ（2026年2月5日更新: 高パフォーマンス設定）
-gcloud run deploy video-analyzer-worker \
-  --source . \
-  --region us-central1 \
-  --platform managed \
-  --allow-unauthenticated \
-  --memory 4Gi \
-  --cpu 4 \
-  --timeout 600 \
-  --max-instances 10 \
-  --concurrency 1 \
-  --no-cpu-throttling \
-  --execution-environment gen2
+# Deploy to a SINGLE region (for testing)
+./scripts/deploy-worker.sh us-central1
 ```
 
-**重要な設定オプション**:
-- `--cpu 4`: FFmpeg処理に必要な十分なCPU
-- `--concurrency 1`: 動画処理はリソース集約型なので1リクエストずつ
-- `--no-cpu-throttling`: 常時CPUを割り当て（スロットリング無効）
-- `--execution-environment gen2`: gVisorではなくLinux VM（FFmpegハング回避）
+**How it works**:
+1. `gcloud builds submit` builds the Docker image once → pushes to Artifact Registry (`us-central1`)
+2. `gcloud run deploy --image` deploys the same image to all 6 regions in parallel (background processes)
+3. Health checks verify all deployments
+4. Old `--source .` approach is no longer used (it rebuilt the image per region)
 
-**デプロイ後の確認**:
+**Cloud Run settings** (configured in deploy script):
+- `--cpu 4` / `--memory 4Gi`: FFmpeg processing
+- `--concurrency 1`: One video per instance
+- `--no-cpu-throttling` / `--execution-environment gen2`: Prevent FFmpeg hangs
+- `--timeout 3600`: 1-hour max processing time
+
+**Post-deploy verification**:
 ```bash
-# ヘルスチェック
+# Health check (any region)
 curl https://video-analyzer-worker-820467345033.us-central1.run.app/health
 
-# ログ確認
+# Logs
 gcloud run services logs tail video-analyzer-worker --region us-central1
 ```
 
@@ -1044,6 +1049,18 @@ source .env.cloudflare
 - [Cloudflare API Documentation](https://developers.cloudflare.com/api/)
 - [Clerk API Documentation](https://clerk.com/docs/reference/backend-api)
 - プロジェクト内スクリプト: `scripts/` ディレクトリ
+
+---
+
+## 🎛️ Agent Skills (プロジェクト固有)
+
+### Video Analyzer Tuning Guard (`.claude/skills/video-analyzer-tuning/`)
+シーン検出・音声処理の本番チューニング設定を保護。以下のキーワードでトリガー:
+- シーン検出閾値 / threshold / DEFAULT_CONFIG
+- minSceneInterval / minSceneDuration
+- VAD パラメータ
+- ffmpeg 設定変更
+- `/api/process` の waitUntil
 
 ---
 

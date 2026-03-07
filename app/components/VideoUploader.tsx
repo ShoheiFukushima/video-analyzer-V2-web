@@ -219,7 +219,6 @@ export function VideoUploader({ onUploadSuccess, disabled }: VideoUploaderProps)
           r2Key,
           fileName: fileToUpload.name,
           dataConsent: true,
-          detectionMode: 'reverse_engineer',
         }),
         signal: controller.signal,
       });
