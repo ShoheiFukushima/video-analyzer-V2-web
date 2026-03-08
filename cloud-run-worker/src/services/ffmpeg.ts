@@ -728,12 +728,24 @@ export async function extractFramesForBatch(
     process.env.DISSOLVE_LOCAL_CONTRAST_THRESHOLD || String(DEFAULT_DISSOLVE_LOCAL_CONTRAST_THRESHOLD)
   );
 
+  // Collect quality metrics for structured summary log
+  const qualityMetrics: Array<{
+    scene: number;
+    sharpness: number;
+    edgeRatio: number;
+    localContrast: number;
+    isDissolveCandidate: boolean;
+    blurRetried: boolean;
+  }> = [];
+
   await Promise.all(
     scenes.map((scene) =>
       limit(async () => {
         const filename = path.join(framesDir, `scene-${scene.sceneNumber.toString().padStart(4, '0')}.png`);
 
         await extractFrameAtTime(videoPath, scene.midTime, filename, videoMetadata, targetWidth);
+
+        let blurRetried = false;
 
         if (blurAvoidanceEnabled) {
           // Apply blur avoidance to ALL scenes (not just dissolve-tagged ones)
@@ -743,6 +755,7 @@ export async function extractFramesForBatch(
           if (sharpness < threshold) {
             console.log(`  🔍 Scene ${scene.sceneNumber}: blurry (sharpness=${sharpness.toFixed(1)}, threshold=${threshold}), trying alternatives...`);
             blurRetryCount++;
+            blurRetried = true;
             // Try alternative positions within the scene
             const duration = scene.endTime - scene.startTime;
             let bestScore = sharpness;
@@ -785,8 +798,7 @@ export async function extractFramesForBatch(
             }
           }
 
-          // Phase A: Dissolve quality metrics logging (after blur avoidance)
-          // Measure full quality metrics on the final frame to collect data for threshold calibration
+          // Measure full quality metrics on the final frame for dissolve detection
           const quality = await measureFrameQuality(filename);
           const isDissolveCandidate =
             quality.sharpness >= threshold &&
@@ -795,11 +807,16 @@ export async function extractFramesForBatch(
 
           if (isDissolveCandidate) {
             dissolveDetectedCount++;
-            console.log(`  🔬 Scene ${scene.sceneNumber}: DISSOLVE-LIKE (sharpness=${quality.sharpness.toFixed(1)}, edgeRatio=${quality.edgeRatio.toFixed(4)}, localContrast=${quality.localContrast.toFixed(1)}) ← passed blur check but may be dissolve`);
-          } else {
-            // Log all metrics at debug level for threshold calibration
-            console.log(`  📊 Scene ${scene.sceneNumber}: quality OK (sharpness=${quality.sharpness.toFixed(1)}, edgeRatio=${quality.edgeRatio.toFixed(4)}, localContrast=${quality.localContrast.toFixed(1)})`);
           }
+
+          qualityMetrics.push({
+            scene: scene.sceneNumber,
+            sharpness: quality.sharpness,
+            edgeRatio: quality.edgeRatio,
+            localContrast: quality.localContrast,
+            isDissolveCandidate,
+            blurRetried,
+          });
         }
 
         // Set screenshot path
@@ -809,9 +826,52 @@ export async function extractFramesForBatch(
   );
 
   const elapsed = Date.now() - startTime;
-  const retryInfo = blurRetryCount > 0 ? `, ${blurRetryCount} blur retries` : '';
-  const dissolveInfo = dissolveDetectedCount > 0 ? `, ${dissolveDetectedCount} dissolve-like frames detected` : '';
-  console.log(`  ⚡ Batch frame extraction: ${scenes.length} frames in ${(elapsed / 1000).toFixed(1)}s${retryInfo}${dissolveInfo}`);
+
+  // Structured summary log — always visible in Cloud Run logs
+  // (individual per-scene logs may be buffered and hard to filter)
+  const sortedMetrics = qualityMetrics.sort((a, b) => a.scene - b.scene);
+  const dissolveCandidates = sortedMetrics.filter(m => m.isDissolveCandidate);
+  const blurRetries = sortedMetrics.filter(m => m.blurRetried);
+
+  // JSON structured log for Cloud Logging queryability
+  console.log(JSON.stringify({
+    severity: 'INFO',
+    message: `FRAME_QUALITY_SUMMARY: ${scenes.length} frames, ${blurRetryCount} blur retries, ${dissolveDetectedCount} dissolve candidates`,
+    frameQualitySummary: {
+      totalFrames: scenes.length,
+      blurRetries: blurRetryCount,
+      dissolveCandidates: dissolveDetectedCount,
+      elapsedMs: elapsed,
+      thresholds: {
+        sharpness: parseFloat(process.env.BLUR_SHARPNESS_THRESHOLD || String(DEFAULT_SHARPNESS_THRESHOLD)),
+        dissolveEdgeRatio: dissolveEdgeThreshold,
+        dissolveLocalContrast: dissolveContrastThreshold,
+      },
+      metrics: sortedMetrics.map(m => ({
+        scene: m.scene,
+        s: m.sharpness,
+        e: m.edgeRatio,
+        lc: m.localContrast,
+        ...(m.isDissolveCandidate ? { dissolve: true } : {}),
+        ...(m.blurRetried ? { blurRetried: true } : {}),
+      })),
+    },
+  }));
+
+  // Human-readable summary for gcloud run services logs read
+  console.log(`  ⚡ Batch frame extraction: ${scenes.length} frames in ${(elapsed / 1000).toFixed(1)}s`
+    + (blurRetryCount > 0 ? `, ${blurRetryCount} blur retries` : '')
+    + (dissolveDetectedCount > 0 ? `, ${dissolveDetectedCount} dissolve-like frames` : ''));
+
+  if (dissolveCandidates.length > 0) {
+    console.log(`  🔬 Dissolve candidates: ${dissolveCandidates.map(m => `Scene ${m.scene} (edge=${m.edgeRatio.toFixed(4)}, lc=${m.localContrast.toFixed(1)})`).join(', ')}`);
+  }
+
+  // Per-scene metrics table (compact, single log entry)
+  const metricsTable = sortedMetrics
+    .map(m => `S${m.scene}:${m.sharpness.toFixed(0)}/${m.edgeRatio.toFixed(3)}/${m.localContrast.toFixed(0)}${m.isDissolveCandidate ? '⚠' : ''}${m.blurRetried ? '🔄' : ''}`)
+    .join(' | ');
+  console.log(`  📊 Quality [sharpness/edgeRatio/localContrast]: ${metricsTable}`);
 
   return scenes;
 }
