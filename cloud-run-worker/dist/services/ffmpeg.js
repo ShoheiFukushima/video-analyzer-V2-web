@@ -108,23 +108,16 @@ async function generateSceneRanges(cuts, videoDuration, minSceneDuration = 0.2, 
                 }
             }
         }
-        // Camera pan avoidance: shift midTime if it falls within a pan region
+        // Camera pan avoidance: DISABLED (2026-03-09)
+        // Pan avoidance was shifting midTime away from pan regions, but Scene 18 test showed
+        // that the shifted position could be worse than the original midpoint.
+        // Keeping midTime at the natural 50% midpoint for now.
         if (i > 0 && panAnimations.length > 0) {
             for (const pa of panAnimations) {
                 if (midTime >= pa.start && midTime <= pa.settling) {
-                    const afterSettling = pa.settling + 0.2;
-                    const beforeStart = pa.start - 0.2;
-                    if (afterSettling < endTime) {
-                        console.log(`  📷 Scene ${sceneNumber}: midTime ${midTime.toFixed(2)}s in camera pan (${pa.direction} ${pa.start.toFixed(2)}-${pa.settling.toFixed(2)}s) → shifted to ${afterSettling.toFixed(2)}s`);
-                        midTime = afterSettling;
-                    }
-                    else if (beforeStart > startTime) {
-                        console.log(`  📷 Scene ${sceneNumber}: midTime ${midTime.toFixed(2)}s in camera pan (${pa.direction} ${pa.start.toFixed(2)}-${pa.settling.toFixed(2)}s) → shifted to ${beforeStart.toFixed(2)}s`);
-                        midTime = beforeStart;
-                    }
-                    // else: no safe position, keep original midTime
+                    console.log(`  📷 Scene ${sceneNumber}: midTime ${midTime.toFixed(2)}s in camera pan (${pa.direction} ${pa.start.toFixed(2)}-${pa.settling.toFixed(2)}s) → keeping original midpoint (pan avoidance disabled)`);
                     panAdjustCount++;
-                    break; // Only adjust for the first overlapping pan
+                    break;
                 }
             }
         }
