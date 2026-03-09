@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Inter, Lora } from "next/font/google";
+import { Sora, Cormorant_Garamond, Noto_Sans_JP } from "next/font/google";
 import { ClerkProvider } from "@clerk/nextjs";
 import { Providers } from "./providers/QueryProvider";
 import { SessionRecoveryProvider } from "./components/SessionRecoveryProvider";
@@ -7,14 +7,23 @@ import { BuildInfo } from "./components/BuildInfo";
 import "./globals.css";
 import { cn } from "@/lib/utils";
 
-const fontSans = Inter({ 
-  subsets: ["latin"], 
-  variable: "--font-sans" 
+const sora = Sora({
+  subsets: ["latin"],
+  variable: "--font-sans",
+  weight: ["200", "300", "400", "500", "600"],
 });
 
-const fontSerif = Lora({
+const cormorantGaramond = Cormorant_Garamond({
   subsets: ["latin"],
-  variable: "--font-serif",
+  variable: "--font-display",
+  weight: ["300", "400", "500", "600"],
+  style: ["normal", "italic"],
+});
+
+const notoSansJP = Noto_Sans_JP({
+  subsets: ["latin"],
+  variable: "--font-jp",
+  weight: ["200", "300", "400", "500", "600"],
 });
 
 export const metadata: Metadata = {
@@ -39,12 +48,13 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="ja" className="dark" suppressHydrationWarning>
+    <html lang="ja" suppressHydrationWarning>
       <body
         className={cn(
           "min-h-screen bg-background font-sans antialiased",
-          fontSans.variable,
-          fontSerif.variable
+          sora.variable,
+          cormorantGaramond.variable,
+          notoSansJP.variable
         )}
       >
         <ClerkProvider>
