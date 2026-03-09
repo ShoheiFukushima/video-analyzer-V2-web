@@ -108,10 +108,18 @@ export async function loadCheckpoint(uploadId: string): Promise<ProcessingCheckp
       }
 
       // Check if build has changed (code update invalidates checkpoint)
-      if (CURRENT_BUILD_COMMIT && checkpoint.buildCommit && checkpoint.buildCommit !== CURRENT_BUILD_COMMIT) {
-        console.log(`[${uploadId}] [Checkpoint] Build mismatch (saved: ${checkpoint.buildCommit}, current: ${CURRENT_BUILD_COMMIT}) → ignoring checkpoint, starting fresh`);
-        console.log(`[${uploadId}] [Checkpoint] Old checkpoint preserved in DB (v${checkpoint.version}, step: ${checkpoint.currentStep})`);
-        return null;
+      if (CURRENT_BUILD_COMMIT) {
+        if (!checkpoint.buildCommit) {
+          // Legacy checkpoint without build tracking — cannot verify compatibility
+          console.log(`[${uploadId}] [Checkpoint] Legacy checkpoint (no build hash) → ignoring, starting fresh`);
+          console.log(`[${uploadId}] [Checkpoint] Old checkpoint preserved in DB (v${checkpoint.version}, step: ${checkpoint.currentStep})`);
+          return null;
+        }
+        if (checkpoint.buildCommit !== CURRENT_BUILD_COMMIT) {
+          console.log(`[${uploadId}] [Checkpoint] Build mismatch (saved: ${checkpoint.buildCommit}, current: ${CURRENT_BUILD_COMMIT}) → ignoring, starting fresh`);
+          console.log(`[${uploadId}] [Checkpoint] Old checkpoint preserved in DB (v${checkpoint.version}, step: ${checkpoint.currentStep})`);
+          return null;
+        }
       }
 
       console.log(`[${uploadId}] [Checkpoint] Loaded checkpoint at step: ${checkpoint.currentStep}`);
