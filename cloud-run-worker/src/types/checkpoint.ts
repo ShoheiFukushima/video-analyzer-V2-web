@@ -5,6 +5,32 @@
  */
 
 import type { TranscriptionSegment, SceneCut } from './shared.js';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+/**
+ * Get the current build commit hash from build-info.json
+ */
+function getCurrentBuildCommit(): string | undefined {
+  try {
+    // Try multiple paths (dist/ for production, root for development)
+    const paths = [
+      join(dirname(fileURLToPath(import.meta.url)), '..', 'build-info.json'),
+      join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'build-info.json'),
+    ];
+    for (const p of paths) {
+      try {
+        const info = JSON.parse(readFileSync(p, 'utf-8'));
+        return info.commit;
+      } catch { /* try next */ }
+    }
+  } catch { /* ignore */ }
+  return undefined;
+}
+
+// Cache the build commit at module load time
+export const CURRENT_BUILD_COMMIT = getCurrentBuildCommit();
 
 /**
  * Processing checkpoint step
@@ -25,6 +51,9 @@ export interface ProcessingCheckpoint {
   uploadId: string;
   userId: string;
   currentStep: CheckpointStep;
+
+  // Build tracking (invalidate checkpoint when code changes)
+  buildCommit?: string;  // Git commit hash at checkpoint creation time
 
   // Intermediate file paths (R2 keys)
   intermediateVideoPath?: string;
@@ -131,6 +160,7 @@ export function createInitialCheckpoint(
     uploadId,
     userId,
     currentStep: 'downloading',
+    buildCommit: CURRENT_BUILD_COMMIT,
     completedAudioChunks: [],
     transcriptionSegments: [],
     sceneCuts: [],

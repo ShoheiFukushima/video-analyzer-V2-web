@@ -3,6 +3,32 @@
  *
  * Enables resumable processing for videos up to 2GB/10+ hours
  */
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+/**
+ * Get the current build commit hash from build-info.json
+ */
+function getCurrentBuildCommit() {
+    try {
+        // Try multiple paths (dist/ for production, root for development)
+        const paths = [
+            join(dirname(fileURLToPath(import.meta.url)), '..', 'build-info.json'),
+            join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'build-info.json'),
+        ];
+        for (const p of paths) {
+            try {
+                const info = JSON.parse(readFileSync(p, 'utf-8'));
+                return info.commit;
+            }
+            catch { /* try next */ }
+        }
+    }
+    catch { /* ignore */ }
+    return undefined;
+}
+// Cache the build commit at module load time
+export const CURRENT_BUILD_COMMIT = getCurrentBuildCommit();
 /**
  * Whisper checkpoint - save every N chunks
  * Lower values = more frequent saves = better resume granularity
@@ -48,6 +74,7 @@ export function createInitialCheckpoint(uploadId, userId) {
         uploadId,
         userId,
         currentStep: 'downloading',
+        buildCommit: CURRENT_BUILD_COMMIT,
         completedAudioChunks: [],
         transcriptionSegments: [],
         sceneCuts: [],

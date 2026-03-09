@@ -4,6 +4,7 @@
  * Enables resumable processing for videos up to 2GB/10+ hours
  */
 import type { TranscriptionSegment, SceneCut } from './shared.js';
+export declare const CURRENT_BUILD_COMMIT: string | undefined;
 /**
  * Processing checkpoint step
  */
@@ -16,6 +17,7 @@ export interface ProcessingCheckpoint {
     uploadId: string;
     userId: string;
     currentStep: CheckpointStep;
+    buildCommit?: string;
     intermediateVideoPath?: string;
     intermediateAudioPath?: string;
     videoDuration?: number;

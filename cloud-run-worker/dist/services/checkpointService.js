@@ -6,7 +6,7 @@
  */
 import dotenv from 'dotenv';
 import { createClient } from '@libsql/client';
-import { CHECKPOINT_EXPIRATION_DAYS, createInitialCheckpoint, generateIntermediatePaths, isCheckpointExpired, } from '../types/checkpoint.js';
+import { CHECKPOINT_EXPIRATION_DAYS, CURRENT_BUILD_COMMIT, createInitialCheckpoint, generateIntermediatePaths, isCheckpointExpired, } from '../types/checkpoint.js';
 import { deleteFromR2 } from './r2Client.js';
 // Load environment variables
 dotenv.config();
@@ -37,6 +37,10 @@ function getTursoClient() {
             authToken: process.env.TURSO_AUTH_TOKEN,
         });
         console.log('[CheckpointService] Turso mode enabled');
+        // Auto-migrate: add build_commit column if missing
+        turso.execute(`ALTER TABLE processing_checkpoints ADD COLUMN build_commit TEXT`).catch(() => {
+            // Column already exists — safe to ignore
+        });
         tursoInitialized = true;
         return turso;
     }
@@ -69,6 +73,12 @@ export async function loadCheckpoint(uploadId) {
             if (isCheckpointExpired(checkpoint)) {
                 console.log(`[${uploadId}] [Checkpoint] Checkpoint expired, deleting`);
                 await deleteCheckpoint(uploadId);
+                return null;
+            }
+            // Check if build has changed (code update invalidates checkpoint)
+            if (CURRENT_BUILD_COMMIT && checkpoint.buildCommit && checkpoint.buildCommit !== CURRENT_BUILD_COMMIT) {
+                console.log(`[${uploadId}] [Checkpoint] Build mismatch (saved: ${checkpoint.buildCommit}, current: ${CURRENT_BUILD_COMMIT}) → ignoring checkpoint, starting fresh`);
+                console.log(`[${uploadId}] [Checkpoint] Old checkpoint preserved in DB (v${checkpoint.version}, step: ${checkpoint.currentStep})`);
                 return null;
             }
             console.log(`[${uploadId}] [Checkpoint] Loaded checkpoint at step: ${checkpoint.currentStep}`);
@@ -106,16 +116,17 @@ export async function saveCheckpoint(checkpoint, options = {}) {
         try {
             await client.execute({
                 sql: `INSERT INTO processing_checkpoints (
-          upload_id, user_id, current_step,
+          upload_id, user_id, current_step, build_commit,
           intermediate_video_path, intermediate_audio_path,
           video_duration, total_audio_chunks, total_scenes,
           completed_audio_chunks, transcription_segments, scene_cuts,
           completed_ocr_scenes, ocr_results,
           created_at, updated_at, expires_at,
           retry_count, version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(upload_id) DO UPDATE SET
           current_step = excluded.current_step,
+          build_commit = excluded.build_commit,
           intermediate_video_path = excluded.intermediate_video_path,
           intermediate_audio_path = excluded.intermediate_audio_path,
           video_duration = excluded.video_duration,
@@ -134,6 +145,7 @@ export async function saveCheckpoint(checkpoint, options = {}) {
                     updatedCheckpoint.uploadId,
                     updatedCheckpoint.userId,
                     updatedCheckpoint.currentStep,
+                    updatedCheckpoint.buildCommit ?? null,
                     updatedCheckpoint.intermediateVideoPath ?? null,
                     updatedCheckpoint.intermediateAudioPath ?? null,
                     updatedCheckpoint.videoDuration ?? null,
@@ -359,6 +371,7 @@ function mapRowToCheckpoint(row) {
         uploadId: row.upload_id,
         userId: row.user_id,
         currentStep: row.current_step,
+        buildCommit: row.build_commit ?? undefined,
         intermediateVideoPath: row.intermediate_video_path,
         intermediateAudioPath: row.intermediate_audio_path,
         videoDuration: row.video_duration,
