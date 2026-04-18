@@ -36,7 +36,10 @@ async function callCloudRunWithFailover(
           Authorization: `Bearer ${workerSecret}`,
         },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(25000),
+        // Cold-start of a Cloud Run region commonly takes 20-30s on min-instances=0.
+        // Keep the timeout above that to avoid spurious failover (which previously caused
+        // the same upload to be processed in 3 regions = 3x Gemini API cost).
+        signal: AbortSignal.timeout(60000),
       });
 
       if (response.ok || response.status === 202) {

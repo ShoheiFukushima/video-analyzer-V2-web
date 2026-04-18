@@ -265,6 +265,26 @@ app.post('/process', validateAuth, async (req: Request, res: Response): Promise<
     return;
   }
 
+  // Duplicate lock: another region (or earlier retry) may already be processing this uploadId.
+  // Vercel's callCloudRunWithFailover triggers redundant calls when cold-start exceeds its 25s timeout.
+  // Returning 202 here stops the failover chain and prevents 3x Gemini API cost.
+  try {
+    const existing = await getStatus(uploadId);
+    if (existing) {
+      console.log(`[${uploadId}] Duplicate /process ignored (existing status=${existing.status})`);
+      res.status(202).json({
+        success: true,
+        uploadId,
+        message: `Upload already ${existing.status}`,
+        status: existing.status,
+        duplicate: true,
+      });
+      return;
+    }
+  } catch (err) {
+    console.warn(`[${uploadId}] Duplicate-lock check failed, proceeding anyway:`, err);
+  }
+
   console.log(`[${uploadId}] Starting video processing`, {
     fileName,
     userId,
