@@ -265,22 +265,30 @@ app.post('/process', validateAuth, async (req: Request, res: Response): Promise<
     return;
   }
 
-  // Duplicate lock: another region (or earlier retry) may already be processing this uploadId.
-  // Vercel's callCloudRunWithFailover triggers redundant calls when cold-start exceeds its 25s timeout.
-  // Returning 202 here stops the failover chain and prevents 3x Gemini API cost.
+  // Duplicate lock: another worker (or earlier retry) may already be processing this uploadId.
+  // Vercel's /api/process pre-inserts a row with current_step='Initiating...' BEFORE forwarding here,
+  // so a row's mere existence does NOT mean a worker has started — we must look at `stage`.
+  // Only block when stage has progressed past the Vercel initiation marker.
   try {
     const existing = await getStatus(uploadId);
-    if (existing) {
-      console.log(`[${uploadId}] Duplicate /process ignored (existing status=${existing.status})`);
+    const stageStr = existing?.stage as string | undefined;
+    const workerAlreadyStarted = !!existing && !!stageStr && stageStr !== 'Initiating...';
+    if (workerAlreadyStarted) {
+      console.log(`[${uploadId}] Duplicate /process ignored (worker already at stage=${stageStr})`);
       res.status(202).json({
         success: true,
         uploadId,
-        message: `Upload already ${existing.status}`,
+        message: `Upload already in progress (stage=${stageStr})`,
         status: existing.status,
         duplicate: true,
       });
       return;
     }
+    // Claim ownership: bump stage so a near-simultaneous failover request sees us as the active worker.
+    // Best-effort — if this fails we still proceed (processVideo will set stage anyway).
+    await updateStatus(uploadId, { stage: 'downloading' }).catch((err) => {
+      console.warn(`[${uploadId}] Failed to mark worker started:`, err);
+    });
   } catch (err) {
     console.warn(`[${uploadId}] Duplicate-lock check failed, proceeding anyway:`, err);
   }
