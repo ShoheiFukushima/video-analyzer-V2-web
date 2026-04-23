@@ -4,65 +4,35 @@
 
 @layer base {
   :root {
-    --background: hsl(30 20% 97%); /* #FBF9F7 */
-    --foreground: hsl(0 0% 23%);   /* #3A3A3A */
-    
-    --card: hsl(30 20% 98%);
-    --card-foreground: hsl(0 0% 23%);
-    
-    --popover: hsl(30 20% 98%);
-    --popover-foreground: hsl(0 0% 23%);
+    --background: #F5F0E8;
+    --foreground: #1A1A18;
 
-    --primary: hsl(15 52% 49%);   /* #C05A3A */
-    --primary-foreground: hsl(30 20% 98%);
+    --card: #FAF7F2;
+    --card-foreground: #1A1A18;
 
-    --secondary: hsl(30 25% 91%); /* #EAE3DB */
-    --secondary-foreground: hsl(0 0% 23%);
+    --popover: #FAF7F2;
+    --popover-foreground: #1A1A18;
 
-    --muted: hsl(30 25% 91%);
-    --muted-foreground: hsl(0 0% 45%);
+    --primary: #1A1A18;
+    --primary-foreground: #F5F0E8;
 
-    --accent: hsl(38 78% 62%);     /* #E6A549 */
-    --accent-foreground: hsl(0 0% 23%);
-    
-    --destructive: hsl(0 72% 51%);
-    --destructive-foreground: hsl(30 20% 98%);
+    --secondary: #E8E3DA;
+    --secondary-foreground: #1A1A18;
 
-    --border: hsl(30 15% 85%);
-    --input: hsl(30 15% 85%);
-    --ring: hsl(15 52% 49%);
+    --muted: #E8E3DA;
+    --muted-foreground: #6B6B63;
 
-    --radius: 0.5rem;
-  }
+    --accent: #B8965A;
+    --accent-foreground: #FFFFFF;
 
-  .dark {
-    --background: hsl(0 0% 10%);   /* #1A1A1A */
-    --foreground: hsl(0 0% 88%);   /* #E0E0E0 */
+    --destructive: #CC4444;
+    --destructive-foreground: #F5F0E8;
 
-    --card: hsl(0 0% 12%);
-    --card-foreground: hsl(0 0% 88%);
+    --border: #E8E3DA;
+    --input: #E8E3DA;
+    --ring: #B8965A;
 
-    --popover: hsl(0 0% 12%);
-    --popover-foreground: hsl(0 0% 88%);
-
-    --primary: hsl(17 62% 61%);   /* #D47F63 */
-    --primary-foreground: hsl(0 0% 10%);
-
-    --secondary: hsl(0 0% 16%); /* #2A2A2A */
-    --secondary-foreground: hsl(0 0% 88%);
-
-    --muted: hsl(0 0% 16%);
-    --muted-foreground: hsl(0 0% 60%);
-
-    --accent: hsl(39 86% 67%);     /* #F2B866 */
-    --accent-foreground: hsl(0 0% 10%);
-
-    --destructive: hsl(0 63% 31%);
-    --destructive-foreground: hsl(0 0% 88%);
-    
-    --border: hsl(0 0% 20%);
-    --input: hsl(0 0% 20%);
-    --ring: hsl(17 62% 61%);
+    --radius: 0.125rem;
   }
 }
 
@@ -72,6 +42,16 @@
   }
   body {
     @apply bg-background text-foreground;
-    font-feature-settings: "rlig" 1, "calt" 1;
+    font-weight: 300;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }
